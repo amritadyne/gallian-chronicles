@@ -1,0 +1,43 @@
+--- a/host/ui/ui.hpp	2026-11-07 00:09:22.753827251 +0000
++++ b/host/ui/ui.hpp	2026-11-07 00:09:22.819266159 +0000
+@@ -33,6 +33,11 @@
+ // (Esc, or L3+R3 on a gamepad).
+ [[nodiscard]] bool menu_requested();
+ 
++// A game profile can detach the menu from the game entirely: Esc, L3+R3 and
++// the touch button then open nothing (the port provides its own settings).
++void set_menu_enabled(bool enabled);
++[[nodiscard]] bool menu_enabled();
++
+ // Whether the menu, opened now, pauses the game. Settings decide: "Pause the
+ // game when the menu opens", and during ad hoc play "Pause during
+ // multiplayer", off by default because a paused game stops answering its
+--- a/host/ui/menu.cpp	2026-11-07 00:09:22.753746018 +0000
++++ b/host/ui/menu.cpp	2026-11-07 00:09:22.819164656 +0000
+@@ -1599,12 +1599,24 @@
+ 
+ bool take_quit_request() { return std::exchange(quit_requested(), false); }
+ 
++namespace {
++bool &menu_enabled_flag() {
++    static bool enabled = true;
++    return enabled;
++}
++} // namespace
++
++void set_menu_enabled(bool enabled) { menu_enabled_flag() = enabled; }
++bool menu_enabled() { return menu_enabled_flag(); }
++
+ bool menu_requested() {
+     Layer &layer = Layer::get();
+     if (!layer.attached() || text_input_open()) return false;
+-    // The on-screen menu button, then Esc or L3+R3.
++    // The on-screen menu button, then Esc or L3+R3. Both are taken even with
++    // the menu off, so the request never lingers or reaches the game.
+     const bool touched = layer.renderer().take_touch_menu();
+-    return layer.take_menu_toggle() || touched;
++    const bool toggled = layer.take_menu_toggle();
++    return menu_enabled_flag() && (toggled || touched);
+ }
+ 
+ bool run_menu() {

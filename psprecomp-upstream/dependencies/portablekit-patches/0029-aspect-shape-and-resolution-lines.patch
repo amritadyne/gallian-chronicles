@@ -1,0 +1,232 @@
+Aspect ratio separate from resolution: video.aspect takes a shape under Fill
+("16:9", "16:10", "4:3", "21:9" = 43:18, "32:9", any "w:h"; "fill" = the window's shape),
+and video.resolution may be lines only ("1080": the width follows the shape).
+Old "WxH" values still work. (2026-11-13)
+
+--- a/host/settings/settings.hpp
++++ b/host/settings/settings.hpp
+@@ -43,13 +43,18 @@
+ enum class FrameRate { Fps30, Fps45, Fps60, Fps90, Fps120, Display };
+ 
+ // The size the game is drawn at, in pixels. 0x0 follows the window's own
+-// size in pixels, including every later change of it. Under Fill the picture
+-// has this shape (shown with bars when the window's shape differs); under
+-// Original and Stretch it is the PSP's 480x272 shape fitted inside it.
++// size in pixels, including every later change of it. 0 x <height> ("1080" in
++// settings.ini) is that many lines, the width following the picture's shape
++// (video.aspect: the PSP's, the window's, or a fixed shape). A full
++// <width>x<height> (older settings) is drawn at that size: under Fill the
++// picture has its shape, under Original and Stretch the PSP's shape is fitted
++// inside it. The picture is shown with bars where its shape and the window's
++// differ.
+ struct Resolution {
+     std::uint32_t width{};
+     std::uint32_t height{};
+-    [[nodiscard]] constexpr bool follows_window() const noexcept { return width == 0u || height == 0u; }
++    [[nodiscard]] constexpr bool follows_window() const noexcept { return height == 0u; }
++    [[nodiscard]] constexpr bool lines_only() const noexcept { return width == 0u && height != 0u; }
+     friend constexpr bool operator==(const Resolution &, const Resolution &) = default;
+ };
+ inline constexpr std::uint32_t kMinResolutionSide = 16u;
+@@ -58,33 +63,37 @@
+     const char *name;
+     Resolution size;
+ };
+-// What the menus offer, in order. Any other size can be set in settings.ini.
++// What the menus offer, in order: lines; the width follows video.aspect. Any
++// other size can be set in settings.ini.
+ inline constexpr ResolutionPreset kResolutionPresets[] = {
+     {"Match window", {0u, 0u}},
+-    {"PSP", {480u, 272u}},
+-    {"480p 4:3", {640u, 480u}},
+-    {"480p", {854u, 480u}},
+-    {"720p", {1280u, 720u}},
+-    {"800p 16:10", {1280u, 800u}},
+-    {"900p", {1600u, 900u}},
+-    {"1080p", {1920u, 1080u}},
+-    {"1080p 16:10", {1920u, 1200u}},
+-    {"1080p ultrawide", {2560u, 1080u}},
+-    {"1080p super ultrawide", {3840u, 1080u}},
+-    {"1440p", {2560u, 1440u}},
+-    {"1440p 16:10", {2560u, 1600u}},
+-    {"1440p ultrawide", {3440u, 1440u}},
+-    {"1440p super ultrawide", {5120u, 1440u}},
+-    {"1800p", {3200u, 1800u}},
+-    {"4K", {3840u, 2160u}},
+-    {"4K ultrawide", {5120u, 2160u}},
+-    {"5K", {5120u, 2880u}},
++    {"272 (PSP)", {0u, 272u}},
++    {"480", {0u, 480u}},
++    {"720", {0u, 720u}},
++    {"768", {0u, 768u}},
++    {"900", {0u, 900u}},
++    {"1080", {0u, 1080u}},
++    {"1200", {0u, 1200u}},
++    {"1440", {0u, 1440u}},
++    {"1600", {0u, 1600u}},
++    {"1800", {0u, 1800u}},
++    {"2160 (4K)", {0u, 2160u}},
++    {"2880 (5K)", {0u, 2880u}},
+ };
+-// "window" or "<width>x<height>", the spelling settings.ini uses.
++// "window", "<height>" or "<width>x<height>", the spelling settings.ini uses.
+ [[nodiscard]] std::string format_resolution(Resolution resolution);
+ [[nodiscard]] bool parse_resolution(const std::string &text, Resolution &out);
+ // The preset's name, "1920x1080" for a size no preset has.
+ [[nodiscard]] std::string resolution_name(Resolution resolution);
++// video.aspect: "original", "stretch", "fill" (the window's shape) or a shape
++// under Fill, "16:9", "16:10", "4:3", "21:9" (43:18, as 3440x1440), "32:9" or
++// any "<w>:<h>".
++[[nodiscard]] bool parse_aspect(const std::string &text, Aspect &aspect, std::uint32_t &shape_width,
++                                std::uint32_t &shape_height);
++struct Settings;
++[[nodiscard]] std::string format_aspect(const Settings &s);
++// Under Fill with a shape: width / height; else 0.
++[[nodiscard]] double fill_shape(const Settings &s);
+ 
+ struct Settings {
+     // Video
+@@ -97,6 +106,10 @@
+     std::string monitor;
+     PresentMode present_mode{PresentMode::Fifo};
+     Aspect aspect{Aspect::Original};
++    // Under Fill: the picture's shape, width:height (16:10 is 16 and 10); 0:0
++    // the window's own. video.aspect writes it as "fill" or "16:10".
++    std::uint32_t shape_width{};
++    std::uint32_t shape_height{};
+     bool sharp_screen{};               // nearest instead of linear scaling to the window
+     bool sharp_textures{};             // nearest instead of linear texture sampling
+     std::uint32_t msaa{1u};            // samples per pixel of the game's targets: 1 (off), 2, 4 or 8
+--- a/host/settings/settings.cpp
++++ b/host/settings/settings.cpp
+@@ -218,8 +218,9 @@
+              return true;
+          },
+          [](const Settings &s) { return std::string(s.aspect == Aspect::Stretch ? "0" : "1"); }, nullptr},
+-        {"video.aspect", nullptr, [](Settings &s, const std::string &t) { return kAspects.parse(t, s.aspect); },
+-         [](const Settings &s) { return kAspects.format(s.aspect); }, nullptr},
++        {"video.aspect", nullptr,
++         [](Settings &s, const std::string &t) { return parse_aspect(t, s.aspect, s.shape_width, s.shape_height); },
++         [](const Settings &s) { return format_aspect(s); }, nullptr},
+         BOOL_FIELD("video.sharp_screen", sharp_screen),
+         BOOL_FIELD("video.sharp_textures", sharp_textures),
+         // Read when the renderer starts; the GPU may allow fewer samples.
+@@ -605,6 +606,7 @@
+ 
+ std::string format_resolution(Resolution resolution) {
+     if (resolution.follows_window()) return "window";
++    if (resolution.lines_only()) return std::to_string(resolution.height);
+     return std::to_string(resolution.width) + "x" + std::to_string(resolution.height);
+ }
+ 
+@@ -616,7 +618,13 @@
+         return true;
+     }
+     const std::size_t x = text.find_first_of("xX");
+-    if (x == std::string::npos) return false;
++    if (x == std::string::npos) {
++        // "1080": lines only, the width from the picture's shape.
++        std::uint32_t lines = 0u;
++        if (!parse_uint(text, kMinResolutionSide, kMaxResolutionSide, lines)) return false;
++        out = {0u, lines};
++        return true;
++    }
+     std::uint32_t width = 0u;
+     std::uint32_t height = 0u;
+     if (!parse_uint(text.substr(0, x), kMinResolutionSide, kMaxResolutionSide, width) ||
+@@ -626,6 +634,37 @@
+     return true;
+ }
+ 
++bool parse_aspect(const std::string &text, Aspect &aspect, std::uint32_t &shape_width, std::uint32_t &shape_height) {
++    Aspect named{};
++    if (kAspects.parse(text, named)) {
++        aspect = named;
++        shape_width = shape_height = 0u;
++        return true;
++    }
++    const std::size_t colon = text.find(':');
++    if (colon == std::string::npos) return false;
++    std::uint32_t w = 0u, h = 0u;
++    if (!parse_uint(text.substr(0, colon), 1u, 1000u, w) || !parse_uint(text.substr(colon + 1u), 1u, 1000u, h)) return false;
++    if (w == 21u && h == 9u) w = 43u, h = 18u;  // "21:9" panels are 3440x1440 (43:18)
++    const double ratio = static_cast<double>(w) / h;
++    if (ratio < 0.5 || ratio > 4.0) return false;
++    aspect = Aspect::Fill;
++    shape_width = w;
++    shape_height = h;
++    return true;
++}
++
++std::string format_aspect(const Settings &s) {
++    if (s.aspect != Aspect::Fill || s.shape_width == 0u || s.shape_height == 0u) return kAspects.format(s.aspect);
++    if (s.shape_width == 43u && s.shape_height == 18u) return "21:9";
++    return std::to_string(s.shape_width) + ":" + std::to_string(s.shape_height);
++}
++
++double fill_shape(const Settings &s) {
++    if (s.aspect != Aspect::Fill || s.shape_width == 0u || s.shape_height == 0u) return 0.0;
++    return static_cast<double>(s.shape_width) / static_cast<double>(s.shape_height);
++}
++
+ std::string resolution_name(Resolution resolution) {
+     for (const ResolutionPreset &preset : kResolutionPresets)
+         if (preset.size == resolution) return preset.name;
+--- a/host/gpu/vulkan_renderer.cpp
++++ b/host/gpu/vulkan_renderer.cpp
+@@ -2264,6 +2264,17 @@
+         if (!(content_scale > 0.0f)) content_scale = 1.0f;
+         double width = player.resolution.width / content_scale;
+         double height = player.resolution.height / content_scale;
++        if (player.resolution.lines_only()) {
++            // Lines only: the width from the picture's shape (a fixed shape,
++            // the display's under Fill, else the PSP's).
++            double shape = settings::fill_shape(player);
++            SDL_Rect bounds{};
++            if (shape <= 0.0 && player.aspect == settings::Aspect::Fill && display != 0u &&
++                SDL_GetDisplayBounds(display, &bounds) && bounds.h > 0)
++                shape = static_cast<double>(bounds.w) / bounds.h;
++            if (shape <= 0.0) shape = static_cast<double>(kPspWidth) / kPspHeight;
++            width = height * shape;
++        }
+         SDL_Rect usable{};
+         if (display != 0u && SDL_GetDisplayUsableBounds(display, &usable) && usable.w > 0 && usable.h > 0) {
+             // Leave room for the window's frame.
+@@ -5766,10 +5777,21 @@
+ VkExtent2D VulkanRenderer::Impl::wanted_target_extent() const {
+     const bool known = content_rect.extent.width != 0u && content_rect.extent.height != 0u;
+     const bool follows = requested_resolution.follows_window();
+-    double width = follows ? (known ? content_rect.extent.width : static_cast<double>(target_extent.width))
+-                           : static_cast<double>(requested_resolution.width);
+-    double height = follows ? (known ? content_rect.extent.height : static_cast<double>(target_extent.height))
+-                            : static_cast<double>(requested_resolution.height);
++    const bool lines_only = requested_resolution.lines_only();
++    const double window_width = known ? content_rect.extent.width : static_cast<double>(target_extent.width);
++    const double window_height = known ? content_rect.extent.height : static_cast<double>(target_extent.height);
++    // Under Fill, a fixed shape (video.aspect "16:10" and the like); 0: the window's.
++    const double shape = aspect == settings::Aspect::Fill ? settings::fill_shape(settings::current()) : 0.0;
++    double width = follows ? window_width : static_cast<double>(requested_resolution.width);
++    double height = follows ? window_height : static_cast<double>(requested_resolution.height);
++    if (lines_only) {
++        // That many lines; the width from the picture's shape.
++        const double window_shape = std::max(window_width, 1.0) / std::max(window_height, 1.0);
++        const double s = aspect == settings::Aspect::Fill    ? (shape > 0.0 ? shape : window_shape)
++                         : aspect == settings::Aspect::Stretch ? window_shape
++                                                               : static_cast<double>(kPspWidth) / kPspHeight;
++        width = height * s;
++    }
+     width = std::max(width, 1.0);
+     height = std::max(height, 1.0);
+     // A small window is still drawn at the PSP's own 272 lines at least.
+@@ -5777,6 +5799,11 @@
+         width *= kPspHeight / height;
+         height = kPspHeight;
+     }
++    // A fixed shape inside the window (Match window) or a full size.
++    if (shape > 0.0 && !lines_only) {
++        if (width / height > shape) width = height * shape;
++        else height = width / shape;
++    }
+     if (aspect != settings::Aspect::Fill) {
+         const double x = width / kPspWidth;
+         const double y = height / kPspHeight;

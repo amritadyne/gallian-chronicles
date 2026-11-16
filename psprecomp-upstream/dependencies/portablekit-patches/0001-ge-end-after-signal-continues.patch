@@ -1,0 +1,21 @@
+--- ge_state.cpp.orig	2026-11-06 14:37:29.454575082 +0000
++++ ge_state.cpp	2026-11-06 14:37:34.539769326 +0000
+@@ -1410,6 +1410,18 @@
+             }
+             continue;
+         case kEnd:
++            // An END that directly follows an interrupting SIGNAL (behaviour
++            // 0x01 suspend, 0x02 continue) terminates that signal, not the
++            // list: the GE raises the interrupt and goes on with the next
++            // command. Only END after FINISH (or a bare END) ends the list.
++            // Traced in Valkyria Chronicles II (ULES01417): every frame list
++            // opens with SIGNAL 0x0E020002 + END, then holds the whole frame
++            // (state, textures, primitives) up to FINISH + END.
++            if (memory.contains(pc - 8u, 4u)) {
++                const std::uint32_t prior = memory.load32(pc - 8u);
++                const std::uint32_t behaviour = (prior >> 16u) & 0xFFu;
++                if ((prior >> 24u) == kSignal && (behaviour == 0x01u || behaviour == 0x02u)) continue;
++            }
+             finished = true;
+             return pc;
+         case kFinish:

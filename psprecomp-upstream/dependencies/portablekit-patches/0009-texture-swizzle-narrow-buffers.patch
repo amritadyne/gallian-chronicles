@@ -1,0 +1,80 @@
+--- a/host/gpu/texture_decode.cpp	2026-11-07 00:16:29.230840584 +0000
++++ b/host/gpu/texture_decode.cpp	2026-11-07 00:16:29.261903741 +0000
+@@ -50,6 +50,18 @@
+     }
+ }
+ 
++// Rows a texture occupies in memory: a swizzled one is stored as whole blocks
++// 8 rows tall. Its bytes per row likewise round up to whole 16-byte blocks: a
++// buffer narrower than one block (a 16-texel 4-bit texture has 8-byte rows)
++// still takes a block per row on hardware. Left unswizzled, such a texture
++// was read as plain rows and came out as stripes.
++std::uint32_t stored_row_bytes(const TextureState &texture, std::uint32_t row_bytes) {
++    return texture.swizzled ? (row_bytes + 15u) & ~15u : row_bytes;
++}
++std::uint32_t stored_rows(const TextureState &texture, std::uint32_t rows) {
++    return texture.swizzled ? (rows + 7u) & ~7u : rows;
++}
++
+ // <prefix>_NO_BUFFER_REUSE: allocate the decoder's working buffers for every
+ // texture, as before, instead of keeping them from one texture to the next.
+ bool reuse_buffers() {
+@@ -188,7 +200,7 @@
+                         std::vector<std::uint32_t> &out) {
+     const std::size_t total = data.size();
+     for (std::size_t i = 0; i < total; ++i) data[i] = memory.load8(texture.address + static_cast<std::uint32_t>(i));
+-    if (texture.swizzled) unswizzle(data, row_bytes, height);
++    if (texture.swizzled) unswizzle(data, row_bytes, stored_rows(texture, height));
+     for (std::uint32_t y = 0; y < height; ++y) {
+         for (std::uint32_t x = 0; x < width; ++x) {
+             const std::size_t row_offset = static_cast<std::size_t>(y) * row_bytes;
+@@ -384,8 +396,8 @@
+     // sampled size: a 512x512 texture can live in a 480-texel-wide buffer, and
+     // sampling past the stride wraps into the next row exactly as on hardware.
+     const std::uint32_t stride_texels = texture.buffer_width != 0u ? texture.buffer_width : width;
+-    const std::uint32_t row_bytes = stride_texels * bits / 8u;
+-    const std::size_t total = static_cast<std::size_t>(row_bytes) * height;
++    const std::uint32_t row_bytes = stored_row_bytes(texture, stride_texels * bits / 8u);
++    const std::size_t total = static_cast<std::size_t>(row_bytes) * stored_rows(texture, height);
+     if (total == 0u || !memory.contains(texture.address, total)) return false;
+ 
+     thread_local std::vector<std::uint8_t> kept;
+@@ -400,7 +412,7 @@
+     } else {
+         for (std::size_t i = 0; i < total; ++i) data[i] = memory.load8(texture.address + static_cast<std::uint32_t>(i));
+     }
+-    if (texture.swizzled) unswizzle(data, row_bytes, height);
++    if (texture.swizzled) unswizzle(data, row_bytes, stored_rows(texture, height));
+     decode_texels([&](std::uint32_t index) { return read_clut(memory, texture, index); }, texture, width, height,
+                   row_bytes, data, out);
+     // <prefix>_CHECK_TEXTURE_DECODE: every texture decoded both ways, compared.
+@@ -427,8 +439,8 @@
+     const std::uint32_t bits = bits_per_texel(texture.format);
+     if (bits == 0u) return false;  // the block formats are decoded at once
+     const std::uint32_t stride_texels = texture.buffer_width != 0u ? texture.buffer_width : width;
+-    const std::uint32_t row_bytes = stride_texels * bits / 8u;
+-    const std::size_t total = static_cast<std::size_t>(row_bytes) * height;
++    const std::uint32_t row_bytes = stored_row_bytes(texture, stride_texels * bits / 8u);
++    const std::size_t total = static_cast<std::size_t>(row_bytes) * stored_rows(texture, height);
+     if (total == 0u || !memory.contains(texture.address, total)) return false;
+     const std::uint8_t *texels = memory.raw_pointer(texture.address, total);
+     if (texels == nullptr) return false;
+@@ -450,7 +462,7 @@
+ bool decode_snapshot(TextureSnapshot &snapshot, std::vector<std::uint32_t> &out) {
+     const TextureState &texture = snapshot.texture;
+     out.assign(static_cast<std::size_t>(texture.width) * texture.height, 0xFF000000u);
+-    if (texture.swizzled) unswizzle(snapshot.texels, snapshot.row_bytes, texture.height);
++    if (texture.swizzled) unswizzle(snapshot.texels, snapshot.row_bytes, stored_rows(texture, texture.height));
+     decode_texels([&](std::uint32_t index) { return read_clut_copy(snapshot.clut, texture, index); }, texture,
+                   texture.width, texture.height, snapshot.row_bytes, snapshot.texels, out);
+     return true;
+@@ -485,7 +497,8 @@
+     }
+     const std::uint32_t bits = bits_per_texel(texture.format);
+     // DXT1 blocks hold half a byte per texel, DXT3 and DXT5 blocks a byte.
+-    const std::uint32_t size = bits != 0u                               ? texture.width * texture.height * bits / 8u
++    const std::uint32_t size = bits != 0u ? stored_row_bytes(texture, texture.width * bits / 8u) *
++                                                stored_rows(texture, texture.height)
+                                : texture.format == TextureFormat::Dxt1 ? texture.width * texture.height / 2u
+                                                                        : texture.width * texture.height;
+     // Resolve the texture once; this runs for every textured draw.

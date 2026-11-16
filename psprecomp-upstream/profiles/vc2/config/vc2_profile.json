@@ -1,0 +1,37 @@
+{
+  "profile": "vc2",
+  "release": "Europe",
+  "disc_id": "ULES01417",
+  "title": "VALKYRIA CHRONICLES II",
+  "psp_system_version": "6.20",
+  "encrypted_eboot": {
+    "path": "PSP_GAME/SYSDIR/EBOOT.BIN",
+    "size_bytes": 6840560,
+    "sha256": "98b4c1626f7d36bffae280f904bef4d718a5ea49090966c109731cebfe824211"
+  },
+  "portablekit_profile": {
+    "framework_revision": "33800c4060c53f3233e08f8ab2cc4590a0872063",
+    "development_mode": "interpreter permitted until playable-build milestone",
+    "release_requirement": "verify PSPRECOMP_NO_INTERPRETER=1 before calling any build native-playable"
+  },
+  "decrypted_elf": {
+    "module_name": "odin_psp",
+    "size_bytes": 6840220,
+    "sha256": "5bc43ae81b3a35f2fe4a72180e7130598f3b856d7fb849ec7cdc49646187cefe",
+    "load_base": "0x08804000",
+    "entry_point": "0x08BA6ABC",
+    "elf_type": "0xFFA0",
+    "relocations": 173282,
+    "imports": 281,
+    "imports_resolved_by_base_nid_registry": 56,
+    "imports_unresolved_by_base_nid_registry": 225,
+    "function_seeds": 30546,
+    "instruction_labels": 1038056,
+    "portablekit_generation": "not yet generated"
+  },
+  "decryption": {
+    "tag_at_0xd0": "0xD91613F0",
+    "format_key_status": "profiled; installer validation pending",
+    "development_input": "user-owned ISO or pre-existing locally prepared EBOOT.ELF"
+  }
+}

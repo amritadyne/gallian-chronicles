@@ -1,0 +1,16 @@
+--- a/host/hle/hle_atrac.cpp	2026-11-06 22:42:10.444988538 +0000
++++ b/host/hle/hle_atrac.cpp	2026-11-06 22:42:10.462106533 +0000
+@@ -720,7 +720,12 @@
+             return;
+         }
+         write_s32(rt.memory(), arg(ctx, 1), context->loop_num);
+-        write_s32(rt.memory(), arg(ctx, 2), looping(*context) ? 1 : 0);
++        // loopStatus: whether the file has loop information, not whether a
++        // loop count is set. Games read it right after SetData, while the
++        // count is still 0, to decide whether to call SetLoopNum (VC2 asks
++        // for an endless loop when status != 0 and loopNum == 0, so with a
++        // "currently looping" status its streamed BGM stopped at the file end).
++        write_s32(rt.memory(), arg(ctx, 2), context->track.loop_start >= 0 ? 1 : 0);
+         finish_traced(ctx, "sceAtracGetLoopStatus", 0u);
+     });
+ 

@@ -1,0 +1,166 @@
+FPS counter Simple: video.performance=fps shows the frame rate alone, a small number in
+the corner (the overlay otherwise unchanged; "overlay" is the Detailed one). (2026-11-13)
+
+--- a/host/settings/settings.hpp
++++ b/host/settings/settings.hpp
+@@ -29,7 +29,8 @@
+ // game the window's shape: its view widens or narrows to match (the vertical
+ // field of view stays), and the 2D interface keeps the PSP's proportions.
+ enum class Aspect { Original, Stretch, Fill };
+-enum class PerfDisplay { Off, Overlay, OverlayAndLog, Log };
++// Fps: the overlay with the frame rate alone, a small number in the corner.
++enum class PerfDisplay { Off, Overlay, OverlayAndLog, Log, Fps };
+ enum class RightStick { Camera, DPad, Off };
+ // The gamepad button that presses a tilting game's both tilt buttons at once
+ // (LocoRoco's jump), instead of what it presses otherwise.
+--- a/host/settings/settings.cpp
++++ b/host/settings/settings.cpp
+@@ -114,7 +114,8 @@
+ const Names<PerfDisplay> kPerfDisplays{{{PerfDisplay::Off, "off"},
+                                         {PerfDisplay::Overlay, "overlay"},
+                                         {PerfDisplay::OverlayAndLog, "overlay+log"},
+-                                        {PerfDisplay::Log, "log"}}};
++                                        {PerfDisplay::Log, "log"},
++                                        {PerfDisplay::Fps, "fps"}}};
+ const Names<input::tilt::Mode> kTiltModes{{{input::tilt::Mode::Angle, "angle"},
+                                             {input::tilt::Mode::AngleLevel, "level"},
+                                             {input::tilt::Mode::AngleLevel, "horizon"},
+--- a/host/perf/frame_stats.hpp
++++ b/host/perf/frame_stats.hpp
+@@ -15,6 +15,7 @@
+ struct Options {
+     bool log{};
+     bool overlay{};
++    bool fps_only{};  // the overlay shows the frame rate alone
+ };
+ [[nodiscard]] Options options();
+ 
+--- a/host/perf/frame_stats.cpp
++++ b/host/perf/frame_stats.cpp
+@@ -235,6 +235,7 @@
+     case settings::PerfDisplay::Overlay: result.overlay = true; break;
+     case settings::PerfDisplay::OverlayAndLog: result.overlay = result.log = true; break;
+     case settings::PerfDisplay::Log: result.log = true; break;
++    case settings::PerfDisplay::Fps: result.overlay = result.fps_only = true; break;
+     }
+     return result;
+ }
+--- a/host/perf/perf_overlay.hpp
++++ b/host/perf/perf_overlay.hpp
+@@ -10,9 +10,17 @@
+ inline constexpr std::uint32_t kOverlayHeight = 72u;
+ 
+ // Fills `pixels` (kOverlayWidth x kOverlayHeight, red in the low byte) with the
+-// last second's numbers and a graph of recent frame times.
++// last second's numbers and a graph of recent frame times, or with the frame
++// rate alone (video.performance=fps).
+ void draw_overlay(std::uint32_t *pixels);
+ 
++// The part of the overlay image in use, from its top-left corner: all of it,
++// or the frame rate's small box.
++struct OverlaySize {
++    std::uint32_t width, height;
++};
++[[nodiscard]] OverlaySize overlay_size();
++
+ // Integer scale for an overlay drawn over an image `height` pixels tall, so it
+ // stays readable from a 544-line window up to a 4K screen.
+ [[nodiscard]] std::uint32_t overlay_scale(std::uint32_t height);
+--- a/host/perf/perf_overlay.cpp
++++ b/host/perf/perf_overlay.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <algorithm>
+ #include <cstdio>
++#include <cstring>
+ 
+ namespace portablekit::perf {
+ namespace {
+@@ -107,11 +108,29 @@
+ 
+ std::uint32_t overlay_scale(std::uint32_t height) { return std::max(1u, height / 360u); }
+ 
++// Frame rate alone: up to four digits ("1000"), or a dash while measuring.
++constexpr std::uint32_t kFpsDigits = 4u;
++constexpr OverlaySize kFpsSize{kMargin * 2u + kFpsDigits * kGlyphAdvance - 1u, kMargin * 2u + 7u};
++
++OverlaySize overlay_size() {
++    return options().fps_only ? kFpsSize : OverlaySize{kOverlayWidth, kOverlayHeight};
++}
++
+ void draw_overlay(std::uint32_t *pixels) {
+     std::fill(pixels, pixels + kOverlayWidth * kOverlayHeight, kBackground);
+ 
+     const Summary &s = last_second();
+     char line[48];
++    if (options().fps_only) {
++        // Right-aligned in its box, so the number does not jump about.
++        if (s.valid)
++            std::snprintf(line, sizeof(line), "%u", static_cast<unsigned>(std::min(9999.0, s.fps + 0.5)));
++        else
++            std::snprintf(line, sizeof(line), "-");
++        const std::uint32_t length = static_cast<std::uint32_t>(std::strlen(line));
++        draw_text(pixels, kMargin + (kFpsDigits - std::min(length, kFpsDigits)) * kGlyphAdvance, kMargin, line);
++        return;
++    }
+     std::uint32_t y = kMargin;
+     if (s.valid) {
+         std::snprintf(line, sizeof(line), "FPS %.1f GAME %.1f SPD %.0f%%", s.fps, s.game_fps, s.speed * 100.0);
+--- a/host/gpu/vulkan_renderer.cpp
++++ b/host/gpu/vulkan_renderer.cpp
+@@ -2896,8 +2896,10 @@
+ void VulkanRenderer::Impl::record_overlay(VkCommandBuffer commands, VkImage destination) {
+     const std::uint32_t scale = perf::overlay_scale(content_rect.extent.height);
+     const std::uint32_t inset = 4u * scale;
+-    const std::uint32_t width = perf::kOverlayWidth * scale;
+-    const std::uint32_t height = perf::kOverlayHeight * scale;
++    // The part in use (the frame rate alone is a small box).
++    const perf::OverlaySize used = perf::overlay_size();
++    const std::uint32_t width = used.width * scale;
++    const std::uint32_t height = used.height * scale;
+     if (inset + width > content_rect.extent.width || inset + height > content_rect.extent.height) return;
+ 
+     perf::draw_overlay(overlay_pixels.data());
+@@ -2918,8 +2920,7 @@
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+     VkImageBlit blit{};
+     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
+-    blit.srcOffsets[1] = {static_cast<std::int32_t>(perf::kOverlayWidth),
+-                          static_cast<std::int32_t>(perf::kOverlayHeight), 1};
++    blit.srcOffsets[1] = {static_cast<std::int32_t>(used.width), static_cast<std::int32_t>(used.height), 1};
+     blit.dstSubresource = blit.srcSubresource;
+     const std::int32_t left = content_rect.offset.x + static_cast<std::int32_t>(inset);
+     const std::int32_t top = content_rect.offset.y + static_cast<std::int32_t>(inset);
+@@ -8615,10 +8616,11 @@
+     if (impl.overlay_visible) {
+         const std::uint32_t scale = perf::overlay_scale(height);
+         const std::uint32_t inset = 4u * scale;
+-        if (inset + perf::kOverlayWidth * scale <= width && inset + perf::kOverlayHeight * scale <= height) {
+-            for (std::uint32_t y = 0; y < perf::kOverlayHeight * scale; ++y) {
++        const perf::OverlaySize used = perf::overlay_size();
++        if (inset + used.width * scale <= width && inset + used.height * scale <= height) {
++            for (std::uint32_t y = 0; y < used.height * scale; ++y) {
+                 std::uint8_t *row = pixels.data() + static_cast<std::size_t>(inset + y) * width * 4u;
+-                for (std::uint32_t x = 0; x < perf::kOverlayWidth * scale; ++x) {
++                for (std::uint32_t x = 0; x < used.width * scale; ++x) {
+                     const std::uint32_t pixel = impl.overlay_pixels[(y / scale) * perf::kOverlayWidth + x / scale];
+                     std::memcpy(row + (inset + x) * 4u, &pixel, 4u);
+                 }
+--- a/host/ui/menu.cpp
++++ b/host/ui/menu.cpp
+@@ -410,13 +410,13 @@
+         }
+     }
+     {
+-        static const char *const kPerf[] = {"Off", "Overlay", "Overlay and log", "Log only"};
++        static const char *const kPerf[] = {"Off", "Overlay", "Overlay and log", "Log only", "Frame rate only"};
+         const int current = static_cast<int>(s.perf);
+         if (const int delta = choice_row(
+                 "Performance", kPerf[current],
+                 options_for("video.performance", "Frame times and speed in the top-left corner, and a [perf] line "
+                                                  "per second on the console. F3 shows or hides the overlay."))) {
+-            s.perf = static_cast<settings::PerfDisplay>(cycle(current, delta, 4));
++            s.perf = static_cast<settings::PerfDisplay>(cycle(current, delta, 5));
+             renderer().set_perf_overlay(perf::options().overlay);
+             settings::save();
+         }

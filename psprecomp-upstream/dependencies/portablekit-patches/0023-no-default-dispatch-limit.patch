@@ -1,0 +1,14 @@
+--- a/host/main.cpp	2026-11-11 15:50:08.657862313 +0000
++++ b/host/main.cpp	2026-11-11 15:50:15.475615137 +0000
+@@ -83,7 +83,10 @@
+ #endif
+ 
+ std::uint64_t configured_max_dispatches() {
+-    constexpr std::uint64_t default_limit = 4'000'000'000ull;
++    // No limit unless one is asked for: the old default (4 billion dispatches)
++    // stopped the game after under an hour of play.
++    // PSPRECOMP_MAX_DISPATCHES still bounds a test run.
++    constexpr std::uint64_t default_limit = std::numeric_limits<std::uint64_t>::max();
+     const char *text = std::getenv("PSPRECOMP_MAX_DISPATCHES");
+     if (text == nullptr || *text == '\0') return default_limit;
+     errno = 0;

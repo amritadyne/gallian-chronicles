@@ -1,0 +1,51 @@
+--- a/host/gpu/ge_state.hpp	2026-11-06 23:33:30.665859576 +0000
++++ b/host/gpu/ge_state.hpp	2026-11-06 23:33:30.737525109 +0000
+@@ -260,6 +260,14 @@
+ using DrawObserver = void (*)(const DrawCall &call, std::uint32_t primitive_address);
+ void set_draw_observer(DrawObserver observer) noexcept;
+ 
++// Optional source of draws built outside the display list. A NOP whose data is
++// non-zero is passed to it as a marker; when it returns a draw, that draw goes
++// to the sink at that point of the list, keeping its order with the list's own
++// draws. A game profile uses it to draw from the game's graphics-library calls
++// directly (VC2 native rendering) instead of from commands describing them.
++using NativeDrawSource = const DrawCall *(*)(std::uint32_t marker);
++void set_native_draw_source(NativeDrawSource source) noexcept;
++
+ // Executes display lists and reports the draw calls they produce. The backend
+ // installs a sink; with no sink the lists are still parsed (for callbacks).
+ class GeState {
+--- a/host/gpu/ge_state.cpp	2026-11-06 23:33:30.671226533 +0000
++++ b/host/gpu/ge_state.cpp	2026-11-06 23:33:30.737652268 +0000
+@@ -171,6 +171,7 @@
+ }
+ 
+ DrawObserver g_draw_observer = nullptr;
++NativeDrawSource g_native_draw_source = nullptr;
+ 
+ std::uint32_t expand_color(std::uint32_t value, std::uint32_t format) {
+     switch (format) {
+@@ -988,6 +989,7 @@
+ }
+ 
+ void set_draw_observer(DrawObserver observer) noexcept { g_draw_observer = observer; }
++void set_native_draw_source(NativeDrawSource source) noexcept { g_native_draw_source = source; }
+ 
+ void GeState::fill_draw_state(DrawCall &call) const {
+     call.through = (vertex_type_ & (1u << 23u)) != 0u;
+@@ -1416,6 +1418,15 @@
+         if (command == kViewMatrixNumber) view_matrix_source_ = pc;
+         pc += 4u;
+ 
++        if (command == kNop && data != 0u && g_native_draw_source != nullptr) {
++            if (const DrawCall *native = g_native_draw_source(data); native != nullptr) {
++                ++draw_count_;
++                vertex_count_ += native->vertices.size();
++                if (draw_sink_) draw_sink_(*native);
++            }
++            continue;
++        }
++
+         switch (command) {
+         case kJump:
+             pc = relative_address(data) & 0x0FFFFFFCu;

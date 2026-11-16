@@ -1,0 +1,856 @@
+sceNetAdhocMatching: the party library (host / client / peer modes, hello, join, accept,
+cancel, leave, bye, keep-alive timeouts, data), on the ad hoc datagram sockets with its own
+message format, events delivered on an event thread as on the PSP. sceNetGetMallocStat.
+(2026-11-14)
+
+--- a/host/hle/hle_adhoc.cpp
++++ b/host/hle/hle_adhoc.cpp
+@@ -301,7 +301,24 @@
+ // sceNet and sceWlanDrv ------------------------------------------------------
+ 
+ void register_net(HleRegistrar &hle) {
+-    hle.add("sceNet", "sceNetInit", [](Runtime &, AllegrexContext &ctx) { done(ctx, "sceNetInit", 5, 0u); });
++    // The network library's memory pool: its size, from sceNetInit.
++    static std::uint32_t pool_size = 0x20000u;
++    hle.add("sceNet", "sceNetInit", [](Runtime &, AllegrexContext &ctx) {
++        if (arg(ctx, 0) != 0u) pool_size = arg(ctx, 0);
++        done(ctx, "sceNetInit", 5, 0u);
++    });
++    // sceNetGetMallocStat(stat): the pool's size, the most of it ever used and
++    // what is free now. Host sockets use none of it, so it is all free. VC2
++    // sends a battle's stream data only with 40 KB free; the stub that left
++    // the structure unwritten stopped Versus at Deploy (2026-11-14).
++    hle.bind("sceNet", 0xCC393E48u, [](Runtime &rt, AllegrexContext &ctx) {
++        if (const std::uint32_t stat = arg(ctx, 0); stat != 0u) {
++            rt.memory().store32(stat + 0u, pool_size);
++            rt.memory().store32(stat + 4u, 0u);
++            rt.memory().store32(stat + 8u, pool_size);
++        }
++        done(ctx, "sceNetGetMallocStat", 1, 0u, "pool " + std::to_string(pool_size) + " bytes, all free");
++    });
+     hle.add("sceNet", "sceNetTerm", [](Runtime &, AllegrexContext &ctx) { done(ctx, "sceNetTerm", 0, 0u); });
+     hle.add("sceNet", "sceNetFreeThreadinfo",
+             [](Runtime &, AllegrexContext &ctx) { done(ctx, "sceNetFreeThreadinfo", 1, 0u); });
+@@ -958,6 +975,10 @@
+ 
+ } // namespace
+ 
++void register_adhoc_matching(HleRegistrar &hle);  // hle_adhoc_matching.cpp
++
++adhoc::Mac adhoc_own_mac() { return own_mac(); }
++
+ void adhoc_apply_settings(bool switch_now) {
+     if (!state().ctl_initialized) return;
+     if (!settings::current().adhoc || adhoc_server_address().empty()) {
+@@ -986,6 +1007,7 @@
+     register_ptp(hle);
+     register_discover(hle);
+     register_netconf(hle);
++    register_adhoc_matching(hle);
+ }
+ 
+ } // namespace portablekit
+--- a/cmake/PortableKit.cmake
++++ b/cmake/PortableKit.cmake
+@@ -70,6 +70,7 @@
+     host/hle/hle_utility.cpp
+     host/hle/hle_savedata.cpp
+     host/hle/hle_adhoc.cpp
++    host/hle/hle_adhoc_matching.cpp
+     host/hle/hle_extensions.cpp
+     host/hle/hle_extension_host.cpp
+     host/extension_keys.cpp
+--- /dev/null
++++ b/host/hle/hle_adhoc_matching.cpp
+@@ -0,0 +1,791 @@
++// sceNetAdhocMatching: forming a party of players (host and clients, or two
++// equal peers) on top of the ad hoc datagram sockets.
++//
++// The game sees the PSP library: Init, Term, Create, Start, Stop, Delete,
++// SelectTarget, CancelTarget, CancelTargetWithOpt, SetHelloOpt, SendData and
++// AbortSendData, and its handler gets the PSP's events (hello, request, leave,
++// deny, cancel, accept, established, timeout, error, bye, data, data ack) on
++// an event thread of the priority and stack size the game passes to Start, as
++// on the PSP, so the handler may do anything a thread may.
++//
++// Between players the messages are this file's own, not the PSP's: one small
++// datagram per message on the game's matching port, sent through the ad hoc
++// client (which carries them inside the session, see adhoc/client.hpp):
++//
++//   offset size
++//   0      4    magic "VCM1"
++//   4      1    type (Message below)
++//   5      1    0
++//   6      2    option length (little-endian), at most kMaxOption
++//   8      n    option data
++//   8+n    6*k  (Accept only) the other members' MACs
++//
++// Behaviour (what each side sees), from the PSP library's documented API:
++//  - A host (mode 1) or peer (mode 3) sends Hello every hello interval while it
++//    has room; a client (mode 2) or a peer with no partner gets a hello event
++//    for each Hello from a sender it has not asked or been asked by.
++//  - A client's SelectTarget on a host sends Join; the host gets a request
++//    event. The host's SelectTarget on it sends Accept: the host gets an
++//    established event, the client an accept event, then established.
++//  - A host's CancelTarget on a request denies it (the client gets deny); on a
++//    member it removes it (the member gets leave). A client's CancelTarget on
++//    its request withdraws it (the host gets cancel); on its host it leaves
++//    (the host gets leave).
++//  - Stop sends Bye: a host's members get bye; a member's host gets bye.
++//  - Each side pings its partners every keep-alive interval; a partner heard
++//    from for none of keep-alive x init count gets a timeout event and goes.
++//
++// Written from the PSP library's interface and behaviour; no other
++// implementation's code is used. <prefix>_TRACE_ADHOC logs every call and
++// event.
++#include "../profile.hpp"
++#include "hle_common.hpp"
++
++#include "adhoc/client.hpp"
++
++#include "psprecomp/common.hpp"
++
++#include <algorithm>
++#include <cstring>
++#include <deque>
++#include <map>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace portablekit {
++
++adhoc::Mac adhoc_own_mac();  // hle_adhoc.cpp
++
++namespace {
++
++using adhoc::Client;
++using adhoc::Mac;
++
++namespace err {
++constexpr std::uint32_t kInvalidMode = 0x80410801u;
++constexpr std::uint32_t kInvalidPort = 0x80410802u;
++constexpr std::uint32_t kInvalidMaxNum = 0x80410803u;
++constexpr std::uint32_t kInvalidOptLen = 0x80410805u;
++constexpr std::uint32_t kInvalidArg = 0x80410806u;
++constexpr std::uint32_t kInvalidId = 0x80410807u;
++constexpr std::uint32_t kIdNotAvailable = 0x80410808u;
++constexpr std::uint32_t kNoSpace = 0x80410809u;
++constexpr std::uint32_t kIsRunning = 0x8041080Au;
++constexpr std::uint32_t kNotRunning = 0x8041080Bu;
++constexpr std::uint32_t kUnknownTarget = 0x8041080Cu;
++constexpr std::uint32_t kTargetNotReady = 0x8041080Du;
++constexpr std::uint32_t kExceedMaxNum = 0x8041080Eu;
++constexpr std::uint32_t kRequestInProgress = 0x8041080Fu;
++constexpr std::uint32_t kAlreadyEstablished = 0x80410810u;
++constexpr std::uint32_t kAlreadyInitialized = 0x80410812u;
++constexpr std::uint32_t kNotInitialized = 0x80410813u;
++constexpr std::uint32_t kPortInUse = 0x80410814u;
++constexpr std::uint32_t kInvalidDataLen = 0x80410816u;
++constexpr std::uint32_t kNotEstablished = 0x80410817u;
++constexpr std::uint32_t kDataBusy = 0x80410818u;
++}  // namespace err
++
++enum Mode : std::uint32_t { kHost = 1u, kClient = 2u, kPeer = 3u };
++
++enum Event : std::uint32_t {
++    kEventHello = 1u,
++    kEventRequest = 2u,
++    kEventLeave = 3u,
++    kEventDeny = 4u,
++    kEventCancel = 5u,
++    kEventAccept = 6u,
++    kEventEstablished = 7u,
++    kEventTimeout = 8u,
++    kEventError = 9u,
++    kEventBye = 10u,
++    kEventData = 11u,
++    kEventDataAck = 12u,
++    kEventDataTimeout = 13u,
++};
++
++enum class Message : std::uint8_t {
++    Hello = 1,
++    Join = 2,
++    Accept = 3,
++    Refuse = 4,   // a request turned down, or a membership ended by the host
++    Withdraw = 5, // a request or membership ended by the client
++    Ping = 6,
++    Bye = 7,
++    Data = 8,
++    DataAck = 9,
++    Joined = 10,  // host to members: another member joined (MAC after the header)
++    Gone = 11,    // host to members: a member left (MAC after the header)
++};
++
++constexpr char kMagic[4] = {'V', 'C', 'M', '1'};
++constexpr std::size_t kHeader = 8u;
++// Options and data: up to 8 KB (VC2's accept option is over 1 KB; the
++// datagram relay takes up to 10 KB).
++constexpr std::uint32_t kMaxOption = 8192u;
++constexpr std::uint32_t kMaxData = 8192u;
++// The handler's buffer: MAC at +0, option or data at +8.
++constexpr std::uint32_t kEventBuffer = 8u + kMaxData;
++// Where the event thread starts: a host function at an address the kernel
++// leaves to the host (kernel.hpp: 0x08800000..0x08804000).
++constexpr std::uint32_t kEventThreadEntry = 0x08800100u;
++
++enum class PeerState {
++    Offered,         // heard its hello
++    Asking,          // we asked to join it (client) or partner it (peer)
++    Asked,           // it asked us
++    Member,          // host: one of our members; client: a fellow member
++    Partner,         // client: our host; peer: our partner
++};
++
++struct Peer {
++    PeerState state{PeerState::Offered};
++    std::uint64_t last_heard_us{};
++    std::vector<std::uint8_t> hello;  // its latest hello option
++};
++
++struct PendingEvent {
++    std::uint32_t event{};
++    Mac mac{};
++    bool has_mac{true};
++    std::vector<std::uint8_t> option;
++};
++
++struct Context {
++    std::uint32_t id{};
++    std::uint32_t mode{};
++    std::uint32_t max_peers{};
++    std::uint16_t port{};
++    std::uint32_t buffer_size{};
++    std::uint64_t hello_us{};
++    std::uint64_t keepalive_us{};
++    std::uint32_t init_count{};
++    std::uint64_t retry_us{};
++    std::uint32_t handler{};
++    bool running{};
++    int socket{};
++    std::vector<std::uint8_t> hello;
++    std::map<Mac, Peer> peers;
++    std::deque<PendingEvent> events;
++    std::uint64_t next_hello_us{};
++    std::uint64_t next_ping_us{};
++    // The event thread, and the buffer its handler calls point into.
++    SceUID thread{};
++    std::int32_t buffer_block{-1};
++    std::uint32_t buffer{};
++    bool in_handler{};
++    bool stopping{};
++    // SendData waiting for its acknowledgement: target and when it was sent.
++    std::optional<Mac> sending;
++    std::uint64_t sent_us{};
++};
++
++struct State {
++    bool initialized{};
++    bool hooked{};
++    bool entry_registered{};
++    std::uint32_t next_id{1u};
++    std::map<std::uint32_t, Context> contexts;
++};
++
++State &state() {
++    static State value;
++    return value;
++}
++
++bool trace() { return Client::tracing(); }
++
++void trace_line(const std::string &line) {
++    if (trace()) Client::log("[adhoc-matching] " + line + " t=" + std::to_string(kernel().now_us() / 1000u) + "ms", true);
++}
++
++void done(AllegrexContext &ctx, const char *name, std::uint32_t result, const std::string &note = {}) {
++    if (trace())
++        trace_line(std::string(name) + " = " + psprecomp::hex32(result) + (note.empty() ? "" : " " + note) +
++                   " ra=" + psprecomp::hex32(ctx.gpr[31]));
++    kernel().finish(ctx, result);
++}
++
++Mac read_mac(const psprecomp::GuestMemory &memory, std::uint32_t address) {
++    Mac mac{};
++    for (std::uint32_t i = 0; i < 6u; ++i) mac[i] = memory.load8(address + i);
++    return mac;
++}
++
++std::vector<std::uint8_t> read_bytes(const psprecomp::GuestMemory &memory, std::uint32_t address, std::uint32_t size) {
++    std::vector<std::uint8_t> bytes(size);
++    for (std::uint32_t i = 0; i < size; ++i) bytes[i] = memory.load8(address + i);
++    return bytes;
++}
++
++Context *find(std::uint32_t id) {
++    auto &contexts = state().contexts;
++    const auto it = contexts.find(id);
++    return it != contexts.end() ? &it->second : nullptr;
++}
++
++// Messages ---------------------------------------------------------------------
++
++std::string encode(Message type, const std::vector<std::uint8_t> &option, const std::vector<Mac> &macs = {}) {
++    std::string packet(kMagic, 4);
++    packet.push_back(static_cast<char>(type));
++    packet.push_back('\0');
++    const auto size = static_cast<std::uint16_t>(std::min<std::size_t>(option.size(), kMaxData));
++    packet.push_back(static_cast<char>(size & 0xFFu));
++    packet.push_back(static_cast<char>(size >> 8u));
++    packet.append(reinterpret_cast<const char *>(option.data()), size);
++    for (const Mac &mac : macs) packet.append(reinterpret_cast<const char *>(mac.data()), mac.size());
++    return packet;
++}
++
++struct Decoded {
++    Message type{};
++    std::vector<std::uint8_t> option;
++    std::vector<Mac> macs;
++};
++
++std::optional<Decoded> decode(const std::string &packet) {
++    if (packet.size() < kHeader || std::memcmp(packet.data(), kMagic, 4) != 0) return std::nullopt;
++    Decoded d;
++    d.type = static_cast<Message>(static_cast<std::uint8_t>(packet[4]));
++    const std::size_t size = static_cast<std::uint8_t>(packet[6]) | (static_cast<std::uint8_t>(packet[7]) << 8u);
++    if (size > kMaxData || packet.size() < kHeader + size) return std::nullopt;
++    d.option.assign(packet.begin() + kHeader, packet.begin() + static_cast<std::ptrdiff_t>(kHeader + size));
++    for (std::size_t at = kHeader + size; at + 6u <= packet.size() && d.macs.size() < 64u; at += 6u) {
++        Mac mac{};
++        std::memcpy(mac.data(), packet.data() + at, 6u);
++        d.macs.push_back(mac);
++    }
++    return d;
++}
++
++void send(Context &c, const Mac &to, Message type, const std::vector<std::uint8_t> &option = {},
++          const std::vector<Mac> &macs = {}) {
++    if (c.socket == 0) return;
++    const std::string packet = encode(type, option, macs);
++    (void)Client::get().pdp_send(c.socket, to, c.port, packet.data(), packet.size());
++}
++
++void raise(Context &c, std::uint32_t event, const Mac &mac, std::vector<std::uint8_t> option = {}) {
++    if (trace())
++        trace_line("context " + std::to_string(c.id) + " event " + std::to_string(event) + " " +
++                   adhoc::format_mac(mac) + " option " + std::to_string(option.size()) + " bytes");
++    c.events.push_back(PendingEvent{event, mac, true, std::move(option)});
++}
++
++std::size_t count(const Context &c, PeerState s) {
++    return static_cast<std::size_t>(
++        std::count_if(c.peers.begin(), c.peers.end(), [s](const auto &p) { return p.second.state == s; }));
++}
++
++std::optional<Mac> partner(const Context &c) {
++    for (const auto &[mac, peer] : c.peers)
++        if (peer.state == PeerState::Partner) return mac;
++    return std::nullopt;
++}
++
++bool asking(const Context &c) { return count(c, PeerState::Asking) != 0u; }
++
++// Room for another member (host) or a partner (peer, client).
++bool has_room(const Context &c) {
++    if (c.mode == kHost) return count(c, PeerState::Member) + 1u < c.max_peers;
++    return !partner(c);
++}
++
++std::vector<Mac> members(const Context &c) {
++    std::vector<Mac> list;
++    for (const auto &[mac, peer] : c.peers)
++        if (peer.state == PeerState::Member) list.push_back(mac);
++    return list;
++}
++
++// Handling one message from `from` ---------------------------------------------
++
++void on_message(Context &c, const Mac &from, const Decoded &m, std::uint64_t now) {
++    if (from == adhoc_own_mac()) return;
++    auto it = c.peers.find(from);
++    if (it != c.peers.end()) it->second.last_heard_us = now;
++    const auto known = [&](PeerState s) { return it != c.peers.end() && it->second.state == s; };
++    switch (m.type) {
++    case Message::Hello: {
++        // Only those still looking take note of hellos.
++        if (c.mode == kHost || !has_room(c)) break;
++        if (it == c.peers.end()) it = c.peers.emplace(from, Peer{PeerState::Offered, now, {}}).first;
++        it->second.hello = m.option;
++        if (it->second.state == PeerState::Offered) raise(c, kEventHello, from, m.option);
++        break;
++    }
++    case Message::Join: {
++        if (c.mode == kClient) break;
++        if (!has_room(c)) {
++            send(c, from, Message::Refuse);
++            break;
++        }
++        if (known(PeerState::Asked) || known(PeerState::Member) || known(PeerState::Partner)) break;
++        if (it == c.peers.end()) it = c.peers.emplace(from, Peer{PeerState::Asked, now, {}}).first;
++        it->second.state = PeerState::Asked;
++        raise(c, kEventRequest, from, m.option);
++        break;
++    }
++    case Message::Accept: {
++        if (c.mode == kHost || !known(PeerState::Asking)) break;
++        it->second.state = PeerState::Partner;
++        // The host's other members (they are told about us separately).
++        for (const Mac &mac : m.macs)
++            if (mac != adhoc_own_mac() && c.mode == kClient) c.peers[mac] = Peer{PeerState::Member, now, {}};
++        // Anyone else we heard from is no longer of interest.
++        for (auto peer = c.peers.begin(); peer != c.peers.end();)
++            peer = peer->second.state == PeerState::Offered ? c.peers.erase(peer) : std::next(peer);
++        raise(c, kEventAccept, from, m.option);
++        raise(c, kEventEstablished, from);
++        break;
++    }
++    case Message::Refuse: {
++        if (known(PeerState::Asking)) {
++            it->second.state = PeerState::Offered;
++            raise(c, kEventDeny, from, m.option);
++        } else if (known(PeerState::Partner)) {
++            // Our host (or partner) ended it: every party member is gone.
++            for (const auto &[mac, peer] : c.peers)
++                if (peer.state == PeerState::Partner || peer.state == PeerState::Member)
++                    raise(c, kEventLeave, mac, m.option);
++            c.peers.clear();
++        }
++        break;
++    }
++    case Message::Withdraw: {
++        if (known(PeerState::Asked)) {
++            it->second.state = PeerState::Offered;
++            raise(c, kEventCancel, from, m.option);
++        } else if ((c.mode == kHost && known(PeerState::Member)) || known(PeerState::Partner)) {
++            c.peers.erase(it);
++            raise(c, kEventLeave, from, m.option);
++            if (c.mode == kHost)
++                for (const Mac &mac : members(c)) send(c, mac, Message::Gone, {}, {from});
++        }
++        break;
++    }
++    case Message::Ping: break;  // last_heard_us is all it does
++    case Message::Bye: {
++        if (it == c.peers.end()) break;
++        const PeerState was = it->second.state;
++        c.peers.erase(it);
++        if (c.mode == kClient && was == PeerState::Partner) {
++            c.peers.clear();
++            raise(c, kEventBye, from);
++        } else if (c.mode == kClient) {
++            // A fellow member stopped: the host tells us with Gone.
++        } else if (was != PeerState::Offered) {
++            raise(c, kEventBye, from);
++            if (c.mode == kHost && was == PeerState::Member)
++                for (const Mac &mac : members(c)) send(c, mac, Message::Gone, {}, {from});
++        }
++        break;
++    }
++    case Message::Joined:
++        if (c.mode == kClient && partner(c) == from)
++            for (const Mac &mac : m.macs)
++                if (mac != adhoc_own_mac()) c.peers[mac] = Peer{PeerState::Member, now, {}};
++        break;
++    case Message::Gone:
++        if (c.mode == kClient && partner(c) == from)
++            for (const Mac &mac : m.macs)
++                if (c.peers.erase(mac) != 0u) raise(c, kEventLeave, mac);
++        break;
++    case Message::Data:
++        if (it == c.peers.end() || (it->second.state != PeerState::Member && it->second.state != PeerState::Partner))
++            break;
++        send(c, from, Message::DataAck);
++        raise(c, kEventData, from, m.option);
++        break;
++    case Message::DataAck:
++        if (c.sending && *c.sending == from) {
++            c.sending.reset();
++            raise(c, kEventDataAck, from);
++        }
++        break;
++    }
++}
++
++// Once a vblank: messages in, hellos and pings out, timeouts.
++void pump() {
++    auto &s = state();
++    if (s.contexts.empty()) return;
++    const std::uint64_t now = kernel().now_us();
++    for (auto &[id, c] : s.contexts) {
++        if (!c.running || c.socket == 0) continue;
++        for (int i = 0; i < 64; ++i) {
++            const auto datagram = Client::get().pdp_receive(c.socket);
++            if (!datagram) break;
++            if (const auto message = decode(datagram->data)) on_message(c, datagram->source, *message, now);
++        }
++        if (c.hello_us != 0u && c.mode != kClient && has_room(c) && now >= c.next_hello_us) {
++            send(c, adhoc::kBroadcastMac, Message::Hello, c.hello);
++            c.next_hello_us = now + c.hello_us;
++        }
++        if (c.keepalive_us != 0u && now >= c.next_ping_us) {
++            for (const auto &[mac, peer] : c.peers)
++                if (peer.state == PeerState::Member || peer.state == PeerState::Partner) send(c, mac, Message::Ping);
++            c.next_ping_us = now + c.keepalive_us;
++        }
++        // Silent partners time out; stale offers and requests are forgotten.
++        const std::uint64_t limit = std::max<std::uint64_t>(c.keepalive_us * std::max(c.init_count, 1u), 1'000'000u);
++        for (auto peer = c.peers.begin(); peer != c.peers.end();) {
++            const bool silent = now > peer->second.last_heard_us + limit;
++            if (!silent) {
++                ++peer;
++                continue;
++            }
++            const PeerState was = peer->second.state;
++            const Mac mac = peer->first;
++            peer = c.peers.erase(peer);
++            if (was == PeerState::Member || was == PeerState::Partner || was == PeerState::Asking ||
++                was == PeerState::Asked) {
++                raise(c, kEventTimeout, mac);
++                if (c.mode == kHost && was == PeerState::Member)
++                    for (const Mac &other : members(c)) send(c, other, Message::Gone, {}, {mac});
++            }
++        }
++        if (c.sending && c.retry_us != 0u && now > c.sent_us + c.retry_us * std::max(c.init_count, 1u)) {
++            const Mac mac = *c.sending;
++            c.sending.reset();
++            raise(c, kEventDataTimeout, mac);
++        }
++    }
++}
++
++// The event thread ------------------------------------------------------------
++//
++// Starts at kEventThreadEntry and comes back there after each handler call: it
++// waits until its context has an event, calls the game's handler with it, and
++// ends when the context stops.
++
++Context *context_of_current_thread() {
++    const SceUID uid = kernel().current_uid();
++    for (auto &[id, c] : state().contexts)
++        if (c.thread == uid) return &c;
++    return nullptr;
++}
++
++void release(Context &c);
++
++void event_thread(psprecomp::CorpusRuntime &, AllegrexContext &ctx) {
++    Context *c = context_of_current_thread();
++    if (c == nullptr || c->stopping || !c->running) {
++        if (c != nullptr) {
++            c->thread = 0;
++            c->stopping = false;
++            c->in_handler = false;
++            // Deleted while its handler ran: it goes now.
++            if (c->handler == 0u) {
++                release(*c);
++                state().contexts.erase(c->id);
++            }
++        }
++        ctx.set_gpr(2, 0u);
++        kernel().exit_current_thread(ctx, 0, true);
++        return;
++    }
++    c->in_handler = false;
++    if (c->events.empty()) {
++        const std::uint32_t id = c->id;
++        ctx.set_gpr(31, kEventThreadEntry);
++        ctx.pc = kEventThreadEntry;
++        // When the wait ends the thread comes back to the entry (pc above).
++        kernel().wait_host(ctx, std::nullopt, [id](bool) -> std::optional<std::uint32_t> {
++            pump();
++            const Context *context = find(id);
++            if (context == nullptr || context->stopping || !context->running || !context->events.empty()) return 0u;
++            return std::nullopt;
++        });
++        return;
++    }
++    PendingEvent e = std::move(c->events.front());
++    c->events.pop_front();
++    auto &memory = kernel().runtime().memory();
++    const auto size = static_cast<std::uint32_t>(std::min<std::size_t>(e.option.size(), kMaxData));
++    for (std::uint32_t i = 0; i < 6u; ++i) memory.store8(c->buffer + i, e.mac[i]);
++    for (std::uint32_t i = 0; i < size; ++i) memory.store8(c->buffer + 8u + i, e.option[i]);
++    c->in_handler = true;
++    ctx.set_gpr(31, kEventThreadEntry);
++    kernel().call_guest(ctx, c->handler, {c->id, e.event, e.has_mac ? c->buffer : 0u, size, c->buffer + 8u},
++                        [](AllegrexContext &returned, std::uint32_t) { returned.pc = kEventThreadEntry; }, 5u);
++}
++
++// Stops a context: Bye to its partners and members, the event thread ended.
++void stop(AllegrexContext &ctx, Context &c) {
++    for (const auto &[mac, peer] : c.peers)
++        if (peer.state != PeerState::Offered) send(c, mac, Message::Bye);
++    c.peers.clear();
++    c.events.clear();
++    c.running = false;
++    if (c.socket != 0) {
++        Client::get().pdp_close(c.socket);
++        c.socket = 0;
++    }
++    if (c.thread != 0) {
++        if (c.thread == kernel().current_uid() || c.in_handler) {
++            c.stopping = true;  // it ends itself when the handler returns
++        } else {
++            (void)kernel().terminate_thread(ctx, c.thread, true);
++            c.thread = 0;
++        }
++    }
++}
++
++void release(Context &c) {
++    if (c.buffer_block >= 0) (void)kernel().free_block(c.buffer_block);
++    c.buffer_block = -1;
++}
++
++}  // namespace
++
++void register_adhoc_matching(HleRegistrar &hle) {
++    hle.add("sceNetAdhocMatching", "sceNetAdhocMatchingInit", [](Runtime &, AllegrexContext &ctx) {
++        auto &s = state();
++        if (s.initialized) return done(ctx, "sceNetAdhocMatchingInit", err::kAlreadyInitialized);
++        s.initialized = true;
++        if (!s.hooked) {
++            s.hooked = true;
++            kernel().add_vblank_hook(&pump);
++        }
++        done(ctx, "sceNetAdhocMatchingInit", 0u, "memory " + std::to_string(arg(ctx, 0)));
++    });
++    hle.add("sceNetAdhocMatching", "sceNetAdhocMatchingTerm", [](Runtime &, AllegrexContext &ctx) {
++        auto &s = state();
++        for (auto &[id, c] : s.contexts) {
++            stop(ctx, c);
++            release(c);
++        }
++        s.contexts.clear();
++        s.initialized = false;
++        done(ctx, "sceNetAdhocMatchingTerm", 0u);
++    });
++    // Create(mode, max peers, port, buffer size, hello us, keep-alive us,
++    // init count, retry us, handler): the ninth argument is on the stack.
++    hle.add("sceNetAdhocMatching", "sceNetAdhocMatchingCreate", [](Runtime &rt, AllegrexContext &ctx) {
++        auto &s = state();
++        const char *name = "sceNetAdhocMatchingCreate";
++        if (!s.initialized) return done(ctx, name, err::kNotInitialized);
++        const std::uint32_t mode = arg(ctx, 0);
++        const std::uint32_t max_peers = arg(ctx, 1);
++        const auto port = static_cast<std::uint16_t>(arg(ctx, 2));
++        const std::uint32_t handler = rt.memory().load32(ctx.gpr[29]);
++        if (mode < kHost || mode > kPeer) return done(ctx, name, err::kInvalidMode);
++        if (mode != kPeer && (max_peers < 2u || max_peers > 16u)) return done(ctx, name, err::kInvalidMaxNum);
++        if (port == 0u) return done(ctx, name, err::kInvalidPort);
++        if (handler == 0u) return done(ctx, name, err::kInvalidArg);
++        for (const auto &[id, c] : s.contexts)
++            if (c.port == port) return done(ctx, name, err::kPortInUse);
++        if (s.contexts.size() >= 16u) return done(ctx, name, err::kIdNotAvailable);
++        Context c;
++        c.id = s.next_id++;
++        c.mode = mode;
++        c.max_peers = mode == kPeer ? 2u : max_peers;
++        c.port = port;
++        c.buffer_size = arg(ctx, 3);
++        c.hello_us = arg(ctx, 4);
++        c.keepalive_us = arg(ctx, 5);
++        c.init_count = arg(ctx, 6);
++        c.retry_us = arg(ctx, 7);
++        c.handler = handler;
++        const std::uint32_t id = c.id;
++        s.contexts.emplace(id, std::move(c));
++        done(ctx, name, id,
++             "mode " + std::to_string(mode) + " peers " + std::to_string(max_peers) + " port " + std::to_string(port) +
++                 " hello " + std::to_string(arg(ctx, 4)) + "us keep-alive " + std::to_string(arg(ctx, 5)) +
++                 "us x" + std::to_string(arg(ctx, 6)) + " handler " + psprecomp::hex32(handler));
++    });
++    // Start(id, event thread priority, its stack, input thread priority, its
++    // stack, hello option length, hello option).
++    hle.add("sceNetAdhocMatching", "sceNetAdhocMatchingStart", [](Runtime &rt, AllegrexContext &ctx) {
++        auto &s = state();
++        const char *name = "sceNetAdhocMatchingStart";
++        if (!s.initialized) return done(ctx, name, err::kNotInitialized);
++        Context *c = find(arg(ctx, 0));
++        if (c == nullptr) return done(ctx, name, err::kInvalidId);
++        if (c->running) return done(ctx, name, err::kIsRunning);
++        const std::uint32_t option_size = arg(ctx, 5);
++        const std::uint32_t option = arg(ctx, 6);
++        if (option_size > kMaxOption || (option_size != 0u && option == 0u)) return done(ctx, name, err::kInvalidOptLen);
++        const int socket = Client::get().pdp_open(c->port, std::max<std::uint32_t>(c->buffer_size, 8192u));
++        if (socket == 0) return done(ctx, name, err::kPortInUse);
++        if (!s.entry_registered) {
++            s.entry_registered = true;
++            kernel().runtime().register_function(kEventThreadEntry, &event_thread, "portablekit_matching_events");
++        }
++        if (c->buffer_block < 0) {
++            c->buffer_block = kernel().allocate_block("matching events", 1u, (kEventBuffer + 0xFFu) & ~0xFFu, 0u);
++            if (c->buffer_block < 0) {
++                Client::get().pdp_close(socket);
++                return done(ctx, name, err::kNoSpace);
++            }
++            c->buffer = kernel().find_block(c->buffer_block)->address;
++        }
++        std::uint32_t priority = arg(ctx, 1);
++        if (priority == 0u || priority > 0x7Fu) priority = 0x20u;
++        const std::uint32_t stack = std::max<std::uint32_t>(arg(ctx, 2), 0x1000u);
++        const std::int32_t thread = kernel().create_thread("SceNetAdhocMatchingEvent", kEventThreadEntry, priority,
++                                                           stack, 0u, ctx.gpr[28]);
++        if (thread < 0) {
++            Client::get().pdp_close(socket);
++            return done(ctx, name, err::kNoSpace);
++        }
++        c->socket = socket;
++        c->hello = read_bytes(rt.memory(), option, option_size);
++        c->running = true;
++        c->stopping = false;
++        c->in_handler = false;
++        c->thread = thread;
++        c->next_hello_us = c->next_ping_us = kernel().now_us();
++        const std::uint32_t id = c->id;
++        (void)kernel().start_thread(ctx, thread, 0u, 0u);
++        done(ctx, name, 0u, "context " + std::to_string(id) + " hello option " + std::to_string(option_size) + " bytes");
++    });
++    hle.add("sceNetAdhocMatching", "sceNetAdhocMatchingStop", [](Runtime &, AllegrexContext &ctx) {
++        Context *c = find(arg(ctx, 0));
++        if (c == nullptr) return done(ctx, "sceNetAdhocMatchingStop", err::kInvalidId);
++        if (!c->running) return done(ctx, "sceNetAdhocMatchingStop", err::kNotRunning);
++        stop(ctx, *c);
++        done(ctx, "sceNetAdhocMatchingStop", 0u);
++    });
++    hle.add("sceNetAdhocMatching", "sceNetAdhocMatchingDelete", [](Runtime &, AllegrexContext &ctx) {
++        auto &s = state();
++        const auto it = s.contexts.find(arg(ctx, 0));
++        if (it == s.contexts.end()) return done(ctx, "sceNetAdhocMatchingDelete", err::kInvalidId);
++        if (it->second.running) stop(ctx, it->second);
++        if (it->second.stopping) {
++            // Its event thread is in the handler: it goes when that returns.
++            it->second.handler = 0u;
++        }
++        release(it->second);
++        if (!it->second.stopping) s.contexts.erase(it);
++        done(ctx, "sceNetAdhocMatchingDelete", 0u);
++    });
++    hle.add("sceNetAdhocMatching", "sceNetAdhocMatchingSetHelloOpt", [](Runtime &rt, AllegrexContext &ctx) {
++        Context *c = find(arg(ctx, 0));
++        if (c == nullptr) return done(ctx, "sceNetAdhocMatchingSetHelloOpt", err::kInvalidId);
++        if (!c->running) return done(ctx, "sceNetAdhocMatchingSetHelloOpt", err::kNotRunning);
++        const std::uint32_t size = arg(ctx, 1);
++        const std::uint32_t option = arg(ctx, 2);
++        if (size > kMaxOption || (size != 0u && option == 0u))
++            return done(ctx, "sceNetAdhocMatchingSetHelloOpt", err::kInvalidOptLen);
++        c->hello = read_bytes(rt.memory(), option, size);
++        done(ctx, "sceNetAdhocMatchingSetHelloOpt", 0u, std::to_string(size) + " bytes");
++    });
++    // SelectTarget(id, mac, option length, option).
++    hle.add("sceNetAdhocMatching", "sceNetAdhocMatchingSelectTarget", [](Runtime &rt, AllegrexContext &ctx) {
++        const char *name = "sceNetAdhocMatchingSelectTarget";
++        Context *c = find(arg(ctx, 0));
++        if (c == nullptr) return done(ctx, name, err::kInvalidId);
++        if (!c->running) return done(ctx, name, err::kNotRunning);
++        if (arg(ctx, 1) == 0u) return done(ctx, name, err::kInvalidArg);
++        const Mac mac = read_mac(rt.memory(), arg(ctx, 1));
++        const std::uint32_t size = arg(ctx, 2);
++        if (size > kMaxOption || (size != 0u && arg(ctx, 3) == 0u))
++            return done(ctx, name, err::kInvalidOptLen, "option " + std::to_string(size) + " bytes");
++        const std::vector<std::uint8_t> option = read_bytes(rt.memory(), arg(ctx, 3), size);
++        const auto it = c->peers.find(mac);
++        if (it == c->peers.end()) return done(ctx, name, err::kUnknownTarget, adhoc::format_mac(mac));
++        Peer &peer = it->second;
++        if (c->mode == kHost) {
++            if (peer.state == PeerState::Member) return done(ctx, name, err::kAlreadyEstablished);
++            if (!has_room(*c)) return done(ctx, name, err::kExceedMaxNum);
++            if (peer.state != PeerState::Asked) return done(ctx, name, err::kTargetNotReady);
++            const std::vector<Mac> others = members(*c);
++            for (const Mac &other : others) send(*c, other, Message::Joined, {}, {mac});
++            peer.state = PeerState::Member;
++            peer.last_heard_us = kernel().now_us();
++            send(*c, mac, Message::Accept, option, others);
++            raise(*c, kEventEstablished, mac);
++            return done(ctx, name, 0u, "accepted " + adhoc::format_mac(mac));
++        }
++        if (partner(*c)) return done(ctx, name, err::kAlreadyEstablished);
++        if (asking(*c)) return done(ctx, name, err::kRequestInProgress);
++        if (c->mode == kPeer && peer.state == PeerState::Asked) {
++            peer.state = PeerState::Partner;
++            peer.last_heard_us = kernel().now_us();
++            send(*c, mac, Message::Accept, option);
++            raise(*c, kEventEstablished, mac);
++            return done(ctx, name, 0u, "accepted " + adhoc::format_mac(mac));
++        }
++        if (peer.state != PeerState::Offered) return done(ctx, name, err::kTargetNotReady);
++        peer.state = PeerState::Asking;
++        peer.last_heard_us = kernel().now_us();
++        send(*c, mac, Message::Join, option);
++        done(ctx, name, 0u, "asked " + adhoc::format_mac(mac));
++    });
++    // CancelTarget(id, mac) and CancelTargetWithOpt(id, mac, length, option).
++    const auto cancel = [](Runtime &rt, AllegrexContext &ctx, const char *name, bool with_option) {
++        Context *c = find(arg(ctx, 0));
++        if (c == nullptr) return done(ctx, name, err::kInvalidId);
++        if (!c->running) return done(ctx, name, err::kNotRunning);
++        if (arg(ctx, 1) == 0u) return done(ctx, name, err::kInvalidArg);
++        const Mac mac = read_mac(rt.memory(), arg(ctx, 1));
++        std::vector<std::uint8_t> option;
++        if (with_option) {
++            const std::uint32_t size = arg(ctx, 2);
++            if (size > kMaxOption || (size != 0u && arg(ctx, 3) == 0u)) return done(ctx, name, err::kInvalidOptLen);
++            option = read_bytes(rt.memory(), arg(ctx, 3), size);
++        }
++        const auto it = c->peers.find(mac);
++        if (it == c->peers.end()) return done(ctx, name, err::kUnknownTarget);
++        switch (it->second.state) {
++        case PeerState::Asked:  // a request we turn down
++            send(*c, mac, Message::Refuse, option);
++            it->second.state = PeerState::Offered;
++            break;
++        case PeerState::Asking:  // our request, withdrawn
++            send(*c, mac, Message::Withdraw, option);
++            it->second.state = PeerState::Offered;
++            break;
++        case PeerState::Member:  // host: a member removed
++            send(*c, mac, c->mode == kHost ? Message::Refuse : Message::Withdraw, option);
++            c->peers.erase(it);
++            if (c->mode == kHost)
++                for (const Mac &other : members(*c)) send(*c, other, Message::Gone, {}, {mac});
++            break;
++        case PeerState::Partner:  // client: leaving our host; peer: our partner
++            send(*c, mac, Message::Withdraw, option);
++            if (c->mode == kClient) c->peers.clear();
++            else c->peers.erase(mac);
++            break;
++        case PeerState::Offered: return done(ctx, name, err::kTargetNotReady);
++        }
++        done(ctx, name, 0u, adhoc::format_mac(mac));
++    };
++    hle.add("sceNetAdhocMatching", "sceNetAdhocMatchingCancelTarget",
++            [cancel](Runtime &rt, AllegrexContext &ctx) { cancel(rt, ctx, "sceNetAdhocMatchingCancelTarget", false); });
++    hle.add("sceNetAdhocMatching", "sceNetAdhocMatchingCancelTargetWithOpt", [cancel](Runtime &rt, AllegrexContext &ctx) {
++        cancel(rt, ctx, "sceNetAdhocMatchingCancelTargetWithOpt", true);
++    });
++    // SendData(id, mac, length, data): one message to a partner or member,
++    // acknowledged with a data ack event (or data timeout).
++    hle.add("sceNetAdhocMatching", "sceNetAdhocMatchingSendData", [](Runtime &rt, AllegrexContext &ctx) {
++        const char *name = "sceNetAdhocMatchingSendData";
++        Context *c = find(arg(ctx, 0));
++        if (c == nullptr) return done(ctx, name, err::kInvalidId);
++        if (!c->running) return done(ctx, name, err::kNotRunning);
++        if (arg(ctx, 1) == 0u) return done(ctx, name, err::kInvalidArg);
++        const std::uint32_t size = arg(ctx, 2);
++        if (size == 0u || size > kMaxData || arg(ctx, 3) == 0u) return done(ctx, name, err::kInvalidDataLen);
++        const Mac mac = read_mac(rt.memory(), arg(ctx, 1));
++        const auto it = c->peers.find(mac);
++        if (it == c->peers.end()) return done(ctx, name, err::kUnknownTarget);
++        if (it->second.state != PeerState::Member && it->second.state != PeerState::Partner)
++            return done(ctx, name, err::kNotEstablished);
++        if (c->sending) return done(ctx, name, err::kDataBusy);
++        send(*c, mac, Message::Data, read_bytes(rt.memory(), arg(ctx, 3), size));
++        c->sending = mac;
++        c->sent_us = kernel().now_us();
++        done(ctx, name, 0u, std::to_string(size) + " bytes to " + adhoc::format_mac(mac));
++    });
++    hle.add("sceNetAdhocMatching", "sceNetAdhocMatchingAbortSendData", [](Runtime &, AllegrexContext &ctx) {
++        Context *c = find(arg(ctx, 0));
++        if (c == nullptr) return done(ctx, "sceNetAdhocMatchingAbortSendData", err::kInvalidId);
++        c->sending.reset();
++        done(ctx, "sceNetAdhocMatchingAbortSendData", 0u);
++    });
++}
++
++}  // namespace portablekit

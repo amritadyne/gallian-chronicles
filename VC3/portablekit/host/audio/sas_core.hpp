@@ -1,0 +1,134 @@
+#pragma once
+
+#include "psprecomp/guest_memory.hpp"
+
+#include <array>
+#include <cstdint>
+#include <vector>
+
+namespace portablekit::audio {
+
+inline constexpr std::uint32_t kSasMaxVoices = 32u;
+// SAS envelope heights are 0..0x40000000 on hardware; the rate encoding it
+// inherits from the SPU works in 15-bit steps, so the envelope is kept there
+// and scaled up only when the guest asks to read it.
+inline constexpr std::int32_t kEnvelopeMax = 0x7FFF;
+
+enum class EnvelopeStage { Off, Attack, Decay, Sustain, Release };
+
+struct SasVoice {
+    // Source
+    std::uint32_t address{};
+    std::uint32_t size{};
+    bool looping{};
+    bool pcm{};  // raw 16-bit PCM instead of VAG
+    // A noise voice (__sceSasSetNoise) plays the output of a noise generator
+    // instead of a sample, at `noise_clock` (0..63), until it is keyed off.
+    bool noise{};
+    std::uint32_t noise_clock{};
+    std::int32_t noise_timer{};
+    std::uint16_t noise_register{1u};
+    std::uint32_t pitch{0x1000u};
+    std::int32_t left{0x1000};
+    std::int32_t right{0x1000};
+
+    bool playing{};
+    bool paused{};
+
+    // VAG decoder position: `block` is a byte offset from `address`, `index`
+    // the sample inside the 28-sample block it decoded, `phase` the 12-bit
+    // fraction of a source sample the resampler has advanced past `index`.
+    std::uint32_t block{};
+    std::uint32_t loop_block{};
+    std::int32_t index{28};
+    std::uint32_t phase{};
+    std::int32_t history1{};
+    std::int32_t history2{};
+    std::array<std::int16_t, 28> decoded{};
+    std::int16_t previous{};
+    std::int16_t current{};
+    bool source_ended{};
+    bool primed{};
+
+    // Envelope
+    bool have_adsr{};
+    std::uint32_t adsr1{};
+    std::uint32_t adsr2{};
+    EnvelopeStage stage{EnvelopeStage::Off};
+    std::int32_t envelope{};
+    std::int32_t envelope_counter{};
+
+    // The explicit envelope a game sets stage by stage with __sceSasSetADSR,
+    // __sceSasSetADSRmode and __sceSasSetSL, instead of the packed words of
+    // __sceSasSetSimpleADSR: for attack, decay, sustain and release a rate
+    // and a curve (SasCurve), stepped once a sample, with heights of
+    // 0..0x40000000 as the hardware reports them. A voice uses it from the
+    // first of those calls until the next __sceSasSetSimpleADSR.
+    bool explicit_envelope{};
+    std::array<std::int64_t, 4> rates{};
+    std::array<std::uint8_t, 4> curves{};
+    std::int64_t sustain_level{};
+    std::int64_t height{};
+};
+
+// The curves of the explicit envelope, as __sceSasSetADSRmode numbers them.
+enum class SasCurve : std::uint8_t {
+    LinearIncrease = 0, LinearDecrease = 1, LinearBent = 2,
+    ExponentDecrease = 3, ExponentIncrease = 4, Direct = 5,
+};
+inline constexpr std::int64_t kEnvelopeHeightMax = 0x40000000;
+
+// Software SAS: up to 32 VAG, PCM or noise voices mixed at 44100 Hz. Reverb
+// is not modelled, so the effect sends are accepted and ignored.
+class SasCore {
+public:
+    void init(std::uint32_t grain, std::uint32_t max_voices, std::uint32_t output_mode);
+    [[nodiscard]] std::uint32_t grain() const noexcept { return grain_; }
+    [[nodiscard]] std::uint32_t output_mode() const noexcept { return output_mode_; }
+
+    void set_voice(std::uint32_t voice, std::uint32_t address, std::uint32_t size, bool looping);
+    void set_voice_pcm(std::uint32_t voice, std::uint32_t address, std::uint32_t size, std::int32_t loop);
+    void set_noise(std::uint32_t voice, std::uint32_t clock);
+    void set_pitch(std::uint32_t voice, std::uint32_t pitch);
+    void set_volume(std::uint32_t voice, std::int32_t left, std::int32_t right);
+    void set_simple_adsr(std::uint32_t voice, std::uint32_t adsr1, std::uint32_t adsr2);
+    // The explicit envelope. `flag` bits 0-3 pick which of attack, decay,
+    // sustain and release change. Each returns 0 or the SAS error code.
+    [[nodiscard]] std::uint32_t set_adsr_rates(std::uint32_t voice, std::uint32_t flag, const std::array<std::int32_t, 4> &rates);
+    [[nodiscard]] std::uint32_t set_adsr_curves(std::uint32_t voice, std::uint32_t flag, std::array<std::uint32_t, 4> curves);
+    [[nodiscard]] std::uint32_t set_sustain_level(std::uint32_t voice, std::int32_t level);
+    [[nodiscard]] std::uint32_t set_grain(std::uint32_t grain);
+    [[nodiscard]] std::uint32_t set_output_mode(std::uint32_t mode);
+    // One bit per voice, set while the voice is paused.
+    [[nodiscard]] std::uint32_t pause_flag() const noexcept;
+    void set_pause(std::uint32_t mask, bool paused);
+    void key_on(std::uint32_t voice);
+    void key_off(std::uint32_t voice);
+    // One bit per voice, set while the voice is *not* playing.
+    [[nodiscard]] std::uint32_t end_flag() const noexcept;
+    [[nodiscard]] std::int32_t envelope_height(std::uint32_t voice) const noexcept;
+    // One bit per voice, set while the voice is paused.
+    [[nodiscard]] std::uint32_t pause_flags() const noexcept;
+
+    // Renders `frames` stereo frames into `output`, overwriting it.
+    void render(const psprecomp::GuestMemory &memory, std::int16_t *output, std::size_t frames);
+
+private:
+    void advance_source(const psprecomp::GuestMemory &memory, SasVoice &voice);
+    void decode_block(const psprecomp::GuestMemory &memory, SasVoice &voice);
+    void step_envelope(SasVoice &voice);
+    void step_explicit_envelope(SasVoice &voice);
+    void make_envelope_explicit(SasVoice &voice);
+
+    std::uint32_t grain_{256u};
+    std::uint32_t max_voices_{kSasMaxVoices};
+    std::uint32_t output_mode_{};
+    std::array<SasVoice, kSasMaxVoices> voices_{};
+    std::vector<std::int32_t> mix_;
+};
+
+// One core per guest SAS handle. Games usually open one, but the handle is an
+// argument to every call, so it is keyed rather than assumed.
+[[nodiscard]] SasCore &sas_core(std::uint32_t handle);
+
+} // namespace portablekit::audio

@@ -1,0 +1,158 @@
+--- a/host/hle/hle_savedata.cpp	2026-11-11 14:18:35.546867404 +0000
++++ b/host/hle/hle_savedata.cpp	2026-11-11 14:19:08.958282239 +0000
+@@ -29,7 +29,9 @@
+ #include <fstream>
+ #include <iostream>
+ #include <iterator>
++#include <map>
+ #include <optional>
++#include <sstream>
+ #include <string>
+ #include <vector>
+ 
+@@ -288,6 +290,64 @@
+     return contents;
+ }
+ 
++// --- Creation dates --------------------------------------------------------------
++// The PSP keeps a save file's creation date. The host does not keep one a
++// game can rely on: saves are written to a temporary file and renamed, and a
++// copied save gets a new one. Valkyria Chronicles II stores its save's
++// creation date and, when FILES reports another, treats the save as one from
++// another console ("Save data creation date does not match the PSP system")
++// and switches off content unlocked by data link or password. So the date
++// each file was first written (or, for a save made before this record, first
++// seen) is kept beside it in portablekit-created.txt (lower case: never
++// listed as part of the save, and copied with it), and FILES reports that as
++// the file's creation date; accessed and modified stay the host's write time.
++
++constexpr const char *kCreatedRecord = "portablekit-created.txt";
++
++std::time_t host_time(std::filesystem::file_time_type written) {
++    // file_time_type's clock is not the system clock everywhere; offset by now.
++    const auto system_time = std::chrono::system_clock::now() +
++                             std::chrono::duration_cast<std::chrono::system_clock::duration>(
++                                 written - std::filesystem::file_time_type::clock::now());
++    return static_cast<std::time_t>(std::chrono::duration_cast<std::chrono::seconds>(system_time.time_since_epoch()).count());
++}
++
++// File name -> creation time (seconds since 1970), as recorded.
++std::map<std::string, long long> read_created(const std::filesystem::path &folder) {
++    std::map<std::string, long long> created;
++    std::ifstream in(folder / kCreatedRecord);
++    std::string name;
++    long long when = 0;
++    while (in >> name >> when) created[name] = when;
++    return created;
++}
++
++void write_created(const std::filesystem::path &folder, const std::map<std::string, long long> &created) {
++    std::error_code error;
++    if (created.empty()) {
++        std::filesystem::remove(folder / kCreatedRecord, error);
++        return;
++    }
++    std::ofstream out(folder / kCreatedRecord, std::ios::trunc);
++    for (const auto &[name, when] : created) out << name << ' ' << when << '\n';
++}
++
++// After a save: each file of the save without a recorded creation date gets
++// its write time (new saves: when they were made); files gone are dropped.
++void record_created(const std::filesystem::path &folder) {
++    auto created = read_created(folder);
++    std::map<std::string, long long> now;
++    std::error_code error;
++    for (const auto &entry : std::filesystem::directory_iterator(folder, error)) {
++        if (!entry.is_regular_file(error)) continue;
++        const std::string name = entry.path().filename().string();
++        if (name == kCreatedRecord) continue;
++        const auto found = created.find(name);
++        now[name] = found != created.end() ? found->second : static_cast<long long>(host_time(entry.last_write_time(error)));
++    }
++    if (now != created) write_created(folder, now);
++}
++
+ std::uint32_t do_save(psprecomp::GuestMemory &memory, std::uint32_t params, const std::string &save_name) {
+     const auto files = files_for(memory, params, save_name);
+     const std::uint32_t buffer = memory.load32(params + param::kDataBuf);
+@@ -303,12 +363,18 @@
+     }
+     std::cerr << "[savedata] saved " << size << " bytes to " << savedata::save_folder(state().memory_stick, files).string()
+               << (files.key ? " (encrypted)" : "") << "\n";
++    record_created(savedata::save_folder(state().memory_stick, files));
+     return result::kOk;
+ }
+ 
+ std::uint32_t do_delete(psprecomp::GuestMemory &memory, std::uint32_t params, const std::string &save_name) {
+     const auto files = files_for(memory, params, save_name);
+     if (!savedata::delete_save(state().memory_stick, files)) return result::kDeleteNoData;
++    {
++        std::error_code error;
++        const std::filesystem::path folder = savedata::save_folder(state().memory_stick, files);
++        if (std::filesystem::is_directory(folder, error)) record_created(folder);
++    }
+     std::cerr << "[savedata] deleted " << savedata::save_folder(state().memory_stick, files).string() << "\n";
+     return result::kOk;
+ }
+@@ -446,13 +512,7 @@
+ 
+ // A ScePspDateTime (year, month, day, hour, minute, second as u16, then a
+ // u32 of microseconds) for a host file time, in local time.
+-void store_psp_date(psprecomp::GuestMemory &memory, std::uint32_t at, std::filesystem::file_time_type written) {
+-    // file_time_type's clock is not the system clock everywhere; offset by now.
+-    const auto system_time = std::chrono::system_clock::now() +
+-                             std::chrono::duration_cast<std::chrono::system_clock::duration>(
+-                                 written - std::filesystem::file_time_type::clock::now());
+-    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(system_time.time_since_epoch());
+-    const std::time_t time = static_cast<std::time_t>(seconds.count());
++void store_psp_date(psprecomp::GuestMemory &memory, std::uint32_t at, std::time_t time) {
+     std::tm tm{};
+ #if defined(_WIN32)
+     localtime_s(&tm, &time);
+@@ -517,6 +577,8 @@
+               [](const auto &a, const auto &b) { return a.path().filename() < b.path().filename(); });
+ 
+     constexpr std::uint32_t kEntrySize = 80u;
++    auto created = read_created(folder);
++    bool created_changed = false;
+     for (const auto &entry : entries) {
+         const std::string name = entry.path().filename().string();
+         // PSP file names are upper case; anything else (a host temporary
+@@ -543,15 +605,23 @@
+         if (kind == 0u && size >= 16u &&
+             std::find(encrypted_names.begin(), encrypted_names.end(), name) != encrypted_names.end())
+             size -= 16u;
+-        const auto written = entry.last_write_time(error);
++        const std::time_t written = host_time(entry.last_write_time(error));
++        // The creation date: the recorded one (see "Creation dates"); a save
++        // made before the record gets its current write time, kept from now on.
++        std::time_t made = written;
++        if (const auto found = created.find(name); found != created.end()) made = static_cast<std::time_t>(found->second);
++        else created[name] = written, created_changed = true;
+         memory.store32(at, 0x21FFu);  // a file, readable and writable
+         memory.store32(at + 4u, 0u);
+         memory.store32(at + 8u, static_cast<std::uint32_t>(size));
+         memory.store32(at + 12u, static_cast<std::uint32_t>(size >> 32u));
+-        for (std::uint32_t record = 0; record < 3u; ++record) store_psp_date(memory, at + 16u + record * 16u, written);
++        store_psp_date(memory, at + 16u, made);     // created
++        store_psp_date(memory, at + 32u, written);  // accessed
++        store_psp_date(memory, at + 48u, written);  // modified
+         write_cstring(memory, at + 64u, name, 16u);
+         memory.store32(info + 12u + kind * 4u, count + 1u);
+     }
++    if (created_changed) write_created(folder, created);
+     if (trace_savedata())
+         std::cerr << "[savedata] FILES " << folder.string() << ": secure=" << memory.load32(info + 12u)
+                   << " normal=" << memory.load32(info + 16u) << " system=" << memory.load32(info + 20u) << "\n";
+--- a/host/save_data/savedata_store.cpp	2026-11-11 14:18:35.640247662 +0000
++++ b/host/save_data/savedata_store.cpp	2026-11-11 14:19:08.960634612 +0000
+@@ -241,7 +241,8 @@
+     const auto folder = save_folder(memory_stick, files);
+     if (!std::filesystem::is_directory(folder, ec)) return 0u;
+     for (const auto &entry : std::filesystem::directory_iterator(folder, ec))
+-        if (entry.is_regular_file(ec)) total += entry.file_size(ec);
++        // The creation-date record (hle_savedata.cpp) is not part of the save.
++        if (entry.is_regular_file(ec) && entry.path().filename() != "portablekit-created.txt") total += entry.file_size(ec);
+     return total;
+ }
+ 

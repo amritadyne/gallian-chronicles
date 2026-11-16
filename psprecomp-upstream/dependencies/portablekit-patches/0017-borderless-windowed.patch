@@ -1,0 +1,301 @@
+Subject: [PATCH 0017] Borderless windowed display mode
+
+video.display_mode = window | borderless | fullscreen (Settings::borderless
+beside Settings::fullscreen; settings::display_mode/set_display_mode).
+Borderless: a window with no frame over the whole display it is on, kept
+there when it moves to another display or the desktop's resolution changes;
+the plain window's place and size come back when leaving it. video.fullscreen
+is still read first and written, so older builds see borderless as a window.
+VulkanRenderer::set_display_mode; set_fullscreen remains. The menu's Display
+row cycles the three.
+
+diff -ru a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
+--- a/host/gpu/vulkan_renderer.cpp	2026-11-07 23:58:00.603184183 +0000
++++ b/host/gpu/vulkan_renderer.cpp	2026-11-07 23:58:51.572847544 +0000
+@@ -675,6 +675,11 @@
+ 
+     RendererConfig config;
+     SDL_Window *window{};
++    // How the window is shown now, and where it was as a plain window, to
++    // go back to from Borderless (SDL restores it itself after Fullscreen).
++    settings::DisplayMode display_mode{settings::DisplayMode::Window};
++    SDL_Rect windowed_rect{};
++    bool windowed_rect_known{};
+     VkInstance instance{};
+     VkSurfaceKHR surface{};
+     VkPhysicalDevice physical_device{};
+@@ -1990,6 +1995,9 @@
+     bool create_overlay(std::string &error);
+     void record_overlay(VkCommandBuffer commands, VkImage destination);
+     void update_display_info();
++    void apply_display_mode(settings::DisplayMode mode);
++    // Borderless: the window over the whole display it is on.
++    void cover_display();
+     // `overwritten`: bit 0, the pass's first draw writes every pixel's colour
+     // and alpha; bit 1, every pixel's depth.
+     void begin_pass(std::uint32_t address, std::uint32_t overwritten = 0u);
+@@ -2160,7 +2168,10 @@
+     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) std::cout << "[pad] no gamepad support: " << SDL_GetError() << "\n";
+     else impl.scan_gamepads();
+     SDL_WindowFlags window_flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE;
+-    if (player.fullscreen) window_flags |= SDL_WINDOW_FULLSCREEN;
++    const settings::DisplayMode display_mode = settings::display_mode(player);
++    if (display_mode == settings::DisplayMode::Fullscreen) window_flags |= SDL_WINDOW_FULLSCREEN;
++    // Without a frame from the start, so none shows before it covers the display.
++    if (display_mode == settings::DisplayMode::Borderless) window_flags |= SDL_WINDOW_BORDERLESS;
+ #if defined(__ANDROID__)
+     // A phone runs the game full screen with the system bars hidden: shown,
+     // they cover the top and bottom of the picture (Android 15 draws apps
+@@ -2173,6 +2184,9 @@
+         error = std::string("SDL_CreateWindow failed: ") + SDL_GetError();
+         return false;
+     }
++    impl.display_mode = (window_flags & SDL_WINDOW_FULLSCREEN) != 0u ? settings::DisplayMode::Fullscreen
++                                                                     : settings::DisplayMode::Window;
++    if (display_mode == settings::DisplayMode::Borderless) impl.apply_display_mode(display_mode);
+ 
+     std::uint32_t extension_count = 0u;
+     const char *const *sdl_extensions = SDL_Vulkan_GetInstanceExtensions(&extension_count);
+@@ -5070,7 +5084,15 @@
+         if (event.type == SDL_EVENT_GAMEPAD_REMOVED) impl_->close_gamepad(event.gdevice.which);
+         // F3 toggles the performance overlay. No pad combination: L3+R3 is
+         // reserved for the in-game menu.
+-        if (event.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED) impl_->update_display_info();
++        if (event.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED) {
++            impl_->update_display_info();
++            // Moved to another display (Win+Shift+arrow): cover that one.
++            if (impl_->display_mode == settings::DisplayMode::Borderless) impl_->cover_display();
++        }
++        // The desktop's resolution changed under a borderless window.
++        if (event.type == SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED &&
++            impl_->display_mode == settings::DisplayMode::Borderless)
++            impl_->cover_display();
+         if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) impl_->swapchain_dirty = true;
+         // A phone turned from one landscape to the other keeps its size; only
+         // the display's transform changes.
+@@ -5450,18 +5472,87 @@
+ void VulkanRenderer::set_window_scale(std::uint32_t scale) {
+     if (!impl_ || impl_->window == nullptr) return;
+     scale = std::clamp<std::uint32_t>(scale, 1u, settings::kMaxWindowScale);
+-    if ((SDL_GetWindowFlags(impl_->window) & SDL_WINDOW_FULLSCREEN) != 0u) return;
+-    SDL_SetWindowSize(impl_->window, static_cast<int>(kPspWidth * scale), static_cast<int>(kPspHeight * scale));
++    const int width = static_cast<int>(kPspWidth * scale);
++    const int height = static_cast<int>(kPspHeight * scale);
++    if (impl_->display_mode != settings::DisplayMode::Window ||
++        (SDL_GetWindowFlags(impl_->window) & SDL_WINDOW_FULLSCREEN) != 0u) {
++        // Applied when the window comes back.
++        impl_->windowed_rect.w = width;
++        impl_->windowed_rect.h = height;
++        return;
++    }
++    SDL_SetWindowSize(impl_->window, width, height);
+     impl_->swapchain_dirty = true;
+ }
+ 
+ void VulkanRenderer::set_fullscreen(bool fullscreen) {
+-    if (!impl_ || impl_->window == nullptr) return;
++    set_display_mode(fullscreen ? settings::DisplayMode::Fullscreen : settings::DisplayMode::Window);
++}
++
++void VulkanRenderer::set_display_mode(settings::DisplayMode mode) {
++    if (impl_ && impl_->window != nullptr) impl_->apply_display_mode(mode);
++}
++
++void VulkanRenderer::Impl::apply_display_mode(settings::DisplayMode mode) {
+ #if defined(__ANDROID__)
+-    fullscreen = true;
++    mode = settings::DisplayMode::Fullscreen;
+ #endif
+-    SDL_SetWindowFullscreen(impl_->window, fullscreen);
+-    impl_->swapchain_dirty = true;
++    using settings::DisplayMode;
++    if (display_mode == DisplayMode::Window && mode != DisplayMode::Window) {
++        // Remember the plain window's place and size, unmaximised.
++        if ((SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) != 0u) {
++            SDL_RestoreWindow(window);
++            SDL_SyncWindow(window);
++        }
++        windowed_rect_known = SDL_GetWindowPosition(window, &windowed_rect.x, &windowed_rect.y) &&
++                              SDL_GetWindowSize(window, &windowed_rect.w, &windowed_rect.h);
++    }
++    const DisplayMode previous = display_mode;
++    display_mode = mode;
++    switch (mode) {
++    case DisplayMode::Fullscreen:
++        SDL_SetWindowBordered(window, true);
++        SDL_SetWindowResizable(window, true);
++        SDL_SetWindowFullscreen(window, true);
++        break;
++    case DisplayMode::Borderless:
++        SDL_SetWindowFullscreen(window, false);
++        SDL_SyncWindow(window);
++        SDL_SetWindowResizable(window, false);
++        SDL_SetWindowBordered(window, false);
++        cover_display();
++        break;
++    case DisplayMode::Window:
++        SDL_SetWindowFullscreen(window, false);
++        SDL_SyncWindow(window);
++        SDL_SetWindowBordered(window, true);
++        SDL_SetWindowResizable(window, true);
++        if (previous != DisplayMode::Window && windowed_rect_known && windowed_rect.w > 0 && windowed_rect.h > 0) {
++            SDL_SetWindowSize(window, windowed_rect.w, windowed_rect.h);
++            SDL_SetWindowPosition(window, windowed_rect.x, windowed_rect.y);
++        }
++        break;
++    }
++    SDL_SyncWindow(window);
++    swapchain_dirty = true;
++    std::cout << "[render] display mode "
++              << (mode == DisplayMode::Fullscreen ? "fullscreen" : mode == DisplayMode::Borderless ? "borderless" : "window")
++              << "\n";
++}
++
++void VulkanRenderer::Impl::cover_display() {
++    if (window == nullptr) return;
++    SDL_DisplayID display = SDL_GetDisplayForWindow(window);
++    if (display == 0u) display = SDL_GetPrimaryDisplay();
++    SDL_Rect bounds{};
++    if (display == 0u || !SDL_GetDisplayBounds(display, &bounds) || bounds.w <= 0 || bounds.h <= 0) return;
++    int x = 0, y = 0, width = 0, height = 0;
++    SDL_GetWindowPosition(window, &x, &y);
++    SDL_GetWindowSize(window, &width, &height);
++    if (x == bounds.x && y == bounds.y && width == bounds.w && height == bounds.h) return;
++    SDL_SetWindowPosition(window, bounds.x, bounds.y);
++    SDL_SetWindowSize(window, bounds.w, bounds.h);
++    swapchain_dirty = true;
+ }
+ 
+ void VulkanRenderer::set_present_mode(settings::PresentMode mode) {
+diff -ru a/host/gpu/vulkan_renderer.hpp b/host/gpu/vulkan_renderer.hpp
+--- a/host/gpu/vulkan_renderer.hpp	2026-11-07 23:58:00.603365995 +0000
++++ b/host/gpu/vulkan_renderer.hpp	2026-11-07 23:58:51.567685574 +0000
+@@ -191,7 +191,8 @@
+     // window's size in pixels, including every later change of it.
+     void set_resolution(settings::Resolution resolution);
+     void set_window_scale(std::uint32_t scale);
+-    void set_fullscreen(bool fullscreen);
++    void set_fullscreen(bool fullscreen);  // Fullscreen or Window
++    void set_display_mode(settings::DisplayMode mode);
+     void set_present_mode(settings::PresentMode mode);
+     [[nodiscard]] bool supports_present_mode(settings::PresentMode mode) const;
+     void set_aspect(settings::Aspect aspect);
+diff -ru a/host/settings/settings.cpp b/host/settings/settings.cpp
+--- a/host/settings/settings.cpp	2026-11-07 23:58:00.603150332 +0000
++++ b/host/settings/settings.cpp	2026-11-07 23:58:51.567372037 +0000
+@@ -181,6 +181,23 @@
+          [](Settings &s, const std::string &t) { return parse_uint(t, 1u, kMaxWindowScale, s.window_scale); },
+          [](const Settings &s) { return std::to_string(s.window_scale); }, nullptr},
+         BOOL_FIELD("video.fullscreen", fullscreen),
++        // After video.fullscreen, which older versions read, so it decides.
++        {"video.display_mode", nullptr,
++         [](Settings &s, const std::string &t) {
++             if (t == "window") set_display_mode(s, DisplayMode::Window);
++             else if (t == "borderless") set_display_mode(s, DisplayMode::Borderless);
++             else if (t == "fullscreen") set_display_mode(s, DisplayMode::Fullscreen);
++             else return false;
++             return true;
++         },
++         [](const Settings &s) {
++             switch (display_mode(s)) {
++             case DisplayMode::Borderless: return std::string("borderless");
++             case DisplayMode::Fullscreen: return std::string("fullscreen");
++             default: return std::string("window");
++             }
++         },
++         nullptr},
+         {"video.present_mode", nullptr,
+          [](Settings &s, const std::string &t) { return kPresentModes.parse(t, s.present_mode); },
+          [](const Settings &s) { return kPresentModes.format(s.present_mode); }, nullptr},
+@@ -538,7 +555,7 @@
+     if (const auto keyboard = game().keyboard_defaults) keyboard(values.bindings, values.mouse);
+     if (platform == Platform::Android) {
+         values.aspect = Aspect::Fill;
+-        values.fullscreen = true;
++        set_display_mode(values, DisplayMode::Fullscreen);
+         values.mouse = false;
+     }
+     return values;
+diff -ru a/host/settings/settings.hpp b/host/settings/settings.hpp
+--- a/host/settings/settings.hpp	2026-11-07 23:58:00.603112859 +0000
++++ b/host/settings/settings.hpp	2026-11-07 23:58:51.566251700 +0000
+@@ -91,6 +91,7 @@
+     Resolution resolution{};           // render resolution; 0x0: the window's (see Resolution)
+     std::uint32_t window_scale{2u};    // windowed size, multiples of 480x272
+     bool fullscreen{};
++    bool borderless{};                 // windowed without a frame, covering its display (fullscreen off)
+     PresentMode present_mode{PresentMode::Fifo};
+     Aspect aspect{Aspect::Original};
+     bool sharp_screen{};               // nearest instead of linear scaling to the window
+@@ -181,6 +182,19 @@
+     bool backup_timestamp{true};       // a backup made from the menu goes to a new folder named by its time
+ };
+ 
++// How the game's window is shown, kept as the two settings above (an older
++// version reads video.fullscreen and sees a borderless window as a window).
++// Borderless: a window with no frame over the whole display it is on, so
++// switching away and overlays work as with a window.
++enum class DisplayMode { Window, Borderless, Fullscreen };
++[[nodiscard]] constexpr DisplayMode display_mode(const Settings &s) noexcept {
++    return s.fullscreen ? DisplayMode::Fullscreen : s.borderless ? DisplayMode::Borderless : DisplayMode::Window;
++}
++constexpr void set_display_mode(Settings &s, DisplayMode mode) noexcept {
++    s.fullscreen = mode == DisplayMode::Fullscreen;
++    s.borderless = mode == DisplayMode::Borderless;
++}
++
+ inline constexpr std::uint32_t kMaxWindowScale = 4u;
+ inline constexpr std::uint32_t kMaxFontWeight = 2u;
+ inline constexpr float kMinMouseSensitivity = 0.01f;
+diff -ru a/host/ui/menu.cpp b/host/ui/menu.cpp
+--- a/host/ui/menu.cpp	2026-11-07 23:58:00.603419899 +0000
++++ b/host/ui/menu.cpp	2026-11-07 23:59:07.071120273 +0000
+@@ -230,20 +230,24 @@
+ #if !defined(__ANDROID__)
+     // A phone is always full screen: no window to size.
+     {
+-        const int delta =
+-            choice_row("Display", s.fullscreen ? "Fullscreen" : "Window",
+-                       options_for("video.fullscreen", "Fill the screen, or play in a window you can resize."));
++        static const char *const kModes[] = {"Window", "Borderless", "Fullscreen"};
++        const int current = static_cast<int>(settings::display_mode(s));
++        const int delta = choice_row(
++            "Display", kModes[current],
++            options_for("video.display_mode", "A window you can resize; Borderless, a window without a frame over "
++                                              "the whole screen, which you can switch away from like a window; or "
++                                              "fullscreen."));
+         if (delta != 0) {
+-            s.fullscreen = !s.fullscreen;
+-            renderer().set_fullscreen(s.fullscreen);
++            settings::set_display_mode(s, static_cast<settings::DisplayMode>(cycle(current, delta, 3)));
++            renderer().set_display_mode(settings::display_mode(s));
+             settings::save();
+         }
+     }
+     {
+         RowOptions o = options_for("video.window_scale", "The window's size, in multiples of the PSP's screen.");
+-        if (s.fullscreen) {
++        if (settings::display_mode(s) != settings::DisplayMode::Window) {
+             o.disabled = true;
+-            o.note = "Fullscreen";
++            o.note = s.fullscreen ? "Fullscreen" : "Borderless";
+         }
+         const std::string value = "×" + std::to_string(s.window_scale) + "   " + size_text(s.window_scale);
+         if (const int delta = choice_row("Window size", value, o)) {
+@@ -426,6 +430,7 @@
+         };
+         restore("video.resolution", s.resolution, d.resolution);
+         restore("video.fullscreen", s.fullscreen, d.fullscreen);
++        restore("video.display_mode", s.borderless, d.borderless);
+         restore("video.window_scale", s.window_scale, d.window_scale);
+         restore("video.aspect", s.aspect, d.aspect);
+         restore("video.sharp_screen", s.sharp_screen, d.sharp_screen);
+@@ -438,7 +443,7 @@
+         restore("video.fast_loading", s.fast_loading, d.fast_loading);
+         restore("video.performance", s.perf, d.perf);
+         renderer().set_resolution(s.resolution);
+-        renderer().set_fullscreen(s.fullscreen);
++        renderer().set_display_mode(settings::display_mode(s));
+         renderer().set_window_scale(s.window_scale);
+         renderer().set_aspect(s.aspect);
+         renderer().set_sharp_screen(s.sharp_screen);

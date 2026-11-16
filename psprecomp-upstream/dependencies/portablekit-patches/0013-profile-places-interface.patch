@@ -1,0 +1,46 @@
+diff -ru a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
+--- a/host/gpu/vulkan_renderer.cpp	2026-11-07 13:31:02.283175661 +0000
++++ b/host/gpu/vulkan_renderer.cpp	2026-11-07 13:31:10.383176142 +0000
+@@ -838,6 +838,7 @@
+     // Display settings.
+     settings::PresentMode requested_present{settings::PresentMode::Fifo};
+     settings::Aspect aspect{settings::Aspect::Original};
++    bool profile_places_interface{};  // set_profile_places_interface
+     std::uint32_t requested_scale{2u};  // multiples of 480x272; 0: the window's size
+     // A target size the window asks for, applied once it has held for
+     // kSettleFrames frames; a changed setting applies at the next chance.
+@@ -5458,6 +5459,10 @@
+     impl_->follow_window();
+ }
+ 
++void VulkanRenderer::set_profile_places_interface(bool places) {
++    if (impl_) impl_->profile_places_interface = places;
++}
++
+ bool VulkanRenderer::supports_fill() noexcept { return portablekit::game().view_aspect_frame != nullptr; }
+ 
+ settings::Aspect VulkanRenderer::usable_aspect(settings::Aspect aspect) noexcept {
+@@ -6322,7 +6327,7 @@
+     // background) belong with the 3D view and stay spread.
+     float fit_x = 1.0f, fit_y = 1.0f;
+     bool fitted = false;
+-    if (call.through && !call.clear_mode && framebuffer_source.target == nullptr &&
++    if (call.through && !call.clear_mode && framebuffer_source.target == nullptr && !impl.profile_places_interface &&
+         impl.shows(call.target.color_address) && impl.interface_fit(fit_x, fit_y)) {
+         float left = impl.scratch.front().x, right = left;
+         for (const GpuVertex &vertex : impl.scratch) {
+diff -ru a/host/gpu/vulkan_renderer.hpp b/host/gpu/vulkan_renderer.hpp
+--- a/host/gpu/vulkan_renderer.hpp	2026-11-07 13:31:02.283718341 +0000
++++ b/host/gpu/vulkan_renderer.hpp	2026-11-07 13:31:10.378959125 +0000
+@@ -198,6 +198,11 @@
+     // view_aspect_frame); for any other it is drawn as Original.
+     [[nodiscard]] static bool supports_fill() noexcept;
+     [[nodiscard]] static settings::Aspect usable_aspect(settings::Aspect aspect) noexcept;
++    // Under Fill the renderer pulls screen-space (through-mode) interface draws
++    // in about the screen's centre to square pixels. A game profile that places
++    // its interface itself (anchoring elements to the window's edges) turns
++    // that off; movies uploaded to the framebuffer keep their pillarbox.
++    void set_profile_places_interface(bool places);
+     void set_sharp_screen(bool sharp);
+     void set_sharp_textures(bool sharp);
+     // Draws an installed HD texture pack's images instead of the game's own

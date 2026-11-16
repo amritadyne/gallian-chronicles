@@ -1,0 +1,8 @@
+# VC2-specific aliases for HLE already supplied by PortableKit.
+# library,nid,name
+SysMemUserForUser,0x91DE343C,sceKernelSetCompiledSdkVersion
+# VC2 enters this callback-aware mutex import while the observed lock is
+# uncontended.  PortableKit's shared mutex path is the same in that case;
+# callback delivery remains a later trace requirement for contested waits.
+ThreadManForUser,0x5BF4DD27,sceKernelLockMutex
+sceUmdUser,0x340B7686,sceUmdGetDiscInfo

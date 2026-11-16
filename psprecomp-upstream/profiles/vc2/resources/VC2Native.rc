@@ -1,0 +1,7 @@
+// Windows application resource for the native Valkyria Chronicles II build.
+// ID 1 is deliberately the primary icon selected by Explorer, the taskbar,
+// and Alt-Tab.
+
+#define VC2NATIVE_ICON 1
+
+VC2NATIVE_ICON ICON "vc2native.ico"

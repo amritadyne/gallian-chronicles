@@ -1,0 +1,2641 @@
+diff -ru a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
+--- a/host/gpu/vulkan_renderer.cpp	2026-11-07 03:25:52.717397289 +0000
++++ b/host/gpu/vulkan_renderer.cpp	2026-11-07 03:25:52.771404213 +0000
+@@ -459,7 +459,7 @@
+ 
+ // The SceCtrlButtons bit the game confirms with: the console's confirm
+ // button, as sceUtilityGetSystemParamInt reports it (0 circle, 1 cross).
+-std::uint32_t confirm_button_bit() { return portablekit::game().confirm_button == 1u ? 0x4000u : 0x2000u; }
++std::uint32_t confirm_button_bit() { return portablekit::active_confirm_button() == 1u ? 0x4000u : 0x2000u; }
+ 
+ // Read on every poll, so the in-game menu's changes apply at once.
+ PadTuning pad_tuning() {
+diff -ru a/host/hle/hle_system.cpp b/host/hle/hle_system.cpp
+--- a/host/hle/hle_system.cpp	2026-11-07 03:25:52.713746458 +0000
++++ b/host/hle/hle_system.cpp	2026-11-07 03:25:52.767360739 +0000
+@@ -1,451 +1,451 @@
+-// UtilsForUser, LoadExecForUser, StdioForUser, ModuleMgrForUser,
+-// InterruptManager, scePower, sceRtc, sceImpose, sceOpenPSID and the parameter
+-// part of sceUtility. sceWlanDrv is with the ad hoc calls in hle_adhoc.cpp.
+-#include "../profile.hpp"
+-#include "hle_common.hpp"
+-
+-#include "kernel/rtc_time.hpp"
+-#include "overlays.hpp"
+-
+-#include "psprecomp/common.hpp"
+-
+-#include <array>
+-#include <chrono>
+-#include <cstring>
+-#include <ctime>
+-#include <iostream>
+-#include <set>
+-#include <string>
+-
+-namespace portablekit {
+-void register_rtc_calendar(HleRegistrar &hle);
+-namespace {
+-
+-// Epoch the virtual PSP clock starts at, so guest wall time advances with it.
+-std::uint64_t boot_unix_us() {
+-    static const std::uint64_t value = static_cast<std::uint64_t>(
+-        std::chrono::duration_cast<std::chrono::microseconds>(
+-            std::chrono::system_clock::now().time_since_epoch()).count());
+-    return value;
+-}
+-
+-std::uint64_t guest_unix_us() { return boot_unix_us() + kernel().now_us(); }
+-
+-void success(Runtime &, AllegrexContext &ctx) { kernel().finish(ctx, 0u); }
+-
+-// The console settings a game asks for and tells the system, under
+-// TRACE_KERNEL: which language and which confirm button it ends up using.
+-bool trace_system_params() {
+-    static const bool enabled = portablekit::env("TRACE_KERNEL") != nullptr;
+-    return enabled;
+-}
+-
+-void register_utils(HleRegistrar &hle) {
+-    // The host has no data cache to keep coherent. Phantasy Star Portable 2
+-    // Infinity (NPJH50332) uses WritebackInvalidateRange.
+-    for (const char *name : {"sceKernelDcacheWritebackAll", "sceKernelDcacheWritebackInvalidateAll",
+-                             "sceKernelDcacheInvalidateRange", "sceKernelDcacheWritebackRange",
+-                             "sceKernelDcacheWritebackInvalidateRange", "sceKernelSetGPO"})
+-        hle.add("UtilsForUser", name, success);
+-    // The guest flushes the instruction cache after copying code into an overlay
+-    // slot, which is the profile's cue to re-check which overlay is loaded.
+-    const auto flush_icache = [](Runtime &rt, AllegrexContext &ctx) {
+-        forget_unmatched_overlays();
+-        revalidate_overlays(rt);
+-        kernel().finish(ctx, 0u);
+-    };
+-    hle.add("UtilsForUser", "sceKernelIcacheInvalidateAll", flush_icache);
+-    hle.add("UtilsForUser", "sceKernelIcacheInvalidateRange", flush_icache);
+-    hle.add("UtilsForUser", "sceKernelLibcTime", [](Runtime &rt, AllegrexContext &ctx) {
+-        const auto seconds = static_cast<std::uint32_t>(guest_unix_us() / 1'000'000u);
+-        if (arg(ctx, 0) != 0u) rt.memory().store32(arg(ctx, 0), seconds);
+-        kernel().finish(ctx, seconds);
+-    });
+-    hle.add("UtilsForUser", "sceKernelLibcGettimeofday", [](Runtime &rt, AllegrexContext &ctx) {
+-        const std::uint64_t now = guest_unix_us();
+-        if (arg(ctx, 0) != 0u) {
+-            rt.memory().store32(arg(ctx, 0), static_cast<std::uint32_t>(now / 1'000'000u));
+-            rt.memory().store32(arg(ctx, 0) + 4u, static_cast<std::uint32_t>(now % 1'000'000u));
+-        }
+-        if (arg(ctx, 1) != 0u) {
+-            rt.memory().store32(arg(ctx, 1), 0u);
+-            rt.memory().store32(arg(ctx, 1) + 4u, 0u);
+-        }
+-        kernel().finish(ctx, 0u);
+-    });
+-    hle.add("UtilsForUser", "sceKernelLibcClock", [](Runtime &, AllegrexContext &ctx) {
+-        kernel().finish(ctx, static_cast<std::uint32_t>(kernel().now_us()));
+-    });
+-}
+-
+-void register_process(HleRegistrar &hle) {
+-    hle.add("LoadExecForUser", "sceKernelRegisterExitCallback", success);
+-    hle.add("LoadExecForUser", "sceKernelExitGame", [](Runtime &rt, AllegrexContext &ctx) {
+-        (void)ctx;
+-        rt.stop("guest called sceKernelExitGame");
+-    });
+-    hle.add("StdioForUser", "sceKernelStdin", [](Runtime &, AllegrexContext &ctx) { kernel().finish(ctx, 0u); });
+-    hle.add("StdioForUser", "sceKernelStdout", [](Runtime &, AllegrexContext &ctx) { kernel().finish(ctx, 1u); });
+-    hle.add("StdioForUser", "sceKernelStderr", [](Runtime &, AllegrexContext &ctx) { kernel().finish(ctx, 2u); });
+-
+-    // The main executable is the only module; overlays are loaded by game code.
+-    constexpr std::uint32_t kMainModuleId = 0x01000001u;
+-    hle.add("ModuleMgrForUser", "sceKernelGetModuleId", [](Runtime &, AllegrexContext &ctx) {
+-        kernel().finish(ctx, kMainModuleId);
+-    });
+-    hle.add("ModuleMgrForUser", "sceKernelGetModuleIdByAddress", [](Runtime &, AllegrexContext &ctx) {
+-        kernel().finish(ctx, kMainModuleId);
+-    });
+-    // Games load Sony's stock modules (font, codecs) as encrypted PRX blobs from
+-    // the disc. Their exports are served by this profile's HLE, so the load is
+-    // acknowledged with a module id and the image itself is never touched.
+-    // The name logged is the one in the module's "~PSP" header.
+-    const auto load_stock_module = [](AllegrexContext &ctx, const std::uint8_t *header, std::size_t count,
+-                                      const std::string &where) {
+-        std::string name = "unknown";
+-        for (std::size_t i = 0; i + 0x2Au < count; ++i) {
+-            if (std::memcmp(header + i, "~PSP", 4u) != 0) continue;
+-            const char *text = reinterpret_cast<const char *>(header + i + 0x0Au);
+-            name.assign(text, strnlen(text, 28u));
+-            break;
+-        }
+-        const auto uid = static_cast<std::uint32_t>(kernel().allocate_uid());
+-        log_once("module:" + name, "[module] loaded stock module " + name + where + " (HLE)");
+-        kernel().finish(ctx, uid);
+-    };
+-    hle.add("ModuleMgrForUser", "sceKernelLoadModuleByID", [load_stock_module](Runtime &, AllegrexContext &ctx) {
+-        std::array<std::uint8_t, 0x100> header{};
+-        const std::size_t count = read_open_file(arg(ctx, 0), 0u, header.data(), header.size());
+-        load_stock_module(ctx, header.data(), count, "");
+-    });
+-    // The same by path. A path that does not open fails the way sceIoOpen
+-    // would have.
+-    hle.add("ModuleMgrForUser", "sceKernelLoadModule", [load_stock_module](Runtime &rt, AllegrexContext &ctx) {
+-        const std::string path = read_cstring(rt.memory(), arg(ctx, 0), 256u);
+-        std::array<std::uint8_t, 0x100> header{};
+-        const std::int64_t count = read_guest_file(path, 0u, header.data(), header.size());
+-        if (count < 0) {
+-            std::cerr << "[module] cannot load " << path << ": " << psprecomp::hex32(static_cast<std::uint32_t>(count))
+-                      << "\n";
+-            kernel().finish(ctx, static_cast<std::uint32_t>(count));
+-            return;
+-        }
+-        load_stock_module(ctx, header.data(), static_cast<std::size_t>(count), " from " + path);
+-    });
+-    for (const char *name : {"sceKernelStartModule", "sceKernelStopModule", "sceKernelUnloadModule"}) {
+-        hle.add("ModuleMgrForUser", name, [name](Runtime &, AllegrexContext &ctx) {
+-            log_once(std::string("module-op:") + name, std::string("[module] ") + name);
+-            // sceKernelStartModule returns the module id it was given.
+-            kernel().finish(ctx, arg(ctx, 0));
+-        });
+-    }
+-    hle.add("ModuleMgrForUser", "sceKernelStopUnloadSelfModuleWithStatus", [](Runtime &, AllegrexContext &ctx) {
+-        kernel().exit_current_thread(ctx, static_cast<std::int32_t>(arg(ctx, 1)), true);
+-    });
+-}
+-
+-void register_interrupts(HleRegistrar &hle) {
+-    hle.add("InterruptManager", "sceKernelRegisterSubIntrHandler", [](Runtime &, AllegrexContext &ctx) {
+-        auto &handler = kernel().sub_interrupts[arg(ctx, 0)][arg(ctx, 1)];
+-        handler.handler = arg(ctx, 2);
+-        handler.argument = arg(ctx, 3);
+-        kernel().finish(ctx, 0u);
+-    });
+-    hle.add("InterruptManager", "sceKernelReleaseSubIntrHandler", [](Runtime &, AllegrexContext &ctx) {
+-        kernel().finish(ctx, kernel().sub_interrupts[arg(ctx, 0)].erase(arg(ctx, 1)) != 0u ? 0u : error::kIllegalArgument);
+-    });
+-    hle.add("InterruptManager", "sceKernelEnableSubIntr", [](Runtime &, AllegrexContext &ctx) {
+-        auto &handlers = kernel().sub_interrupts[arg(ctx, 0)];
+-        const auto found = handlers.find(arg(ctx, 1));
+-        if (found != handlers.end()) found->second.enabled = true;
+-        kernel().finish(ctx, found != handlers.end() ? 0u : error::kIllegalArgument);
+-    });
+-}
+-
+-void register_platform(HleRegistrar &hle) {
+-    hle.add("scePower", "scePowerRegisterCallback", [](Runtime &, AllegrexContext &ctx) {
+-        // Report mains power with a healthy battery so the game stops waiting for
+-        // the first power notification.
+-        constexpr std::uint32_t kAcPower = 0x00001000u;
+-        constexpr std::uint32_t kBatteryExists = 0x00000080u;
+-        constexpr std::uint32_t kBatteryPower = 0x00000004u;
+-        kernel().notify_callback(static_cast<SceUID>(arg(ctx, 1)), kAcPower | kBatteryExists | kBatteryPower);
+-        kernel().finish(ctx, 0u);
+-    });
+-    // Nothing here ever changes the power state, so there is nothing to stop
+-    // reporting; the slot is simply forgotten.
+-    hle.add("scePower", "scePowerUnregisterCallback", success);
+-    // The clocks the game asked for, reported back when it asks: a PSP
+-    // starts at 222/111 MHz. Setting them changes nothing here.
+-    struct Clocks {
+-        std::uint32_t pll{222u}, cpu{222u}, bus{111u};
+-    };
+-    static Clocks clocks;
+-    // scePowerSetClockFrequency(pll, cpu, bus) and its aliases: 0xEBD177D6
+-    // (its name in public NID lists is scePower_EBD177D6), which God of War,
+-    // Patapon and Chinatown Wars call with 333, 333, 166.
+-    const auto set_clocks = [](Runtime &, AllegrexContext &ctx) {
+-        clocks.pll = arg(ctx, 0);
+-        clocks.cpu = arg(ctx, 1);
+-        clocks.bus = arg(ctx, 2);
+-        kernel().finish(ctx, 0u);
+-    };
+-    hle.add("scePower", "scePowerSetClockFrequency630", set_clocks);
+-    hle.add("scePower", "scePowerSetClockFrequency", set_clocks);
+-    hle.add("scePower", "scePower_EBD177D6", set_clocks);
+-    hle.add("scePower", "scePowerGetCpuClockFrequencyInt", [](Runtime &, AllegrexContext &ctx) {
+-        kernel().finish(ctx, clocks.cpu);
+-    });
+-    hle.add("scePower", "scePowerGetBusClockFrequencyInt", [](Runtime &, AllegrexContext &ctx) {
+-        kernel().finish(ctx, clocks.bus);
+-    });
+-    hle.add("scePower", "scePowerGetPllClockFrequencyInt", [](Runtime &, AllegrexContext &ctx) {
+-        kernel().finish(ctx, clocks.pll);
+-    });
+-    // The float forms answer in $f0.
+-    hle.add("scePower", "scePowerGetPllClockFrequencyFloat", [](Runtime &, AllegrexContext &ctx) {
+-        ctx.fpr[0] = static_cast<float>(clocks.pll);
+-        kernel().finish(ctx, 0u);
+-    });
+-    hle.add("scePower", "scePowerCheckWlanCoexistenceClock", success);
+-
+-    hle.add("sceRtc", "sceRtcGetCurrentClockLocalTime", [](Runtime &rt, AllegrexContext &ctx) {
+-        const std::uint64_t now = guest_unix_us();
+-        const auto seconds = static_cast<std::time_t>(now / 1'000'000u);
+-        std::tm tm{};
+-#if defined(_WIN32)
+-        localtime_s(&tm, &seconds);
+-#else
+-        localtime_r(&seconds, &tm);
+-#endif
+-        auto &memory = rt.memory();
+-        const std::uint32_t out = arg(ctx, 0);
+-        memory.store16(out, static_cast<std::uint16_t>(tm.tm_year + 1900));
+-        memory.store16(out + 2u, static_cast<std::uint16_t>(tm.tm_mon + 1));
+-        memory.store16(out + 4u, static_cast<std::uint16_t>(tm.tm_mday));
+-        memory.store16(out + 6u, static_cast<std::uint16_t>(tm.tm_hour));
+-        memory.store16(out + 8u, static_cast<std::uint16_t>(tm.tm_min));
+-        memory.store16(out + 10u, static_cast<std::uint16_t>(tm.tm_sec));
+-        memory.store32(out + 12u, static_cast<std::uint32_t>(now % 1'000'000u));
+-        kernel().finish(ctx, 0u);
+-    });
+-    // The RTC's tick: microseconds since 0001-01-01 00:00:00 UTC, which is
+-    // 719162 days before the Unix epoch.
+-    hle.add("sceRtc", "sceRtcGetCurrentTick", [](Runtime &rt, AllegrexContext &ctx) {
+-        constexpr std::uint64_t kUnixEpochTick = 719'162ull * 86'400ull * 1'000'000ull;
+-        if (arg(ctx, 0) != 0u) store64(rt.memory(), arg(ctx, 0), kUnixEpochTick + guest_unix_us());
+-        kernel().finish(ctx, 0u);
+-    });
+-    register_rtc_calendar(hle);
+-    // The power switch is never used here, so holding it off changes nothing.
+-    hle.add("sceSuspendForUser", "sceKernelPowerLock", success);
+-    hle.add("sceSuspendForUser", "sceKernelPowerUnlock", success);
+-    // A disc game's licensee key and a PSN title's data key: nothing here
+-    // decrypts with them yet. Chinatown Wars imports both.
+-    hle.add("scePspNpDrm_user", "sceNpDrmSetLicenseeKey", [](Runtime &, AllegrexContext &ctx) {
+-        log_once("npdrm-licensee", "[npdrm] sceNpDrmSetLicenseeKey (UNVERIFIED: no game traced yet)");
+-        kernel().finish(ctx, 0u);
+-    });
+-    hle.add("scePspNpDrm_user", "sceNpDrmEdataSetupKey", [](Runtime &, AllegrexContext &ctx) {
+-        log_once("npdrm-edata", "[npdrm] sceNpDrmEdataSetupKey (UNVERIFIED: no game traced yet)");
+-        kernel().finish(ctx, 0u);
+-    });
+-    hle.add("sceImpose", "sceImposeSetLanguageMode", [](Runtime &, AllegrexContext &ctx) {
+-        if (trace_system_params())
+-            std::cout << "[sysparam] sceImposeSetLanguageMode language=" << arg(ctx, 0) << " button=" << arg(ctx, 1)
+-                      << "\n";
+-        kernel().finish(ctx, 0u);
+-    });
+-    // (int *language, int *button): the console's, as GetSystemParamInt says.
+-    hle.add("sceImpose", "sceImposeGetLanguageMode", [](Runtime &rt, AllegrexContext &ctx) {
+-        if (arg(ctx, 0) != 0u) rt.memory().store32(arg(ctx, 0), portablekit::game().system_language);
+-        if (arg(ctx, 1) != 0u) rt.memory().store32(arg(ctx, 1), portablekit::game().confirm_button);
+-        kernel().finish(ctx, 0u);
+-    });
+-    // Microseconds the console has been on, as the RTC counts them.
+-    hle.add("sceRtc", "sceRtcGetAccumulativeTime", [](Runtime &, AllegrexContext &ctx) {
+-        kernel().finish64(ctx, kernel().now_us());
+-    });
+-    // The shell's "the disc has been ejected" popup. There is no shell and no
+-    // disc to eject, so whether the game wants it makes no difference.
+-    hle.add("sceImpose", "sceImposeSetUMDPopup", success);
+-    hle.add("sceOpenPSID", "sceOpenPSIDGetOpenPSID", [](Runtime &rt, AllegrexContext &ctx) {
+-        for (std::uint32_t i = 0; i < 16u; ++i) rt.memory().store8(arg(ctx, 0) + i, static_cast<std::uint8_t>(0x10u + i));
+-        kernel().finish(ctx, 0u);
+-    });
+-    // sceUtilityGetSystemParamString(id, char *buffer, int length): id 1 is
+-    // the console's nickname. Vice City Stories and Chinatown Wars import it.
+-    hle.add("sceUtility", "sceUtilityGetSystemParamString", [](Runtime &rt, AllegrexContext &ctx) {
+-        constexpr std::uint32_t kInvalidId = 0x80110103u;  // not traced
+-        log_once("utility-param-string", "[utility] sceUtilityGetSystemParamString (UNVERIFIED: no game traced yet)");
+-        if (arg(ctx, 0) != 1u || arg(ctx, 1) == 0u || arg(ctx, 2) == 0u) {
+-            kernel().finish(ctx, kInvalidId);
+-            return;
+-        }
+-        write_cstring(rt.memory(), arg(ctx, 1), "PortableKit", arg(ctx, 2));
+-        kernel().finish(ctx, 0u);
+-    });
+-    hle.add("sceUtility", "sceUtilityGetSystemParamInt", [](Runtime &rt, AllegrexContext &ctx) {
+-        std::uint32_t value = 0u;
+-        switch (arg(ctx, 0)) {
+-        case 2u: value = 1u; break;  // ad hoc channel: automatic
+-        case 4u: value = 0u; break;  // date format YYYYMMDD
+-        case 5u: value = 0u; break;  // 24-hour clock
+-        case 8u: value = portablekit::game().system_language; break;
+-        case 9u: value = portablekit::game().confirm_button; break;
+-        default: break;
+-        }
+-        if (trace_system_params())
+-            std::cout << "[sysparam] sceUtilityGetSystemParamInt id=" << arg(ctx, 0) << " -> " << value << "\n";
+-        rt.memory().store32(arg(ctx, 1), value);
+-        kernel().finish(ctx, 0u);
+-    });
+-    hle.add("sceUtility", "sceUtilityLoadModule", success);
+-    // The dialogs themselves live in hle_utility.cpp.
+-    hle.add("sceUtility", "sceUtilityUnloadModule", success);
+-    // The audio and video modules (sceUtilityLoadAvModule(id)): the codecs
+-    // are the host's, always there.
+-    hle.add("sceUtility", "sceUtilityLoadAvModule", success);
+-    hle.add("sceUtility", "sceUtilityUnloadAvModule", success);
+-}
+-
+-} // namespace
+-
+-// ScePspDateTime: year, month, day, hour, minute, second (16-bit each), then
+-// the microsecond (32-bit).
+-rtc::DateTime read_date(const psprecomp::GuestMemory &memory, std::uint32_t address) {
+-    rtc::DateTime date;
+-    date.year = memory.load16(address);
+-    date.month = memory.load16(address + 2u);
+-    date.day = memory.load16(address + 4u);
+-    date.hour = memory.load16(address + 6u);
+-    date.minute = memory.load16(address + 8u);
+-    date.second = memory.load16(address + 10u);
+-    date.microsecond = memory.load32(address + 12u);
+-    return date;
+-}
+-
+-void write_date(psprecomp::GuestMemory &memory, std::uint32_t address, const rtc::DateTime &date) {
+-    memory.store16(address, static_cast<std::uint16_t>(date.year));
+-    memory.store16(address + 2u, static_cast<std::uint16_t>(date.month));
+-    memory.store16(address + 4u, static_cast<std::uint16_t>(date.day));
+-    memory.store16(address + 6u, static_cast<std::uint16_t>(date.hour));
+-    memory.store16(address + 8u, static_cast<std::uint16_t>(date.minute));
+-    memory.store16(address + 10u, static_cast<std::uint16_t>(date.second));
+-    memory.store32(address + 12u, date.microsecond);
+-}
+-
+-std::uint64_t load_tick(const psprecomp::GuestMemory &memory, std::uint32_t address) {
+-    return static_cast<std::uint64_t>(memory.load32(address)) | static_cast<std::uint64_t>(memory.load32(address + 4u)) << 32u;
+-}
+-
+-void rtc_unverified(const char *name) {
+-    static std::set<std::string> said;
+-    if (said.insert(name).second) std::cerr << "[rtc] " << name << " (UNVERIFIED: no game traced yet)\n";
+-}
+-
+-// A date that does not exist: what the library answers has not been traced.
+-constexpr std::uint32_t kRtcInvalidDate = 0xFFFFFFFFu;
+-
+-void register_rtc_calendar(HleRegistrar &hle) {
+-    // sceRtcGetTick(const ScePspDateTime *, u64 *tick). Vice City Stories and
+-    // Chinatown Wars import it and CompareTick, Chinatown Wars GetCurrentClock;
+-    // none has been seen calling them yet. The calendar is rtc_time.hpp's,
+-    // unit-tested.
+-    hle.add("sceRtc", "sceRtcGetTick", [](Runtime &rt, AllegrexContext &ctx) {
+-        rtc_unverified("sceRtcGetTick");
+-        const auto tick = rtc::to_tick(read_date(rt.memory(), arg(ctx, 0)));
+-        if (!tick) {
+-            kernel().finish(ctx, kRtcInvalidDate);
+-            return;
+-        }
+-        if (arg(ctx, 1) != 0u) store64(rt.memory(), arg(ctx, 1), *tick);
+-        kernel().finish(ctx, 0u);
+-    });
+-    // sceRtcSetTick(ScePspDateTime *, const u64 *tick)
+-    hle.add("sceRtc", "sceRtcSetTick", [](Runtime &rt, AllegrexContext &ctx) {
+-        rtc_unverified("sceRtcSetTick");
+-        write_date(rt.memory(), arg(ctx, 0), rtc::from_tick(load_tick(rt.memory(), arg(ctx, 1))));
+-        kernel().finish(ctx, 0u);
+-    });
+-    // sceRtcCompareTick(const u64 *a, const u64 *b): 1, 0 or -1.
+-    hle.add("sceRtc", "sceRtcCompareTick", [](Runtime &rt, AllegrexContext &ctx) {
+-        rtc_unverified("sceRtcCompareTick");
+-        const std::uint64_t a = load_tick(rt.memory(), arg(ctx, 0));
+-        const std::uint64_t b = load_tick(rt.memory(), arg(ctx, 1));
+-        kernel().finish(ctx, a > b ? 1u : a < b ? 0xFFFFFFFFu : 0u);
+-    });
+-    // sceRtcGetCurrentClock(ScePspDateTime *, int minutes east of UTC).
+-    hle.add("sceRtc", "sceRtcGetCurrentClock", [](Runtime &rt, AllegrexContext &ctx) {
+-        rtc_unverified("sceRtcGetCurrentClock");
+-        const auto offset = static_cast<std::int64_t>(static_cast<std::int32_t>(arg(ctx, 1))) * 60 *
+-                            static_cast<std::int64_t>(rtc::kTicksPerSecond);
+-        const auto tick = static_cast<std::uint64_t>(static_cast<std::int64_t>(rtc::kUnixEpochTick + guest_unix_us()) + offset);
+-        write_date(rt.memory(), arg(ctx, 0), rtc::from_tick(tick));
+-        kernel().finish(ctx, 0u);
+-    });
+-    hle.add("sceRtc", "sceRtcGetDayOfWeek", [](Runtime &, AllegrexContext &ctx) {
+-        rtc_unverified("sceRtcGetDayOfWeek");
+-        kernel().finish(ctx, static_cast<std::uint32_t>(rtc::day_of_week(static_cast<int>(arg(ctx, 0)),
+-                                                                          static_cast<int>(arg(ctx, 1)),
+-                                                                          static_cast<int>(arg(ctx, 2)))));
+-    });
+-    hle.add("sceRtc", "sceRtcGetDaysInMonth", [](Runtime &, AllegrexContext &ctx) {
+-        rtc_unverified("sceRtcGetDaysInMonth");
+-        kernel().finish(ctx, static_cast<std::uint32_t>(rtc::days_in_month(static_cast<int>(arg(ctx, 0)),
+-                                                                            static_cast<int>(arg(ctx, 1)))));
+-    });
+-    hle.add("sceRtc", "sceRtcIsLeapYear", [](Runtime &, AllegrexContext &ctx) {
+-        rtc_unverified("sceRtcIsLeapYear");
+-        kernel().finish(ctx, rtc::is_leap_year(static_cast<int>(arg(ctx, 0))) ? 1u : 0u);
+-    });
+-    hle.add("sceRtc", "sceRtcCheckValid", [](Runtime &rt, AllegrexContext &ctx) {
+-        rtc_unverified("sceRtcCheckValid");
+-        kernel().finish(ctx, rtc::to_tick(read_date(rt.memory(), arg(ctx, 0))) ? 0u : kRtcInvalidDate);
+-    });
+-    // sceRtcGetTime64_t(const ScePspDateTime *, u64 *time): seconds since
+-    // 1970-01-01. Phantasy Star Portable 2 Infinity (NPJH50332) calls it.
+-    hle.add("sceRtc", "sceRtcGetTime64_t", [](Runtime &rt, AllegrexContext &ctx) {
+-        const auto tick = rtc::to_tick(read_date(rt.memory(), arg(ctx, 0)));
+-        if (!tick || *tick < rtc::kUnixEpochTick) {
+-            kernel().finish(ctx, kRtcInvalidDate);
+-            return;
+-        }
+-        if (arg(ctx, 1) != 0u) store64(rt.memory(), arg(ctx, 1), (*tick - rtc::kUnixEpochTick) / rtc::kTicksPerSecond);
+-        kernel().finish(ctx, 0u);
+-    });
+-    hle.add("sceRtc", "sceRtcGetTickResolution", [](Runtime &, AllegrexContext &ctx) {
+-        rtc_unverified("sceRtcGetTickResolution");
+-        kernel().finish(ctx, static_cast<std::uint32_t>(rtc::kTicksPerSecond));
+-    });
+-    // sceRtcTickAdd*(u64 *dst, const u64 *src, amount): the 64-bit amounts
+-    // come in a2:a3, the 32-bit ones in a2.
+-    const auto add_ticks = [](const char *name, std::uint64_t unit, bool wide) {
+-        return [name, unit, wide](Runtime &rt, AllegrexContext &ctx) {
+-            rtc_unverified(name);
+-            const std::int64_t amount =
+-                wide ? static_cast<std::int64_t>(static_cast<std::uint64_t>(arg(ctx, 2)) |
+-                                                 static_cast<std::uint64_t>(arg(ctx, 3)) << 32u)
+-                     : static_cast<std::int64_t>(static_cast<std::int32_t>(arg(ctx, 2)));
+-            const std::uint64_t source = load_tick(rt.memory(), arg(ctx, 1));
+-            store64(rt.memory(), arg(ctx, 0), source + static_cast<std::uint64_t>(amount * static_cast<std::int64_t>(unit)));
+-            kernel().finish(ctx, 0u);
+-        };
+-    };
+-    hle.add("sceRtc", "sceRtcTickAddTicks", add_ticks("sceRtcTickAddTicks", 1u, true));
+-    hle.add("sceRtc", "sceRtcTickAddMicroseconds", add_ticks("sceRtcTickAddMicroseconds", 1u, true));
+-    hle.add("sceRtc", "sceRtcTickAddSeconds", add_ticks("sceRtcTickAddSeconds", rtc::kTicksPerSecond, true));
+-    hle.add("sceRtc", "sceRtcTickAddMinutes", add_ticks("sceRtcTickAddMinutes", 60u * rtc::kTicksPerSecond, true));
+-    hle.add("sceRtc", "sceRtcTickAddHours", add_ticks("sceRtcTickAddHours", 3600u * rtc::kTicksPerSecond, false));
+-    hle.add("sceRtc", "sceRtcTickAddDays", add_ticks("sceRtcTickAddDays", rtc::kTicksPerDay, false));
+-    hle.add("sceRtc", "sceRtcTickAddWeeks", add_ticks("sceRtcTickAddWeeks", 7u * rtc::kTicksPerDay, false));
+-}
+-
+-void register_system(HleRegistrar &hle) {
+-    register_utils(hle);
+-    register_process(hle);
+-    register_interrupts(hle);
+-    register_platform(hle);
+-}
+-
+-} // namespace portablekit
++// UtilsForUser, LoadExecForUser, StdioForUser, ModuleMgrForUser,
++// InterruptManager, scePower, sceRtc, sceImpose, sceOpenPSID and the parameter
++// part of sceUtility. sceWlanDrv is with the ad hoc calls in hle_adhoc.cpp.
++#include "../profile.hpp"
++#include "hle_common.hpp"
++
++#include "kernel/rtc_time.hpp"
++#include "overlays.hpp"
++
++#include "psprecomp/common.hpp"
++
++#include <array>
++#include <chrono>
++#include <cstring>
++#include <ctime>
++#include <iostream>
++#include <set>
++#include <string>
++
++namespace portablekit {
++void register_rtc_calendar(HleRegistrar &hle);
++namespace {
++
++// Epoch the virtual PSP clock starts at, so guest wall time advances with it.
++std::uint64_t boot_unix_us() {
++    static const std::uint64_t value = static_cast<std::uint64_t>(
++        std::chrono::duration_cast<std::chrono::microseconds>(
++            std::chrono::system_clock::now().time_since_epoch()).count());
++    return value;
++}
++
++std::uint64_t guest_unix_us() { return boot_unix_us() + kernel().now_us(); }
++
++void success(Runtime &, AllegrexContext &ctx) { kernel().finish(ctx, 0u); }
++
++// The console settings a game asks for and tells the system, under
++// TRACE_KERNEL: which language and which confirm button it ends up using.
++bool trace_system_params() {
++    static const bool enabled = portablekit::env("TRACE_KERNEL") != nullptr;
++    return enabled;
++}
++
++void register_utils(HleRegistrar &hle) {
++    // The host has no data cache to keep coherent. Phantasy Star Portable 2
++    // Infinity (NPJH50332) uses WritebackInvalidateRange.
++    for (const char *name : {"sceKernelDcacheWritebackAll", "sceKernelDcacheWritebackInvalidateAll",
++                             "sceKernelDcacheInvalidateRange", "sceKernelDcacheWritebackRange",
++                             "sceKernelDcacheWritebackInvalidateRange", "sceKernelSetGPO"})
++        hle.add("UtilsForUser", name, success);
++    // The guest flushes the instruction cache after copying code into an overlay
++    // slot, which is the profile's cue to re-check which overlay is loaded.
++    const auto flush_icache = [](Runtime &rt, AllegrexContext &ctx) {
++        forget_unmatched_overlays();
++        revalidate_overlays(rt);
++        kernel().finish(ctx, 0u);
++    };
++    hle.add("UtilsForUser", "sceKernelIcacheInvalidateAll", flush_icache);
++    hle.add("UtilsForUser", "sceKernelIcacheInvalidateRange", flush_icache);
++    hle.add("UtilsForUser", "sceKernelLibcTime", [](Runtime &rt, AllegrexContext &ctx) {
++        const auto seconds = static_cast<std::uint32_t>(guest_unix_us() / 1'000'000u);
++        if (arg(ctx, 0) != 0u) rt.memory().store32(arg(ctx, 0), seconds);
++        kernel().finish(ctx, seconds);
++    });
++    hle.add("UtilsForUser", "sceKernelLibcGettimeofday", [](Runtime &rt, AllegrexContext &ctx) {
++        const std::uint64_t now = guest_unix_us();
++        if (arg(ctx, 0) != 0u) {
++            rt.memory().store32(arg(ctx, 0), static_cast<std::uint32_t>(now / 1'000'000u));
++            rt.memory().store32(arg(ctx, 0) + 4u, static_cast<std::uint32_t>(now % 1'000'000u));
++        }
++        if (arg(ctx, 1) != 0u) {
++            rt.memory().store32(arg(ctx, 1), 0u);
++            rt.memory().store32(arg(ctx, 1) + 4u, 0u);
++        }
++        kernel().finish(ctx, 0u);
++    });
++    hle.add("UtilsForUser", "sceKernelLibcClock", [](Runtime &, AllegrexContext &ctx) {
++        kernel().finish(ctx, static_cast<std::uint32_t>(kernel().now_us()));
++    });
++}
++
++void register_process(HleRegistrar &hle) {
++    hle.add("LoadExecForUser", "sceKernelRegisterExitCallback", success);
++    hle.add("LoadExecForUser", "sceKernelExitGame", [](Runtime &rt, AllegrexContext &ctx) {
++        (void)ctx;
++        rt.stop("guest called sceKernelExitGame");
++    });
++    hle.add("StdioForUser", "sceKernelStdin", [](Runtime &, AllegrexContext &ctx) { kernel().finish(ctx, 0u); });
++    hle.add("StdioForUser", "sceKernelStdout", [](Runtime &, AllegrexContext &ctx) { kernel().finish(ctx, 1u); });
++    hle.add("StdioForUser", "sceKernelStderr", [](Runtime &, AllegrexContext &ctx) { kernel().finish(ctx, 2u); });
++
++    // The main executable is the only module; overlays are loaded by game code.
++    constexpr std::uint32_t kMainModuleId = 0x01000001u;
++    hle.add("ModuleMgrForUser", "sceKernelGetModuleId", [](Runtime &, AllegrexContext &ctx) {
++        kernel().finish(ctx, kMainModuleId);
++    });
++    hle.add("ModuleMgrForUser", "sceKernelGetModuleIdByAddress", [](Runtime &, AllegrexContext &ctx) {
++        kernel().finish(ctx, kMainModuleId);
++    });
++    // Games load Sony's stock modules (font, codecs) as encrypted PRX blobs from
++    // the disc. Their exports are served by this profile's HLE, so the load is
++    // acknowledged with a module id and the image itself is never touched.
++    // The name logged is the one in the module's "~PSP" header.
++    const auto load_stock_module = [](AllegrexContext &ctx, const std::uint8_t *header, std::size_t count,
++                                      const std::string &where) {
++        std::string name = "unknown";
++        for (std::size_t i = 0; i + 0x2Au < count; ++i) {
++            if (std::memcmp(header + i, "~PSP", 4u) != 0) continue;
++            const char *text = reinterpret_cast<const char *>(header + i + 0x0Au);
++            name.assign(text, strnlen(text, 28u));
++            break;
++        }
++        const auto uid = static_cast<std::uint32_t>(kernel().allocate_uid());
++        log_once("module:" + name, "[module] loaded stock module " + name + where + " (HLE)");
++        kernel().finish(ctx, uid);
++    };
++    hle.add("ModuleMgrForUser", "sceKernelLoadModuleByID", [load_stock_module](Runtime &, AllegrexContext &ctx) {
++        std::array<std::uint8_t, 0x100> header{};
++        const std::size_t count = read_open_file(arg(ctx, 0), 0u, header.data(), header.size());
++        load_stock_module(ctx, header.data(), count, "");
++    });
++    // The same by path. A path that does not open fails the way sceIoOpen
++    // would have.
++    hle.add("ModuleMgrForUser", "sceKernelLoadModule", [load_stock_module](Runtime &rt, AllegrexContext &ctx) {
++        const std::string path = read_cstring(rt.memory(), arg(ctx, 0), 256u);
++        std::array<std::uint8_t, 0x100> header{};
++        const std::int64_t count = read_guest_file(path, 0u, header.data(), header.size());
++        if (count < 0) {
++            std::cerr << "[module] cannot load " << path << ": " << psprecomp::hex32(static_cast<std::uint32_t>(count))
++                      << "\n";
++            kernel().finish(ctx, static_cast<std::uint32_t>(count));
++            return;
++        }
++        load_stock_module(ctx, header.data(), static_cast<std::size_t>(count), " from " + path);
++    });
++    for (const char *name : {"sceKernelStartModule", "sceKernelStopModule", "sceKernelUnloadModule"}) {
++        hle.add("ModuleMgrForUser", name, [name](Runtime &, AllegrexContext &ctx) {
++            log_once(std::string("module-op:") + name, std::string("[module] ") + name);
++            // sceKernelStartModule returns the module id it was given.
++            kernel().finish(ctx, arg(ctx, 0));
++        });
++    }
++    hle.add("ModuleMgrForUser", "sceKernelStopUnloadSelfModuleWithStatus", [](Runtime &, AllegrexContext &ctx) {
++        kernel().exit_current_thread(ctx, static_cast<std::int32_t>(arg(ctx, 1)), true);
++    });
++}
++
++void register_interrupts(HleRegistrar &hle) {
++    hle.add("InterruptManager", "sceKernelRegisterSubIntrHandler", [](Runtime &, AllegrexContext &ctx) {
++        auto &handler = kernel().sub_interrupts[arg(ctx, 0)][arg(ctx, 1)];
++        handler.handler = arg(ctx, 2);
++        handler.argument = arg(ctx, 3);
++        kernel().finish(ctx, 0u);
++    });
++    hle.add("InterruptManager", "sceKernelReleaseSubIntrHandler", [](Runtime &, AllegrexContext &ctx) {
++        kernel().finish(ctx, kernel().sub_interrupts[arg(ctx, 0)].erase(arg(ctx, 1)) != 0u ? 0u : error::kIllegalArgument);
++    });
++    hle.add("InterruptManager", "sceKernelEnableSubIntr", [](Runtime &, AllegrexContext &ctx) {
++        auto &handlers = kernel().sub_interrupts[arg(ctx, 0)];
++        const auto found = handlers.find(arg(ctx, 1));
++        if (found != handlers.end()) found->second.enabled = true;
++        kernel().finish(ctx, found != handlers.end() ? 0u : error::kIllegalArgument);
++    });
++}
++
++void register_platform(HleRegistrar &hle) {
++    hle.add("scePower", "scePowerRegisterCallback", [](Runtime &, AllegrexContext &ctx) {
++        // Report mains power with a healthy battery so the game stops waiting for
++        // the first power notification.
++        constexpr std::uint32_t kAcPower = 0x00001000u;
++        constexpr std::uint32_t kBatteryExists = 0x00000080u;
++        constexpr std::uint32_t kBatteryPower = 0x00000004u;
++        kernel().notify_callback(static_cast<SceUID>(arg(ctx, 1)), kAcPower | kBatteryExists | kBatteryPower);
++        kernel().finish(ctx, 0u);
++    });
++    // Nothing here ever changes the power state, so there is nothing to stop
++    // reporting; the slot is simply forgotten.
++    hle.add("scePower", "scePowerUnregisterCallback", success);
++    // The clocks the game asked for, reported back when it asks: a PSP
++    // starts at 222/111 MHz. Setting them changes nothing here.
++    struct Clocks {
++        std::uint32_t pll{222u}, cpu{222u}, bus{111u};
++    };
++    static Clocks clocks;
++    // scePowerSetClockFrequency(pll, cpu, bus) and its aliases: 0xEBD177D6
++    // (its name in public NID lists is scePower_EBD177D6), which God of War,
++    // Patapon and Chinatown Wars call with 333, 333, 166.
++    const auto set_clocks = [](Runtime &, AllegrexContext &ctx) {
++        clocks.pll = arg(ctx, 0);
++        clocks.cpu = arg(ctx, 1);
++        clocks.bus = arg(ctx, 2);
++        kernel().finish(ctx, 0u);
++    };
++    hle.add("scePower", "scePowerSetClockFrequency630", set_clocks);
++    hle.add("scePower", "scePowerSetClockFrequency", set_clocks);
++    hle.add("scePower", "scePower_EBD177D6", set_clocks);
++    hle.add("scePower", "scePowerGetCpuClockFrequencyInt", [](Runtime &, AllegrexContext &ctx) {
++        kernel().finish(ctx, clocks.cpu);
++    });
++    hle.add("scePower", "scePowerGetBusClockFrequencyInt", [](Runtime &, AllegrexContext &ctx) {
++        kernel().finish(ctx, clocks.bus);
++    });
++    hle.add("scePower", "scePowerGetPllClockFrequencyInt", [](Runtime &, AllegrexContext &ctx) {
++        kernel().finish(ctx, clocks.pll);
++    });
++    // The float forms answer in $f0.
++    hle.add("scePower", "scePowerGetPllClockFrequencyFloat", [](Runtime &, AllegrexContext &ctx) {
++        ctx.fpr[0] = static_cast<float>(clocks.pll);
++        kernel().finish(ctx, 0u);
++    });
++    hle.add("scePower", "scePowerCheckWlanCoexistenceClock", success);
++
++    hle.add("sceRtc", "sceRtcGetCurrentClockLocalTime", [](Runtime &rt, AllegrexContext &ctx) {
++        const std::uint64_t now = guest_unix_us();
++        const auto seconds = static_cast<std::time_t>(now / 1'000'000u);
++        std::tm tm{};
++#if defined(_WIN32)
++        localtime_s(&tm, &seconds);
++#else
++        localtime_r(&seconds, &tm);
++#endif
++        auto &memory = rt.memory();
++        const std::uint32_t out = arg(ctx, 0);
++        memory.store16(out, static_cast<std::uint16_t>(tm.tm_year + 1900));
++        memory.store16(out + 2u, static_cast<std::uint16_t>(tm.tm_mon + 1));
++        memory.store16(out + 4u, static_cast<std::uint16_t>(tm.tm_mday));
++        memory.store16(out + 6u, static_cast<std::uint16_t>(tm.tm_hour));
++        memory.store16(out + 8u, static_cast<std::uint16_t>(tm.tm_min));
++        memory.store16(out + 10u, static_cast<std::uint16_t>(tm.tm_sec));
++        memory.store32(out + 12u, static_cast<std::uint32_t>(now % 1'000'000u));
++        kernel().finish(ctx, 0u);
++    });
++    // The RTC's tick: microseconds since 0001-01-01 00:00:00 UTC, which is
++    // 719162 days before the Unix epoch.
++    hle.add("sceRtc", "sceRtcGetCurrentTick", [](Runtime &rt, AllegrexContext &ctx) {
++        constexpr std::uint64_t kUnixEpochTick = 719'162ull * 86'400ull * 1'000'000ull;
++        if (arg(ctx, 0) != 0u) store64(rt.memory(), arg(ctx, 0), kUnixEpochTick + guest_unix_us());
++        kernel().finish(ctx, 0u);
++    });
++    register_rtc_calendar(hle);
++    // The power switch is never used here, so holding it off changes nothing.
++    hle.add("sceSuspendForUser", "sceKernelPowerLock", success);
++    hle.add("sceSuspendForUser", "sceKernelPowerUnlock", success);
++    // A disc game's licensee key and a PSN title's data key: nothing here
++    // decrypts with them yet. Chinatown Wars imports both.
++    hle.add("scePspNpDrm_user", "sceNpDrmSetLicenseeKey", [](Runtime &, AllegrexContext &ctx) {
++        log_once("npdrm-licensee", "[npdrm] sceNpDrmSetLicenseeKey (UNVERIFIED: no game traced yet)");
++        kernel().finish(ctx, 0u);
++    });
++    hle.add("scePspNpDrm_user", "sceNpDrmEdataSetupKey", [](Runtime &, AllegrexContext &ctx) {
++        log_once("npdrm-edata", "[npdrm] sceNpDrmEdataSetupKey (UNVERIFIED: no game traced yet)");
++        kernel().finish(ctx, 0u);
++    });
++    hle.add("sceImpose", "sceImposeSetLanguageMode", [](Runtime &, AllegrexContext &ctx) {
++        if (trace_system_params())
++            std::cout << "[sysparam] sceImposeSetLanguageMode language=" << arg(ctx, 0) << " button=" << arg(ctx, 1)
++                      << "\n";
++        kernel().finish(ctx, 0u);
++    });
++    // (int *language, int *button): the console's, as GetSystemParamInt says.
++    hle.add("sceImpose", "sceImposeGetLanguageMode", [](Runtime &rt, AllegrexContext &ctx) {
++        if (arg(ctx, 0) != 0u) rt.memory().store32(arg(ctx, 0), portablekit::active_system_language());
++        if (arg(ctx, 1) != 0u) rt.memory().store32(arg(ctx, 1), portablekit::active_confirm_button());
++        kernel().finish(ctx, 0u);
++    });
++    // Microseconds the console has been on, as the RTC counts them.
++    hle.add("sceRtc", "sceRtcGetAccumulativeTime", [](Runtime &, AllegrexContext &ctx) {
++        kernel().finish64(ctx, kernel().now_us());
++    });
++    // The shell's "the disc has been ejected" popup. There is no shell and no
++    // disc to eject, so whether the game wants it makes no difference.
++    hle.add("sceImpose", "sceImposeSetUMDPopup", success);
++    hle.add("sceOpenPSID", "sceOpenPSIDGetOpenPSID", [](Runtime &rt, AllegrexContext &ctx) {
++        for (std::uint32_t i = 0; i < 16u; ++i) rt.memory().store8(arg(ctx, 0) + i, static_cast<std::uint8_t>(0x10u + i));
++        kernel().finish(ctx, 0u);
++    });
++    // sceUtilityGetSystemParamString(id, char *buffer, int length): id 1 is
++    // the console's nickname. Vice City Stories and Chinatown Wars import it.
++    hle.add("sceUtility", "sceUtilityGetSystemParamString", [](Runtime &rt, AllegrexContext &ctx) {
++        constexpr std::uint32_t kInvalidId = 0x80110103u;  // not traced
++        log_once("utility-param-string", "[utility] sceUtilityGetSystemParamString (UNVERIFIED: no game traced yet)");
++        if (arg(ctx, 0) != 1u || arg(ctx, 1) == 0u || arg(ctx, 2) == 0u) {
++            kernel().finish(ctx, kInvalidId);
++            return;
++        }
++        write_cstring(rt.memory(), arg(ctx, 1), "PortableKit", arg(ctx, 2));
++        kernel().finish(ctx, 0u);
++    });
++    hle.add("sceUtility", "sceUtilityGetSystemParamInt", [](Runtime &rt, AllegrexContext &ctx) {
++        std::uint32_t value = 0u;
++        switch (arg(ctx, 0)) {
++        case 2u: value = 1u; break;  // ad hoc channel: automatic
++        case 4u: value = 0u; break;  // date format YYYYMMDD
++        case 5u: value = 0u; break;  // 24-hour clock
++        case 8u: value = portablekit::active_system_language(); break;
++        case 9u: value = portablekit::active_confirm_button(); break;
++        default: break;
++        }
++        if (trace_system_params())
++            std::cout << "[sysparam] sceUtilityGetSystemParamInt id=" << arg(ctx, 0) << " -> " << value << "\n";
++        rt.memory().store32(arg(ctx, 1), value);
++        kernel().finish(ctx, 0u);
++    });
++    hle.add("sceUtility", "sceUtilityLoadModule", success);
++    // The dialogs themselves live in hle_utility.cpp.
++    hle.add("sceUtility", "sceUtilityUnloadModule", success);
++    // The audio and video modules (sceUtilityLoadAvModule(id)): the codecs
++    // are the host's, always there.
++    hle.add("sceUtility", "sceUtilityLoadAvModule", success);
++    hle.add("sceUtility", "sceUtilityUnloadAvModule", success);
++}
++
++} // namespace
++
++// ScePspDateTime: year, month, day, hour, minute, second (16-bit each), then
++// the microsecond (32-bit).
++rtc::DateTime read_date(const psprecomp::GuestMemory &memory, std::uint32_t address) {
++    rtc::DateTime date;
++    date.year = memory.load16(address);
++    date.month = memory.load16(address + 2u);
++    date.day = memory.load16(address + 4u);
++    date.hour = memory.load16(address + 6u);
++    date.minute = memory.load16(address + 8u);
++    date.second = memory.load16(address + 10u);
++    date.microsecond = memory.load32(address + 12u);
++    return date;
++}
++
++void write_date(psprecomp::GuestMemory &memory, std::uint32_t address, const rtc::DateTime &date) {
++    memory.store16(address, static_cast<std::uint16_t>(date.year));
++    memory.store16(address + 2u, static_cast<std::uint16_t>(date.month));
++    memory.store16(address + 4u, static_cast<std::uint16_t>(date.day));
++    memory.store16(address + 6u, static_cast<std::uint16_t>(date.hour));
++    memory.store16(address + 8u, static_cast<std::uint16_t>(date.minute));
++    memory.store16(address + 10u, static_cast<std::uint16_t>(date.second));
++    memory.store32(address + 12u, date.microsecond);
++}
++
++std::uint64_t load_tick(const psprecomp::GuestMemory &memory, std::uint32_t address) {
++    return static_cast<std::uint64_t>(memory.load32(address)) | static_cast<std::uint64_t>(memory.load32(address + 4u)) << 32u;
++}
++
++void rtc_unverified(const char *name) {
++    static std::set<std::string> said;
++    if (said.insert(name).second) std::cerr << "[rtc] " << name << " (UNVERIFIED: no game traced yet)\n";
++}
++
++// A date that does not exist: what the library answers has not been traced.
++constexpr std::uint32_t kRtcInvalidDate = 0xFFFFFFFFu;
++
++void register_rtc_calendar(HleRegistrar &hle) {
++    // sceRtcGetTick(const ScePspDateTime *, u64 *tick). Vice City Stories and
++    // Chinatown Wars import it and CompareTick, Chinatown Wars GetCurrentClock;
++    // none has been seen calling them yet. The calendar is rtc_time.hpp's,
++    // unit-tested.
++    hle.add("sceRtc", "sceRtcGetTick", [](Runtime &rt, AllegrexContext &ctx) {
++        rtc_unverified("sceRtcGetTick");
++        const auto tick = rtc::to_tick(read_date(rt.memory(), arg(ctx, 0)));
++        if (!tick) {
++            kernel().finish(ctx, kRtcInvalidDate);
++            return;
++        }
++        if (arg(ctx, 1) != 0u) store64(rt.memory(), arg(ctx, 1), *tick);
++        kernel().finish(ctx, 0u);
++    });
++    // sceRtcSetTick(ScePspDateTime *, const u64 *tick)
++    hle.add("sceRtc", "sceRtcSetTick", [](Runtime &rt, AllegrexContext &ctx) {
++        rtc_unverified("sceRtcSetTick");
++        write_date(rt.memory(), arg(ctx, 0), rtc::from_tick(load_tick(rt.memory(), arg(ctx, 1))));
++        kernel().finish(ctx, 0u);
++    });
++    // sceRtcCompareTick(const u64 *a, const u64 *b): 1, 0 or -1.
++    hle.add("sceRtc", "sceRtcCompareTick", [](Runtime &rt, AllegrexContext &ctx) {
++        rtc_unverified("sceRtcCompareTick");
++        const std::uint64_t a = load_tick(rt.memory(), arg(ctx, 0));
++        const std::uint64_t b = load_tick(rt.memory(), arg(ctx, 1));
++        kernel().finish(ctx, a > b ? 1u : a < b ? 0xFFFFFFFFu : 0u);
++    });
++    // sceRtcGetCurrentClock(ScePspDateTime *, int minutes east of UTC).
++    hle.add("sceRtc", "sceRtcGetCurrentClock", [](Runtime &rt, AllegrexContext &ctx) {
++        rtc_unverified("sceRtcGetCurrentClock");
++        const auto offset = static_cast<std::int64_t>(static_cast<std::int32_t>(arg(ctx, 1))) * 60 *
++                            static_cast<std::int64_t>(rtc::kTicksPerSecond);
++        const auto tick = static_cast<std::uint64_t>(static_cast<std::int64_t>(rtc::kUnixEpochTick + guest_unix_us()) + offset);
++        write_date(rt.memory(), arg(ctx, 0), rtc::from_tick(tick));
++        kernel().finish(ctx, 0u);
++    });
++    hle.add("sceRtc", "sceRtcGetDayOfWeek", [](Runtime &, AllegrexContext &ctx) {
++        rtc_unverified("sceRtcGetDayOfWeek");
++        kernel().finish(ctx, static_cast<std::uint32_t>(rtc::day_of_week(static_cast<int>(arg(ctx, 0)),
++                                                                          static_cast<int>(arg(ctx, 1)),
++                                                                          static_cast<int>(arg(ctx, 2)))));
++    });
++    hle.add("sceRtc", "sceRtcGetDaysInMonth", [](Runtime &, AllegrexContext &ctx) {
++        rtc_unverified("sceRtcGetDaysInMonth");
++        kernel().finish(ctx, static_cast<std::uint32_t>(rtc::days_in_month(static_cast<int>(arg(ctx, 0)),
++                                                                            static_cast<int>(arg(ctx, 1)))));
++    });
++    hle.add("sceRtc", "sceRtcIsLeapYear", [](Runtime &, AllegrexContext &ctx) {
++        rtc_unverified("sceRtcIsLeapYear");
++        kernel().finish(ctx, rtc::is_leap_year(static_cast<int>(arg(ctx, 0))) ? 1u : 0u);
++    });
++    hle.add("sceRtc", "sceRtcCheckValid", [](Runtime &rt, AllegrexContext &ctx) {
++        rtc_unverified("sceRtcCheckValid");
++        kernel().finish(ctx, rtc::to_tick(read_date(rt.memory(), arg(ctx, 0))) ? 0u : kRtcInvalidDate);
++    });
++    // sceRtcGetTime64_t(const ScePspDateTime *, u64 *time): seconds since
++    // 1970-01-01. Phantasy Star Portable 2 Infinity (NPJH50332) calls it.
++    hle.add("sceRtc", "sceRtcGetTime64_t", [](Runtime &rt, AllegrexContext &ctx) {
++        const auto tick = rtc::to_tick(read_date(rt.memory(), arg(ctx, 0)));
++        if (!tick || *tick < rtc::kUnixEpochTick) {
++            kernel().finish(ctx, kRtcInvalidDate);
++            return;
++        }
++        if (arg(ctx, 1) != 0u) store64(rt.memory(), arg(ctx, 1), (*tick - rtc::kUnixEpochTick) / rtc::kTicksPerSecond);
++        kernel().finish(ctx, 0u);
++    });
++    hle.add("sceRtc", "sceRtcGetTickResolution", [](Runtime &, AllegrexContext &ctx) {
++        rtc_unverified("sceRtcGetTickResolution");
++        kernel().finish(ctx, static_cast<std::uint32_t>(rtc::kTicksPerSecond));
++    });
++    // sceRtcTickAdd*(u64 *dst, const u64 *src, amount): the 64-bit amounts
++    // come in a2:a3, the 32-bit ones in a2.
++    const auto add_ticks = [](const char *name, std::uint64_t unit, bool wide) {
++        return [name, unit, wide](Runtime &rt, AllegrexContext &ctx) {
++            rtc_unverified(name);
++            const std::int64_t amount =
++                wide ? static_cast<std::int64_t>(static_cast<std::uint64_t>(arg(ctx, 2)) |
++                                                 static_cast<std::uint64_t>(arg(ctx, 3)) << 32u)
++                     : static_cast<std::int64_t>(static_cast<std::int32_t>(arg(ctx, 2)));
++            const std::uint64_t source = load_tick(rt.memory(), arg(ctx, 1));
++            store64(rt.memory(), arg(ctx, 0), source + static_cast<std::uint64_t>(amount * static_cast<std::int64_t>(unit)));
++            kernel().finish(ctx, 0u);
++        };
++    };
++    hle.add("sceRtc", "sceRtcTickAddTicks", add_ticks("sceRtcTickAddTicks", 1u, true));
++    hle.add("sceRtc", "sceRtcTickAddMicroseconds", add_ticks("sceRtcTickAddMicroseconds", 1u, true));
++    hle.add("sceRtc", "sceRtcTickAddSeconds", add_ticks("sceRtcTickAddSeconds", rtc::kTicksPerSecond, true));
++    hle.add("sceRtc", "sceRtcTickAddMinutes", add_ticks("sceRtcTickAddMinutes", 60u * rtc::kTicksPerSecond, true));
++    hle.add("sceRtc", "sceRtcTickAddHours", add_ticks("sceRtcTickAddHours", 3600u * rtc::kTicksPerSecond, false));
++    hle.add("sceRtc", "sceRtcTickAddDays", add_ticks("sceRtcTickAddDays", rtc::kTicksPerDay, false));
++    hle.add("sceRtc", "sceRtcTickAddWeeks", add_ticks("sceRtcTickAddWeeks", 7u * rtc::kTicksPerDay, false));
++}
++
++void register_system(HleRegistrar &hle) {
++    register_utils(hle);
++    register_process(hle);
++    register_interrupts(hle);
++    register_platform(hle);
++}
++
++} // namespace portablekit
+diff -ru a/host/install/executable_preparation.cpp b/host/install/executable_preparation.cpp
+--- a/host/install/executable_preparation.cpp	2026-11-07 03:25:52.712526844 +0000
++++ b/host/install/executable_preparation.cpp	2026-11-07 03:25:52.767228561 +0000
+@@ -1,246 +1,250 @@
+-// Prepares the game's executable from the encrypted EBOOT.BIN on the player's
+-// own disc. Written for this project from public descriptions of the PSP
+-// executable header ("~PSP") and of the PSP's AES-based crypto engine; see
+-// executable_preparation.hpp for what it accepts.
+-//
+-// The tag at 0xD0 selects a key; the framework knows the layout and the
+-// engine's fixed keys, and the profile supplies the key its release's tag
+-// selects (GameProfile::decryption_tag, and decryption_key or, for the older
+-// header layout, decryption_key_table).
+-//
+-// The file is an 0x150-byte header followed by the executable, encrypted with
+-// AES-128 in CBC mode under a per-file key. The header keeps that key wrapped
+-// twice: under the engine's fixed decryption key, and inside header fields that
+-// are encrypted and masked with material derived from the key its tag selects.
+-
+-#include "install/executable_preparation.hpp"
+-
+-#include "crypto_keys.hpp"
+-#include "profile.hpp"
+-
+-#include "psprecomp/common.hpp"
+-#include "psprecomp/sha256.hpp"
+-
+-#include "tiny_aes/aes.h"
+-
+-#include <algorithm>
+-#include <array>
+-#include <cstring>
+-#include <optional>
+-#include <string>
+-
+-namespace portablekit::install {
+-namespace {
+-
+-using Block = std::array<std::uint8_t, 16>;
+-
+-constexpr std::size_t kHeaderSize = 0x150u;
+-
+-// Header fields used here.
+-constexpr std::size_t kMagicOffset = 0x00u;           // "~PSP"
+-constexpr std::size_t kAttributesOffset = 0x06u;      // bit 0 set: compressed
+-constexpr std::size_t kImageSizeOffset = 0x28u;       // size of the decrypted image
+-constexpr std::size_t kFileTypeOffset = 0x7Cu;        // 9: UMD game executable
+-constexpr std::size_t kPayloadSizeOffset = 0xB0u;     // size of the encrypted payload
+-constexpr std::size_t kTagOffset = 0xD0u;
+-
+-constexpr std::uint8_t kUmdGameExecutable = 9u;
+-
+-// Crypto-engine key slot 0x5D (plain AES decryption, command 7), which the
+-// tags of every release supported so far use for the header (another tag may
+-// name another slot: TagKeyMaterial::kirk_slot), and the engine's fixed key for signed and encrypted
+-// blocks (command 1), which wraps the payload key. Both come from
+-// crypto_keys(), never from this file.
+-constexpr std::uint8_t kHeaderKeySlot = 0x5Du;
+-
+-const Block &required_key(const Key16 *key, const char *what) {
+-    if (key == nullptr)
+-        throw psprecomp::Error(std::string("Decrypting EBOOT.BIN needs ") + what +
+-                               ", which is not in the keys this program has. Add a keys file, or use an executable "
+-                               "you have already decrypted.");
+-    return *key;
+-}
+-
+-// The slot of the tag being decrypted; one decryption at a time.
+-std::uint8_t g_header_slot = kHeaderKeySlot;
+-
+-const Block &header_key() {
+-    const CryptoKeys *keys = crypto_keys();
+-    return required_key(keys != nullptr ? keys->kirk(g_header_slot) : nullptr, "the KIRK key the tag selects");
+-}
+-
+-const Block &payload_wrapping_key() {
+-    const CryptoKeys *keys = crypto_keys();
+-    return required_key(keys != nullptr && keys->kirk_cmd1 ? &*keys->kirk_cmd1 : nullptr,
+-                        "the key of KIRK command 1");
+-}
+-
+-std::uint32_t read_le32(std::span<const std::uint8_t> data, std::size_t offset) {
+-    return static_cast<std::uint32_t>(data[offset]) | (static_cast<std::uint32_t>(data[offset + 1u]) << 8u) |
+-           (static_cast<std::uint32_t>(data[offset + 2u]) << 16u) |
+-           (static_cast<std::uint32_t>(data[offset + 3u]) << 24u);
+-}
+-
+-// AES-128-CBC decryption with a zero IV, in place. The length must be a
+-// multiple of the block size.
+-void cbc_decrypt(const Block &key, std::span<std::uint8_t> data) {
+-    const Block zero_iv{};
+-    AES_ctx context{};
+-    AES_init_ctx_iv(&context, key.data(), zero_iv.data());
+-    AES_CBC_decrypt_buffer(&context, data.data(), data.size());
+-}
+-
+-Block block_at(std::span<const std::uint8_t> data, std::size_t offset) {
+-    Block block{};
+-    std::memcpy(block.data(), data.data() + offset, block.size());
+-    return block;
+-}
+-
+-void xor_into(Block &target, std::span<const std::uint8_t> mask) {
+-    for (std::size_t i = 0; i < target.size(); ++i) target[i] ^= mask[i];
+-}
+-
+-void append(std::vector<std::uint8_t> &out, std::span<const std::uint8_t> header, std::size_t offset,
+-            std::size_t size) {
+-    out.insert(out.end(), header.begin() + static_cast<std::ptrdiff_t>(offset),
+-               header.begin() + static_cast<std::ptrdiff_t>(offset + size));
+-}
+-
+-// The tag key, repeated over nine blocks that each carry their own index in
+-// their first byte, decrypted with the header key.
+-std::vector<std::uint8_t> derive_mask(const Block &tag_key) {
+-    std::vector<std::uint8_t> mask;
+-    for (std::uint8_t index = 0; index < 9u; ++index) {
+-        Block block = tag_key;
+-        block[0] = index;
+-        mask.insert(mask.end(), block.begin(), block.end());
+-    }
+-    cbc_decrypt(header_key(), mask);
+-    return mask;
+-}
+-
+-// Recovers the payload key from the header.
+-Block unwrap_payload_key(std::span<const std::uint8_t> header, const Block &tag_key) {
+-    // Four header fields form one 0x60-byte encrypted record. Decrypted, it
+-    // holds a check value and the header's hash, followed from offset 0x24 by
+-    // the payload key still wrapped under the fixed key and masked.
+-    std::vector<std::uint8_t> record;
+-    append(record, header, 0x140u, 0x10u);
+-    append(record, header, 0x12Cu, 0x14u);
+-    append(record, header, 0x80u, 0x30u);
+-    append(record, header, 0xC0u, 0x0Cu);
+-    cbc_decrypt(header_key(), record);
+-
+-    const std::vector<std::uint8_t> mask = derive_mask(tag_key);
+-    Block key = block_at(record, 0x24u);
+-    xor_into(key, std::span(mask).subspan(0x10u, 16u));
+-    cbc_decrypt(header_key(), key);
+-    xor_into(key, std::span(mask).subspan(0x50u, 16u));
+-    cbc_decrypt(payload_wrapping_key(), key);
+-    return key;
+-}
+-
+-// The older header layout, whose tag selects a 0x90-byte key table rather
+-// than a 16-byte key. Its fields are laid out differently, but the result is
+-// the same: the payload key, wrapped under the fixed key.
+-//
+-// Five header fields form one 0xA0-byte record, encrypted under the header key
+-// as a single chain: the last eight bytes of the header hash, the 0x28 bytes
+-// after it, then the key block, which is split between 0x110 and 0x80. The
+-// key block's first 0x70 bytes are masked on either side of a further
+-// decryption, with the table from offsets 0x14 and 0x20. CBC makes each block
+-// depend only on the one before it, so only the first block, which is the
+-// wrapped payload key, and the mode word need decrypting.
+-Block unwrap_payload_key_from_table(std::span<const std::uint8_t> header, std::span<const std::uint8_t> table) {
+-    if (table.size() != 0x90u) throw psprecomp::Error("The decryption key table is not 0x90 bytes long");
+-
+-    std::vector<std::uint8_t> record;
+-    append(record, header, 0xE0u, 0x08u);
+-    append(record, header, 0xE8u, 0x28u);
+-    append(record, header, 0x110u, 0x40u);
+-    append(record, header, 0x80u, 0x30u);
+-    cbc_decrypt(header_key(), record);
+-
+-    // The key block starts at 0x30 in the record. Its first 0x70 bytes are
+-    // the part that is masked; decrypt it whole, since the mode word at 0x60
+-    // is the check that the table was the right one.
+-    std::vector<std::uint8_t> block(record.begin() + 0x30, record.begin() + 0xA0);
+-    for (std::size_t i = 0; i < block.size(); ++i) block[i] ^= table[0x14u + i];
+-    cbc_decrypt(header_key(), block);
+-    for (std::size_t i = 0; i < block.size(); ++i) block[i] ^= table[0x20u + i];
+-
+-    const std::uint32_t mode = read_le32(block, 0x60u);
+-    if (mode != 1u) throw psprecomp::Error("EBOOT.BIN did not decrypt with the key table its tag selects");
+-    Block key = block_at(block, 0x00u);
+-    cbc_decrypt(payload_wrapping_key(), key);
+-    return key;
+-}
+-
+-} // namespace
+-
+-std::optional<std::uint32_t> executable_tag(std::span<const std::uint8_t> eboot_bin) {
+-    if (eboot_bin.size() < kHeaderSize || std::memcmp(eboot_bin.data() + kMagicOffset, "~PSP", 4u) != 0)
+-        return std::nullopt;
+-    return read_le32(eboot_bin, kTagOffset);
+-}
+-
+-std::vector<std::uint8_t> decrypt_executable(std::span<const std::uint8_t> eboot_bin, const TagKeyMaterial &tag,
+-                                             const std::function<void(std::uint64_t, std::uint64_t)> &progress) {
+-    // These checks document the one layout handled here.
+-    if (eboot_bin.size() < kHeaderSize || std::memcmp(eboot_bin.data() + kMagicOffset, "~PSP", 4u) != 0 ||
+-        read_le32(eboot_bin, kTagOffset) != tag.tag || eboot_bin[kFileTypeOffset] != kUmdGameExecutable ||
+-        (eboot_bin[kAttributesOffset] & 1u) != 0u)
+-        throw psprecomp::Error("EBOOT.BIN has an unexpected header");
+-    const std::uint32_t size = read_le32(eboot_bin, kPayloadSizeOffset);
+-    const std::size_t padded_size = (static_cast<std::size_t>(size) + 15u) & ~std::size_t{15u};
+-    if (size == 0u || size != read_le32(eboot_bin, kImageSizeOffset) || padded_size > eboot_bin.size() - kHeaderSize)
+-        throw psprecomp::Error("EBOOT.BIN has an unexpected payload size");
+-
+-    g_header_slot = tag.kirk_slot;
+-    const Block key = tag.table.empty() ? unwrap_payload_key(eboot_bin.first(kHeaderSize), tag.key)
+-                                        : unwrap_payload_key_from_table(eboot_bin.first(kHeaderSize), tag.table);
+-    std::vector<std::uint8_t> executable(eboot_bin.begin() + kHeaderSize,
+-                                         eboot_bin.begin() + static_cast<std::ptrdiff_t>(kHeaderSize + padded_size));
+-    // CBC carries its chaining value in the context, so the payload decrypts
+-    // in slices that report progress in between.
+-    constexpr std::size_t kSlice = 1024u * 1024u;
+-    const Block zero_iv{};
+-    AES_ctx context{};
+-    AES_init_ctx_iv(&context, key.data(), zero_iv.data());
+-    for (std::size_t offset = 0; offset < executable.size(); offset += kSlice) {
+-        const std::size_t length = std::min(kSlice, executable.size() - offset);
+-        AES_CBC_decrypt_buffer(&context, executable.data() + offset, length);
+-        if (progress) progress(offset + length, executable.size());
+-    }
+-    executable.resize(size);
+-    return executable;
+-}
+-
+-std::vector<std::uint8_t> prepare_executable(std::span<const std::uint8_t> eboot_bin,
+-                                             const std::function<void(std::uint64_t, std::uint64_t)> &progress) {
+-    const std::string eboot_sha256 = psprecomp::sha256_bytes(eboot_bin);
+-    // An edition whose EBOOT.BIN is the plain executable (a patched release):
+-    // nothing to decrypt. The installer has already decided whether an
+-    // unknown one may run.
+-    if (eboot_bin.size() > 4u && eboot_bin[0] == 0x7Fu && eboot_bin[1] == 'E' && eboot_bin[2] == 'L' &&
+-        eboot_bin[3] == 'F') {
+-        if (!is_known_executable(eboot_sha256) && !game().run_unknown_executables)
+-            throw psprecomp::Error("EBOOT.BIN is not an executable of " + std::string(game().game_title) + " (" +
+-                                   game().disc_id_display + ") this build knows");
+-        if (progress) progress(eboot_bin.size(), eboot_bin.size());
+-        return {eboot_bin.begin(), eboot_bin.end()};
+-    }
+-    const ProfileVariant *variant = find_variant_by_encrypted(eboot_sha256);
+-    if (variant == nullptr && eboot_sha256 != game().encrypted_executable_sha256)
+-        throw psprecomp::Error("EBOOT.BIN is not the supported executable of " + std::string(game().game_title) + " (" +
+-                               game().disc_id_display + ")");
+-    // The hash already pins the file; the profile names the key its tag selects.
+-    const TagKeyMaterial tag{game().decryption_tag, game().decryption_key, game().decryption_key_table};
+-    std::vector<std::uint8_t> executable = decrypt_executable(eboot_bin, tag, progress);
+-    const char *expected = variant != nullptr ? variant->executable_sha256 : game().executable_sha256;
+-    if (expected == nullptr || psprecomp::sha256_bytes(executable) != expected)
+-        throw psprecomp::Error("The prepared executable does not match the supported one");
+-    return executable;
+-}
+-
+-} // namespace portablekit::install
++// Prepares the game's executable from the encrypted EBOOT.BIN on the player's
++// own disc. Written for this project from public descriptions of the PSP
++// executable header ("~PSP") and of the PSP's AES-based crypto engine; see
++// executable_preparation.hpp for what it accepts.
++//
++// The tag at 0xD0 selects a key; the framework knows the layout and the
++// engine's fixed keys, and the profile supplies the key its release's tag
++// selects (GameProfile::decryption_tag, and decryption_key or, for the older
++// header layout, decryption_key_table).
++//
++// The file is an 0x150-byte header followed by the executable, encrypted with
++// AES-128 in CBC mode under a per-file key. The header keeps that key wrapped
++// twice: under the engine's fixed decryption key, and inside header fields that
++// are encrypted and masked with material derived from the key its tag selects.
++
++#include "install/executable_preparation.hpp"
++
++#include "crypto_keys.hpp"
++#include "profile.hpp"
++
++#include "psprecomp/common.hpp"
++#include "psprecomp/sha256.hpp"
++
++#include "tiny_aes/aes.h"
++
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <optional>
++#include <string>
++
++namespace portablekit::install {
++namespace {
++
++using Block = std::array<std::uint8_t, 16>;
++
++constexpr std::size_t kHeaderSize = 0x150u;
++
++// Header fields used here.
++constexpr std::size_t kMagicOffset = 0x00u;           // "~PSP"
++constexpr std::size_t kAttributesOffset = 0x06u;      // bit 0 set: compressed
++constexpr std::size_t kImageSizeOffset = 0x28u;       // size of the decrypted image
++constexpr std::size_t kFileTypeOffset = 0x7Cu;        // 9: UMD game executable
++constexpr std::size_t kPayloadSizeOffset = 0xB0u;     // size of the encrypted payload
++constexpr std::size_t kTagOffset = 0xD0u;
++
++constexpr std::uint8_t kUmdGameExecutable = 9u;
++
++// Crypto-engine key slot 0x5D (plain AES decryption, command 7), which the
++// tags of every release supported so far use for the header (another tag may
++// name another slot: TagKeyMaterial::kirk_slot), and the engine's fixed key for signed and encrypted
++// blocks (command 1), which wraps the payload key. Both come from
++// crypto_keys(), never from this file.
++constexpr std::uint8_t kHeaderKeySlot = 0x5Du;
++
++const Block &required_key(const Key16 *key, const char *what) {
++    if (key == nullptr)
++        throw psprecomp::Error(std::string("Decrypting EBOOT.BIN needs ") + what +
++                               ", which is not in the keys this program has. Add a keys file, or use an executable "
++                               "you have already decrypted.");
++    return *key;
++}
++
++// The slot of the tag being decrypted; one decryption at a time.
++std::uint8_t g_header_slot = kHeaderKeySlot;
++
++const Block &header_key() {
++    const CryptoKeys *keys = crypto_keys();
++    return required_key(keys != nullptr ? keys->kirk(g_header_slot) : nullptr, "the KIRK key the tag selects");
++}
++
++const Block &payload_wrapping_key() {
++    const CryptoKeys *keys = crypto_keys();
++    return required_key(keys != nullptr && keys->kirk_cmd1 ? &*keys->kirk_cmd1 : nullptr,
++                        "the key of KIRK command 1");
++}
++
++std::uint32_t read_le32(std::span<const std::uint8_t> data, std::size_t offset) {
++    return static_cast<std::uint32_t>(data[offset]) | (static_cast<std::uint32_t>(data[offset + 1u]) << 8u) |
++           (static_cast<std::uint32_t>(data[offset + 2u]) << 16u) |
++           (static_cast<std::uint32_t>(data[offset + 3u]) << 24u);
++}
++
++// AES-128-CBC decryption with a zero IV, in place. The length must be a
++// multiple of the block size.
++void cbc_decrypt(const Block &key, std::span<std::uint8_t> data) {
++    const Block zero_iv{};
++    AES_ctx context{};
++    AES_init_ctx_iv(&context, key.data(), zero_iv.data());
++    AES_CBC_decrypt_buffer(&context, data.data(), data.size());
++}
++
++Block block_at(std::span<const std::uint8_t> data, std::size_t offset) {
++    Block block{};
++    std::memcpy(block.data(), data.data() + offset, block.size());
++    return block;
++}
++
++void xor_into(Block &target, std::span<const std::uint8_t> mask) {
++    for (std::size_t i = 0; i < target.size(); ++i) target[i] ^= mask[i];
++}
++
++void append(std::vector<std::uint8_t> &out, std::span<const std::uint8_t> header, std::size_t offset,
++            std::size_t size) {
++    out.insert(out.end(), header.begin() + static_cast<std::ptrdiff_t>(offset),
++               header.begin() + static_cast<std::ptrdiff_t>(offset + size));
++}
++
++// The tag key, repeated over nine blocks that each carry their own index in
++// their first byte, decrypted with the header key.
++std::vector<std::uint8_t> derive_mask(const Block &tag_key) {
++    std::vector<std::uint8_t> mask;
++    for (std::uint8_t index = 0; index < 9u; ++index) {
++        Block block = tag_key;
++        block[0] = index;
++        mask.insert(mask.end(), block.begin(), block.end());
++    }
++    cbc_decrypt(header_key(), mask);
++    return mask;
++}
++
++// Recovers the payload key from the header.
++Block unwrap_payload_key(std::span<const std::uint8_t> header, const Block &tag_key) {
++    // Four header fields form one 0x60-byte encrypted record. Decrypted, it
++    // holds a check value and the header's hash, followed from offset 0x24 by
++    // the payload key still wrapped under the fixed key and masked.
++    std::vector<std::uint8_t> record;
++    append(record, header, 0x140u, 0x10u);
++    append(record, header, 0x12Cu, 0x14u);
++    append(record, header, 0x80u, 0x30u);
++    append(record, header, 0xC0u, 0x0Cu);
++    cbc_decrypt(header_key(), record);
++
++    const std::vector<std::uint8_t> mask = derive_mask(tag_key);
++    Block key = block_at(record, 0x24u);
++    xor_into(key, std::span(mask).subspan(0x10u, 16u));
++    cbc_decrypt(header_key(), key);
++    xor_into(key, std::span(mask).subspan(0x50u, 16u));
++    cbc_decrypt(payload_wrapping_key(), key);
++    return key;
++}
++
++// The older header layout, whose tag selects a 0x90-byte key table rather
++// than a 16-byte key. Its fields are laid out differently, but the result is
++// the same: the payload key, wrapped under the fixed key.
++//
++// Five header fields form one 0xA0-byte record, encrypted under the header key
++// as a single chain: the last eight bytes of the header hash, the 0x28 bytes
++// after it, then the key block, which is split between 0x110 and 0x80. The
++// key block's first 0x70 bytes are masked on either side of a further
++// decryption, with the table from offsets 0x14 and 0x20. CBC makes each block
++// depend only on the one before it, so only the first block, which is the
++// wrapped payload key, and the mode word need decrypting.
++Block unwrap_payload_key_from_table(std::span<const std::uint8_t> header, std::span<const std::uint8_t> table) {
++    if (table.size() != 0x90u) throw psprecomp::Error("The decryption key table is not 0x90 bytes long");
++
++    std::vector<std::uint8_t> record;
++    append(record, header, 0xE0u, 0x08u);
++    append(record, header, 0xE8u, 0x28u);
++    append(record, header, 0x110u, 0x40u);
++    append(record, header, 0x80u, 0x30u);
++    cbc_decrypt(header_key(), record);
++
++    // The key block starts at 0x30 in the record. Its first 0x70 bytes are
++    // the part that is masked; decrypt it whole, since the mode word at 0x60
++    // is the check that the table was the right one.
++    std::vector<std::uint8_t> block(record.begin() + 0x30, record.begin() + 0xA0);
++    for (std::size_t i = 0; i < block.size(); ++i) block[i] ^= table[0x14u + i];
++    cbc_decrypt(header_key(), block);
++    for (std::size_t i = 0; i < block.size(); ++i) block[i] ^= table[0x20u + i];
++
++    const std::uint32_t mode = read_le32(block, 0x60u);
++    if (mode != 1u) throw psprecomp::Error("EBOOT.BIN did not decrypt with the key table its tag selects");
++    Block key = block_at(block, 0x00u);
++    cbc_decrypt(payload_wrapping_key(), key);
++    return key;
++}
++
++} // namespace
++
++std::optional<std::uint32_t> executable_tag(std::span<const std::uint8_t> eboot_bin) {
++    if (eboot_bin.size() < kHeaderSize || std::memcmp(eboot_bin.data() + kMagicOffset, "~PSP", 4u) != 0)
++        return std::nullopt;
++    return read_le32(eboot_bin, kTagOffset);
++}
++
++std::vector<std::uint8_t> decrypt_executable(std::span<const std::uint8_t> eboot_bin, const TagKeyMaterial &tag,
++                                             const std::function<void(std::uint64_t, std::uint64_t)> &progress) {
++    // These checks document the one layout handled here.
++    if (eboot_bin.size() < kHeaderSize || std::memcmp(eboot_bin.data() + kMagicOffset, "~PSP", 4u) != 0 ||
++        read_le32(eboot_bin, kTagOffset) != tag.tag || eboot_bin[kFileTypeOffset] != kUmdGameExecutable ||
++        (eboot_bin[kAttributesOffset] & 1u) != 0u)
++        throw psprecomp::Error("EBOOT.BIN has an unexpected header");
++    const std::uint32_t size = read_le32(eboot_bin, kPayloadSizeOffset);
++    const std::size_t padded_size = (static_cast<std::size_t>(size) + 15u) & ~std::size_t{15u};
++    if (size == 0u || size != read_le32(eboot_bin, kImageSizeOffset) || padded_size > eboot_bin.size() - kHeaderSize)
++        throw psprecomp::Error("EBOOT.BIN has an unexpected payload size");
++
++    g_header_slot = tag.kirk_slot;
++    const Block key = tag.table.empty() ? unwrap_payload_key(eboot_bin.first(kHeaderSize), tag.key)
++                                        : unwrap_payload_key_from_table(eboot_bin.first(kHeaderSize), tag.table);
++    std::vector<std::uint8_t> executable(eboot_bin.begin() + kHeaderSize,
++                                         eboot_bin.begin() + static_cast<std::ptrdiff_t>(kHeaderSize + padded_size));
++    // CBC carries its chaining value in the context, so the payload decrypts
++    // in slices that report progress in between.
++    constexpr std::size_t kSlice = 1024u * 1024u;
++    const Block zero_iv{};
++    AES_ctx context{};
++    AES_init_ctx_iv(&context, key.data(), zero_iv.data());
++    for (std::size_t offset = 0; offset < executable.size(); offset += kSlice) {
++        const std::size_t length = std::min(kSlice, executable.size() - offset);
++        AES_CBC_decrypt_buffer(&context, executable.data() + offset, length);
++        if (progress) progress(offset + length, executable.size());
++    }
++    executable.resize(size);
++    return executable;
++}
++
++std::vector<std::uint8_t> prepare_executable(std::span<const std::uint8_t> eboot_bin,
++                                             const std::function<void(std::uint64_t, std::uint64_t)> &progress) {
++    const std::string eboot_sha256 = psprecomp::sha256_bytes(eboot_bin);
++    // An edition whose EBOOT.BIN is the plain executable (a patched release):
++    // nothing to decrypt. The installer has already decided whether an
++    // unknown one may run.
++    if (eboot_bin.size() > 4u && eboot_bin[0] == 0x7Fu && eboot_bin[1] == 'E' && eboot_bin[2] == 'L' &&
++        eboot_bin[3] == 'F') {
++        if (!is_known_executable(eboot_sha256) && !game().run_unknown_executables)
++            throw psprecomp::Error("EBOOT.BIN is not an executable of " + std::string(game().game_title) + " (" +
++                                   game().disc_id_display + ") this build knows");
++        if (progress) progress(eboot_bin.size(), eboot_bin.size());
++        return {eboot_bin.begin(), eboot_bin.end()};
++    }
++    const ProfileVariant *variant = find_variant_by_encrypted(eboot_sha256);
++    if (variant == nullptr && eboot_sha256 != game().encrypted_executable_sha256)
++        throw psprecomp::Error("EBOOT.BIN is not the supported executable of " + std::string(game().game_title) + " (" +
++                               game().disc_id_display + ")");
++    // The hash already pins the file; the profile names the key its tag selects.
++    // An edition from another region's disc may name its own tag and key.
++    const TagKeyMaterial tag = variant != nullptr && variant->decryption_tag != 0u
++                                   ? TagKeyMaterial{variant->decryption_tag, variant->decryption_key, {}}
++                                   : TagKeyMaterial{game().decryption_tag, game().decryption_key,
++                                                    game().decryption_key_table};
++    std::vector<std::uint8_t> executable = decrypt_executable(eboot_bin, tag, progress);
++    const char *expected = variant != nullptr ? variant->executable_sha256 : game().executable_sha256;
++    if (expected == nullptr || psprecomp::sha256_bytes(executable) != expected)
++        throw psprecomp::Error("The prepared executable does not match the supported one");
++    return executable;
++}
++
++} // namespace portablekit::install
+diff -ru a/host/profile.cpp b/host/profile.cpp
+--- a/host/profile.cpp	2026-11-07 03:25:52.711311391 +0000
++++ b/host/profile.cpp	2026-11-07 03:25:52.766534119 +0000
+@@ -73,6 +73,18 @@
+     return game().adhoc_product_code;
+ }
+ 
++std::uint32_t active_system_language() {
++    if (g_active_variant != nullptr && g_active_variant->system_language >= 0)
++        return static_cast<std::uint32_t>(g_active_variant->system_language);
++    return game().system_language;
++}
++
++std::uint32_t active_confirm_button() {
++    if (g_active_variant != nullptr && g_active_variant->confirm_button >= 0)
++        return static_cast<std::uint32_t>(g_active_variant->confirm_button);
++    return game().confirm_button;
++}
++
+ const ProfileVariant *find_variant_by_disc_id(std::string_view disc_id, bool &known) {
+     known = disc_id == game().disc_id;
+     if (known) return nullptr;
+diff -ru a/host/profile.hpp b/host/profile.hpp
+--- a/host/profile.hpp	2026-11-07 03:25:52.710082183 +0000
++++ b/host/profile.hpp	2026-11-07 03:25:52.766314852 +0000
+@@ -137,6 +137,15 @@
+     const char *disc_id_display = nullptr;
+     const char *release_name = nullptr;
+     const char *adhoc_product_code = nullptr;
++    // Its EBOOT.BIN's tag and the key it selects, where that is not the
++    // profile's (another region's release can be encrypted under another
++    // tag). 0: the profile's tag, key and key table.
++    std::uint32_t decryption_tag = 0u;
++    std::array<std::uint8_t, 16> decryption_key = {};
++    // What a console of its region reports (GameProfile::system_language and
++    // confirm_button); -1: the profile's.
++    std::int32_t system_language = -1;
++    std::int32_t confirm_button = -1;
+     // What this edition does differently; null or empty: the profile's own.
+     void (*register_extra_hle)(HleRegistrar &) = nullptr;
+     void (*patch_loaded_image)(psprecomp::Runtime &, const psprecomp::Elf32Image &) = nullptr;
+@@ -322,6 +331,10 @@
+ [[nodiscard]] const char *active_disc_id();
+ [[nodiscard]] const char *active_disc_id_display();
+ [[nodiscard]] const char *active_adhoc_product_code();
++// The console settings the running edition expects (ProfileVariant
++// system_language and confirm_button, else the profile's).
++[[nodiscard]] std::uint32_t active_system_language();
++[[nodiscard]] std::uint32_t active_confirm_button();
+ // The profile's release or the edition whose disc has this DISC_ID: null for
+ // a disc no edition comes from. The profile's own release is a null variant,
+ // so `known` says whether the disc id is one this build accepts at all.
+diff -ru a/host/settings/settings.cpp b/host/settings/settings.cpp
+--- a/host/settings/settings.cpp	2026-11-07 03:25:52.714939430 +0000
++++ b/host/settings/settings.cpp	2026-11-07 03:25:52.767509378 +0000
+@@ -1,573 +1,573 @@
+-#include "../profile.hpp"
+-#include "settings/settings.hpp"
+-
+-#include "install/user_data.hpp"
+-
+-#include <algorithm>
+-#include <cstdio>
+-#include <cstdlib>
+-#include <cstring>
+-#include <functional>
+-#include <iostream>
+-#include <map>
+-#include <string>
+-#include <vector>
+-
+-namespace portablekit::settings {
+-namespace {
+-
+-// One setting: its key in settings.ini, the variable that overrides it, and
+-// how both spell its value.
+-struct Field {
+-    const char *key;
+-    const char *variable;  // null: no environment override
+-    std::function<bool(Settings &, const std::string &)> parse;
+-    std::function<std::string(const Settings &)> format;
+-    // Reads the variable's value, which is spelled the way the variable has
+-    // always been. Null: the variable uses the file's spelling.
+-    std::function<void(Settings &, const char *)> parse_variable;
+-};
+-
+-bool parse_bool(const std::string &text, bool &out) {
+-    if (text == "1" || text == "true" || text == "on" || text == "yes") out = true;
+-    else if (text == "0" || text == "false" || text == "off" || text == "no") out = false;
+-    else return false;
+-    return true;
+-}
+-
+-bool parse_float(const std::string &text, float minimum, float maximum, float &out) {
+-    char *end = nullptr;
+-    const float value = std::strtof(text.c_str(), &end);
+-    if (end == text.c_str() || *end != '\0') return false;
+-    out = std::clamp(value, minimum, maximum);
+-    return true;
+-}
+-
+-bool parse_uint(const std::string &text, std::uint32_t minimum, std::uint32_t maximum, std::uint32_t &out) {
+-    char *end = nullptr;
+-    const unsigned long value = std::strtoul(text.c_str(), &end, 10);
+-    if (end == text.c_str() || *end != '\0') return false;
+-    out = static_cast<std::uint32_t>(std::clamp<unsigned long>(value, minimum, maximum));
+-    return true;
+-}
+-
+-// A resolution: a multiple of 480x272, or "auto" (0) for the window's own.
+-bool parse_scale(const std::string &text, std::uint32_t &out) {
+-    if (text == "auto") {
+-        out = 0u;
+-        return true;
+-    }
+-    return parse_uint(text, 0u, kMaxInternalScale, out);
+-}
+-
+-std::string format_float(float value) {
+-    char text[32];
+-    std::snprintf(text, sizeof(text), "%.2f", static_cast<double>(value));
+-    return text;
+-}
+-
+-// Flags the host has always read as "set means on", whatever the value.
+-bool variable_present(const char *) { return true; }
+-
+-// Flags read the way the pad code reads them: 0, no, off and false are off.
+-bool variable_flag(const char *text) {
+-    for (const char *off : {"0", "no", "off", "false"})
+-        if (std::strcmp(text, off) == 0) return false;
+-    return true;
+-}
+-
+-float variable_float(const char *text, float fallback, float minimum, float maximum) {
+-    char *end = nullptr;
+-    const float value = std::strtof(text, &end);
+-    return std::clamp(end != text ? value : fallback, minimum, maximum);
+-}
+-
+-template <typename Enum>
+-struct Names {
+-    std::vector<std::pair<Enum, const char *>> values;
+-
+-    bool parse(const std::string &text, Enum &out) const {
+-        for (const auto &[value, name] : values) {
+-            if (text == name) {
+-                out = value;
+-                return true;
+-            }
+-        }
+-        return false;
+-    }
+-    [[nodiscard]] std::string format(Enum value) const {
+-        for (const auto &[candidate, name] : values)
+-            if (candidate == value) return name;
+-        return values.front().second;
+-    }
+-};
+-
+-const Names<PresentMode> kPresentModes{
+-    {{PresentMode::Fifo, "vsync"}, {PresentMode::Mailbox, "mailbox"}, {PresentMode::Immediate, "immediate"}}};
+-const Names<Aspect> kAspects{{{Aspect::Original, "original"}, {Aspect::Stretch, "stretch"}, {Aspect::Fill, "fill"}}};
+-const Names<PerfDisplay> kPerfDisplays{{{PerfDisplay::Off, "off"},
+-                                        {PerfDisplay::Overlay, "overlay"},
+-                                        {PerfDisplay::OverlayAndLog, "overlay+log"},
+-                                        {PerfDisplay::Log, "log"}}};
+-const Names<input::tilt::Mode> kTiltModes{{{input::tilt::Mode::Angle, "angle"},
+-                                            {input::tilt::Mode::AngleLevel, "level"},
+-                                            {input::tilt::Mode::AngleLevel, "horizon"},
+-                                            {input::tilt::Mode::Rate, "rate"}}};
+-const Names<JumpButton> kJumpButtons{{{JumpButton::Off, "off"},
+-                                      {JumpButton::LeftStick, "l3"},
+-                                      {JumpButton::South, "south"},
+-                                      {JumpButton::East, "east"},
+-                                      {JumpButton::West, "west"},
+-                                      {JumpButton::North, "north"}}};
+-const Names<RightStick> kRightSticks{
+-    {{RightStick::Camera, "camera"}, {RightStick::DPad, "dpad"}, {RightStick::Off, "off"}}};
+-// A trigger profile by the key the game gives it, or "standard" for L and R.
+-bool parse_trigger_profile(const std::string &text, std::uint32_t &out) {
+-    if (text == "standard") {
+-        out = 0u;
+-        return true;
+-    }
+-    const std::span<const TriggerProfile> profiles = game().trigger_profiles;
+-    for (std::size_t i = 0; i < profiles.size(); ++i) {
+-        if (text == profiles[i].key) {
+-            out = static_cast<std::uint32_t>(i + 1u);
+-            return true;
+-        }
+-    }
+-    return false;
+-}
+-
+-std::string format_trigger_profile(std::uint32_t profile) {
+-    const std::span<const TriggerProfile> profiles = game().trigger_profiles;
+-    return profile == 0u || profile > profiles.size() ? std::string("standard") : std::string(profiles[profile - 1u].key);
+-}
+-const Names<NameEntry> kNameEntries{{{NameEntry::Keyboard, "keyboard"}, {NameEntry::Fixed, "fixed"}}};
+-const Names<FrameRate> kFrameRates{{{FrameRate::Fps30, "30"},
+-                                    {FrameRate::Fps45, "45"},
+-                                    {FrameRate::Fps60, "60"},
+-                                    {FrameRate::Fps90, "90"},
+-                                    {FrameRate::Fps120, "120"},
+-                                    {FrameRate::Display, "display"}}};
+-
+-// Written by earlier versions: 1 typed the name into the window, which the
+-// on-screen keyboard now covers.
+-constexpr const char *kRetiredTypeNameKey = "input.type_name";
+-
+-#define BOOL_FIELD(key, member)                                                                                       \
+-    Field {                                                                                                            \
+-        key, nullptr, [](Settings &s, const std::string &t) { return parse_bool(t, s.member); },                       \
+-            [](const Settings &s) { return std::string(s.member ? "1" : "0"); }, nullptr                               \
+-    }
+-
+-const std::vector<Field> &fields() {
+-    static const std::vector<Field> table = {
+-        {"video.internal_scale", "INTERNAL_SCALE",
+-         [](Settings &s, const std::string &t) { return parse_scale(t, s.internal_scale); },
+-         [](const Settings &s) { return s.internal_scale == 0u ? std::string("auto") : std::to_string(s.internal_scale); },
+-         [](Settings &s, const char *t) {
+-             std::uint32_t value = s.internal_scale;
+-             if (parse_scale(t, value)) s.internal_scale = value;
+-         }},
+-        {"video.window_scale", nullptr,
+-         [](Settings &s, const std::string &t) { return parse_uint(t, 1u, kMaxWindowScale, s.window_scale); },
+-         [](const Settings &s) { return std::to_string(s.window_scale); }, nullptr},
+-        BOOL_FIELD("video.fullscreen", fullscreen),
+-        {"video.present_mode", nullptr,
+-         [](Settings &s, const std::string &t) { return kPresentModes.parse(t, s.present_mode); },
+-         [](const Settings &s) { return kPresentModes.format(s.present_mode); }, nullptr},
+-        // Written by earlier versions, which had Original and Stretch only.
+-        // Still written, so going back to one of them keeps the choice as
+-        // near as it can; video.aspect follows it and decides.
+-        {"video.keep_aspect", nullptr,
+-         [](Settings &s, const std::string &t) {
+-             bool keep = true;
+-             if (!parse_bool(t, keep)) return false;
+-             s.aspect = keep ? Aspect::Original : Aspect::Stretch;
+-             return true;
+-         },
+-         [](const Settings &s) { return std::string(s.aspect == Aspect::Stretch ? "0" : "1"); }, nullptr},
+-        {"video.aspect", nullptr, [](Settings &s, const std::string &t) { return kAspects.parse(t, s.aspect); },
+-         [](const Settings &s) { return kAspects.format(s.aspect); }, nullptr},
+-        BOOL_FIELD("video.sharp_screen", sharp_screen),
+-        BOOL_FIELD("video.sharp_textures", sharp_textures),
+-        {"video.texture_pack", "TEXTURE_PACK",
+-         [](Settings &s, const std::string &t) { return parse_bool(t, s.texture_pack); },
+-         [](const Settings &s) { return std::string(s.texture_pack ? "1" : "0"); },
+-         // 0/off/no/false turn it off; anything else, a folder included, on.
+-         [](Settings &s, const char *t) { s.texture_pack = variable_flag(t); }},
+-        {"video.texture_pack_folder", nullptr,
+-         [](Settings &s, const std::string &t) {
+-             s.texture_pack_folder = t;
+-             return true;
+-         },
+-         [](const Settings &s) { return s.texture_pack_folder; }, nullptr},
+-        {"video.unthrottled", "UNTHROTTLED",
+-         [](Settings &s, const std::string &t) { return parse_bool(t, s.unthrottled); },
+-         [](const Settings &s) { return std::string(s.unthrottled ? "1" : "0"); },
+-         [](Settings &s, const char *t) { s.unthrottled = variable_present(t); }},
+-        {"video.fast_loading", "FAST_LOADING",
+-         [](Settings &s, const std::string &t) { return parse_bool(t, s.fast_loading); },
+-         [](const Settings &s) { return std::string(s.fast_loading ? "1" : "0"); },
+-         [](Settings &s, const char *t) { s.fast_loading = variable_flag(t); }},
+-        {"video.frame_rate", "FRAME_RATE",
+-         [](Settings &s, const std::string &t) { return kFrameRates.parse(t, s.frame_rate); },
+-         [](const Settings &s) { return kFrameRates.format(s.frame_rate); },
+-         [](Settings &s, const char *t) {
+-             if (!kFrameRates.parse(t, s.frame_rate)) s.frame_rate = FrameRate::Fps30;
+-         }},
+-        {"video.frame_rate_auto", "FRAME_RATE_AUTO",
+-         [](Settings &s, const std::string &t) { return parse_bool(t, s.frame_rate_auto); },
+-         [](const Settings &s) { return std::string(s.frame_rate_auto ? "1" : "0"); },
+-         [](Settings &s, const char *t) { s.frame_rate_auto = variable_flag(t); }},
+-        {"video.performance", "PERF",
+-         [](Settings &s, const std::string &t) { return kPerfDisplays.parse(t, s.perf); },
+-         [](const Settings &s) { return kPerfDisplays.format(s.perf); },
+-         [](Settings &s, const char *t) {
+-             // `1` has always meant the overlay and the log, `log` the log only.
+-             if (std::strcmp(t, "log") == 0) s.perf = PerfDisplay::Log;
+-             else s.perf = *t != '\0' && variable_flag(t) ? PerfDisplay::OverlayAndLog : PerfDisplay::Off;
+-         }},
+-        {"text.font", "FONT",
+-         [](Settings &s, const std::string &t) {
+-             s.font = t;
+-             return true;
+-         },
+-         [](const Settings &s) { return s.font; }, [](Settings &s, const char *t) { s.font = t; }},
+-        {"text.weight", nullptr,
+-         [](Settings &s, const std::string &t) { return parse_uint(t, 0u, kMaxFontWeight, s.font_weight); },
+-         [](const Settings &s) { return std::to_string(s.font_weight); }, nullptr},
+-        {"audio.volume", nullptr,
+-         [](Settings &s, const std::string &t) { return parse_uint(t, 0u, 100u, s.volume); },
+-         [](const Settings &s) { return std::to_string(s.volume); }, nullptr},
+-        BOOL_FIELD("audio.mute", mute),
+-        {"input.confirm", "PAD_FACE",
+-         [](Settings &s, const std::string &t) {
+-             if (t == "south") s.confirm_south = true;
+-             else if (t == "east") s.confirm_south = false;
+-             else return false;
+-             return true;
+-         },
+-         [](const Settings &s) { return std::string(s.confirm_south ? "south" : "east"); },
+-         [](Settings &s, const char *t) { s.confirm_south = std::strcmp(t, "xbox") == 0 || std::strcmp(t, "south") == 0; }},
+-        {"input.dead_zone", "PAD_DEADZONE",
+-         [](Settings &s, const std::string &t) { return parse_float(t, 0.0f, 0.9f, s.dead_zone); },
+-         [](const Settings &s) { return format_float(s.dead_zone); },
+-         [](Settings &s, const char *t) { s.dead_zone = variable_float(t, 0.15f, 0.0f, 0.9f); }},
+-        {"input.trigger", "PAD_TRIGGER",
+-         [](Settings &s, const std::string &t) { return parse_float(t, 0.05f, 1.0f, s.trigger); },
+-         [](const Settings &s) { return format_float(s.trigger); },
+-         [](Settings &s, const char *t) { s.trigger = variable_float(t, 0.25f, 0.05f, 1.0f); }},
+-        {"input.trigger_profile", "PAD_TRIGGERS",
+-         [](Settings &s, const std::string &t) { return parse_trigger_profile(t, s.trigger_profile); },
+-         [](const Settings &s) { return format_trigger_profile(s.trigger_profile); },
+-         [](Settings &s, const char *t) {
+-             if (!parse_trigger_profile(t, s.trigger_profile)) s.trigger_profile = 0u;
+-         }},
+-        {"input.right_stick", "PAD_RSTICK_DPAD",
+-         [](Settings &s, const std::string &t) { return kRightSticks.parse(t, s.right_stick); },
+-         [](const Settings &s) { return kRightSticks.format(s.right_stick); },
+-         [](Settings &s, const char *t) { s.right_stick = variable_flag(t) ? RightStick::DPad : RightStick::Camera; }},
+-        {"input.right_stick_zone", "PAD_RSTICK_ZONE",
+-         [](Settings &s, const std::string &t) { return parse_float(t, 0.1f, 1.0f, s.right_stick_zone); },
+-         [](const Settings &s) { return format_float(s.right_stick_zone); },
+-         [](Settings &s, const char *t) { s.right_stick_zone = variable_float(t, 0.5f, 0.1f, 1.0f); }},
+-        {"input.analog_camera", "ANALOG_CAMERA",
+-         [](Settings &s, const std::string &t) { return parse_bool(t, s.analog_camera); },
+-         [](const Settings &s) { return std::string(s.analog_camera ? "1" : "0"); },
+-         [](Settings &s, const char *t) { s.analog_camera = variable_flag(t); }},
+-        {"input.camera_speed", "CAMERA_SPEED",
+-         [](Settings &s, const std::string &t) { return parse_float(t, 20.0f, 720.0f, s.camera_speed); },
+-         [](const Settings &s) { return format_float(s.camera_speed); },
+-         [](Settings &s, const char *t) { s.camera_speed = variable_float(t, 190.0f, 20.0f, 720.0f); }},
+-        {"input.aim_speed", "AIM_SPEED",
+-         [](Settings &s, const std::string &t) { return parse_float(t, 10.0f, 360.0f, s.aim_speed); },
+-         [](const Settings &s) { return format_float(s.aim_speed); },
+-         [](Settings &s, const char *t) { s.aim_speed = variable_float(t, 90.0f, 10.0f, 360.0f); }},
+-        BOOL_FIELD("input.invert_camera_x", invert_camera_x),
+-        BOOL_FIELD("input.invert_camera_y", invert_camera_y),
+-        {"input.mouse", "MOUSE",
+-         [](Settings &s, const std::string &t) { return parse_bool(t, s.mouse); },
+-         [](const Settings &s) { return std::string(s.mouse ? "1" : "0"); },
+-         [](Settings &s, const char *t) { s.mouse = variable_flag(t); }},
+-        {"input.mouse_sensitivity", "MOUSE_SENSITIVITY",
+-         [](Settings &s, const std::string &t) {
+-             return parse_float(t, kMinMouseSensitivity, kMaxMouseSensitivity, s.mouse_sensitivity);
+-         },
+-         [](const Settings &s) { return format_float(s.mouse_sensitivity); },
+-         [](Settings &s, const char *t) {
+-             s.mouse_sensitivity = variable_float(t, 0.10f, kMinMouseSensitivity, kMaxMouseSensitivity);
+-         }},
+-        BOOL_FIELD("input.touch_controls", touch_controls),
+-        BOOL_FIELD("input.touch_dpad", touch_dpad),
+-        {"input.touch_opacity", nullptr,
+-         [](Settings &s, const std::string &t) {
+-             return parse_float(t, kMinTouchOpacity, kMaxTouchOpacity, s.touch_opacity);
+-         },
+-         [](const Settings &s) { return format_float(s.touch_opacity); }, nullptr},
+-        {"input.touch_size", nullptr,
+-         [](Settings &s, const std::string &t) { return parse_float(t, kMinTouchSize, kMaxTouchSize, s.touch_size); },
+-         [](const Settings &s) { return format_float(s.touch_size); }, nullptr},
+-        {"input.touch_camera_speed", nullptr,
+-         [](Settings &s, const std::string &t) {
+-             return parse_float(t, kMinTouchCameraSpeed, kMaxTouchCameraSpeed, s.touch_camera_speed);
+-         },
+-         [](const Settings &s) { return format_float(s.touch_camera_speed); }, nullptr},
+-        BOOL_FIELD("input.invert_mouse_x", invert_mouse_x),
+-        BOOL_FIELD("input.invert_mouse_y", invert_mouse_y),
+-        {"input.tilt", "TILT",
+-         [](Settings &s, const std::string &t) { return parse_bool(t, s.tilt); },
+-         [](const Settings &s) { return std::string(s.tilt ? "1" : "0"); },
+-         [](Settings &s, const char *t) { s.tilt = variable_flag(t); }},
+-        {"input.tilt_mode", "TILT_MODE",
+-         [](Settings &s, const std::string &t) { return kTiltModes.parse(t, s.tilt_mode); },
+-         [](const Settings &s) { return kTiltModes.format(s.tilt_mode); },
+-         [](Settings &s, const char *t) {
+-             if (!kTiltModes.parse(t, s.tilt_mode)) std::cerr << "[settings] " << env_name("TILT_MODE") << ": angle, rate, or level (also horizon)\n";
+-         }},
+-        {"input.tilt_full", "TILT_FULL",
+-         [](Settings &s, const std::string &t) {
+-             return parse_float(t, input::tilt::kMinFullTilt, input::tilt::kMaxFullTilt, s.tilt_full);
+-         },
+-         [](const Settings &s) { return format_float(s.tilt_full); },
+-         [](Settings &s, const char *t) {
+-             s.tilt_full = variable_float(t, 12.0f, input::tilt::kMinFullTilt, input::tilt::kMaxFullTilt);
+-         }},
+-        {"input.tilt_dead_zone", "TILT_DEAD_ZONE",
+-         [](Settings &s, const std::string &t) {
+-             return parse_float(t, input::tilt::kMinDeadZone, input::tilt::kMaxDeadZone, s.tilt_dead_zone);
+-         },
+-         [](const Settings &s) { return format_float(s.tilt_dead_zone); },
+-         [](Settings &s, const char *t) {
+-             s.tilt_dead_zone = variable_float(t, 4.0f, input::tilt::kMinDeadZone, input::tilt::kMaxDeadZone);
+-         }},
+-        BOOL_FIELD("input.tilt_invert", tilt_invert),
+-        {"input.jump_button", nullptr,
+-         [](Settings &s, const std::string &t) { return kJumpButtons.parse(t, s.jump_button); },
+-         [](const Settings &s) { return kJumpButtons.format(s.jump_button); }, nullptr},
+-        {"input.tilt_level_limit", nullptr,
+-         [](Settings &s, const std::string &t) {
+-             return parse_float(t, input::tilt::kMinLevelLimit, input::tilt::kMaxLevelLimit, s.tilt_level_limit);
+-         },
+-         [](const Settings &s) { return format_float(s.tilt_level_limit); }, nullptr},
+-        {"input.name_entry", "OSK_MODE",
+-         [](Settings &s, const std::string &t) { return kNameEntries.parse(t, s.name_entry); },
+-         [](const Settings &s) { return kNameEntries.format(s.name_entry); },
+-         [](Settings &s, const char *t) {
+-             if (!kNameEntries.parse(t, s.name_entry)) std::cerr << "[settings] " << env_name("OSK_MODE") << ": keyboard or fixed\n";
+-         }},
+-        {"input.name", "OSK_TEXT",
+-         [](Settings &s, const std::string &t) {
+-             if (t.empty()) return false;
+-             s.name = t;
+-             return true;
+-         },
+-         [](const Settings &s) { return s.name; }, [](Settings &s, const char *t) { s.name = t; }},
+-        {"network.adhoc", "ADHOC",
+-         [](Settings &s, const std::string &t) { return parse_bool(t, s.adhoc); },
+-         [](const Settings &s) { return std::string(s.adhoc ? "1" : "0"); },
+-         [](Settings &s, const char *t) { s.adhoc = variable_flag(t); }},
+-        {"network.server", "ADHOC_SERVER",
+-         [](Settings &s, const std::string &t) {
+-             s.adhoc_server = t;
+-             return true;
+-         },
+-         [](const Settings &s) { return s.adhoc_server; }, [](Settings &s, const char *t) { s.adhoc_server = t; }},
+-        {"network.nickname", "ADHOC_NICKNAME",
+-         [](Settings &s, const std::string &t) {
+-             s.adhoc_nickname = t;
+-             return true;
+-         },
+-         [](const Settings &s) { return s.adhoc_nickname; },
+-         [](Settings &s, const char *t) { s.adhoc_nickname = t; }},
+-        {"network.mac", "ADHOC_MAC",
+-         [](Settings &s, const std::string &t) {
+-             s.adhoc_mac = t;
+-             return true;
+-         },
+-         [](const Settings &s) { return s.adhoc_mac; }, [](Settings &s, const char *t) { s.adhoc_mac = t; }},
+-        {"ui.menu_pause", "MENU_PAUSE",
+-         [](Settings &s, const std::string &t) { return parse_bool(t, s.menu_pause); },
+-         [](const Settings &s) { return std::string(s.menu_pause ? "1" : "0"); },
+-         [](Settings &s, const char *t) { s.menu_pause = variable_flag(t); }},
+-        {"ui.menu_pause_multiplayer", "MENU_PAUSE_MULTIPLAYER",
+-         [](Settings &s, const std::string &t) { return parse_bool(t, s.menu_pause_multiplayer); },
+-         [](const Settings &s) { return std::string(s.menu_pause_multiplayer ? "1" : "0"); },
+-         [](Settings &s, const char *t) { s.menu_pause_multiplayer = variable_flag(t); }},
+-        {"network.recent", nullptr,
+-         [](Settings &s, const std::string &t) {
+-             s.adhoc_recent.clear();
+-             std::size_t start = 0;
+-             while (start <= t.size()) {
+-                 const std::size_t end = std::min(t.find(',', start), t.size());
+-                 if (end > start) s.adhoc_recent.push_back(t.substr(start, end - start));
+-                 start = end + 1u;
+-             }
+-             return true;
+-         },
+-         [](const Settings &s) {
+-             std::string text;
+-             for (const std::string &address : s.adhoc_recent) text += (text.empty() ? "" : ",") + address;
+-             return text;
+-         },
+-         nullptr},
+-        {"network.host_port", "ADHOC_HOST_PORT",
+-         [](Settings &s, const std::string &t) { return parse_uint(t, 1024u, 65534u, s.adhoc_host_port); },
+-         [](const Settings &s) { return std::to_string(s.adhoc_host_port); },
+-         [](Settings &s, const char *t) {
+-             std::uint32_t value = s.adhoc_host_port;
+-             if (parse_uint(t, 1024u, 65534u, value)) s.adhoc_host_port = value;
+-         }},
+-        BOOL_FIELD("ui.menu_hint_seen", menu_hint_seen),
+-        BOOL_FIELD("saves.backup_timestamp", backup_timestamp),
+-        {"ui.last_folder", nullptr,
+-         [](Settings &s, const std::string &t) {
+-             s.last_folder = t;
+-             return true;
+-         },
+-         [](const Settings &s) { return s.last_folder; }, nullptr},
+-    };
+-    return table;
+-}
+-
+-// One key per bound action, "input.bind.triangle=Mouse Left", after the
+-// fixed table.
+-const std::vector<Field> &all_fields() {
+-    static const std::vector<Field> table = [] {
+-        // Field keys are C strings; these hold them for the program's life.
+-        static std::vector<std::string> keys(input::kActions);
+-        std::vector<Field> list = fields();
+-        for (std::size_t i = 0; i < input::kActions; ++i) {
+-            keys[i] = std::string("input.bind.") + input::info(static_cast<input::Action>(i)).key;
+-            list.push_back(Field{keys[i].c_str(), nullptr,
+-                                 [i](Settings &s, const std::string &t) { return input::parse(t, s.bindings[i]); },
+-                                 [i](const Settings &s) { return input::format(s.bindings[i]); }, nullptr});
+-        }
+-        return list;
+-    }();
+-    return table;
+-}
+-
+-#undef BOOL_FIELD
+-
+-struct State {
+-    bool loaded{};
+-    Settings values;
+-    std::filesystem::path data_dir;
+-    // What settings.ini held, so values the environment decided are written
+-    // back as the file had them.
+-    install::SettingsEntries file;
+-    std::map<std::string, std::string> overrides;
+-};
+-
+-State &state() {
+-    static State value;
+-    return value;
+-}
+-
+-void load(State &s) {
+-    s.loaded = true;
+-    s.values = defaults();
+-    try {
+-        s.data_dir = install::user_data_directory();
+-        s.file = install::read_settings_file(s.data_dir);
+-    } catch (const std::exception &e) {
+-        std::cerr << "[settings] cannot read settings.ini: " << e.what() << "\n";
+-    }
+-    for (const Field &field : all_fields()) {
+-        if (const auto found = s.file.find(field.key); found != s.file.end() && !field.parse(s.values, found->second))
+-            std::cerr << "[settings] ignoring " << field.key << "=" << found->second << "\n";
+-        if (field.variable == nullptr) continue;
+-        const char *text = portablekit::env(field.variable);
+-        if (text == nullptr) continue;
+-        field.parse_variable(s.values, text);
+-        s.overrides[field.key] = env_name(field.variable);
+-    }
+-    // Bindings settings.ini did not hold are defaults, which must not take a
+-    // key it gave another control.
+-    std::array<bool, input::kActions> saved{};
+-    bool any_saved = false;
+-    for (std::size_t i = 0; i < input::kActions; ++i) {
+-        saved[i] = s.file.count(std::string("input.bind.") + input::info(static_cast<input::Action>(i)).key) != 0u;
+-        any_saved = any_saved || saved[i];
+-    }
+-    if (any_saved) input::keep_saved(s.values.bindings, saved);
+-    if (portablekit::env("TRACE_PAD") != nullptr) {
+-        std::cout << "[pad] keyboard:";
+-        for (std::size_t i = 0; i < input::kActions; ++i)
+-            std::cout << " " << input::info(static_cast<input::Action>(i)).key << "="
+-                      << input::format(s.values.bindings[i]) << (saved[i] ? "" : "*");
+-        std::cout << " (* the game's default); mouse " << (s.values.mouse ? "on" : "off") << std::endl;
+-    }
+-    // A fixed name in the environment is meant for unattended runs, which
+-    // nobody is there to type in, so it also answers at once unless
+-    // the OSK_MODE variable says otherwise.
+-    if (s.overrides.count("input.name_entry") == 0u && portablekit::env("OSK_TEXT") != nullptr) {
+-        s.values.name_entry = NameEntry::Fixed;
+-        s.overrides["input.name_entry"] = env_name("OSK_TEXT");
+-    }
+-}
+-
+-} // namespace
+-
+-Settings &current() {
+-    State &s = state();
+-    if (!s.loaded) load(s);
+-    return s.values;
+-}
+-
+-std::string game_default_name() {
+-    const char *name = game().default_player_name;
+-    return name != nullptr ? name : "";
+-}
+-
+-Settings defaults_for(Platform platform) {
+-    Settings values{};
+-    // Confirm where a console of the game's region has it: cross, the south
+-    // button, outside Japan; circle, the east button, in Japan.
+-    values.confirm_south = game().confirm_button == 1u;
+-    // The game's keyboard first; a phone then turns the mouse off either way.
+-    if (const auto keyboard = game().keyboard_defaults) keyboard(values.bindings, values.mouse);
+-    if (platform == Platform::Android) {
+-        values.aspect = Aspect::Fill;
+-        values.fullscreen = true;
+-        values.mouse = false;
+-    }
+-    return values;
+-}
+-
+-const Settings &defaults() {
+-    static const Settings value = defaults_for(kPlatform);
+-    return value;
+-}
+-
+-void save() {
+-    State &s = state();
+-    if (!s.loaded) load(s);
+-    install::SettingsEntries entries;
+-    try {
+-        // Re-read, so a key the installer wrote since start-up survives.
+-        entries = install::read_settings_file(s.data_dir);
+-        for (const Field &field : all_fields()) {
+-            if (s.overrides.count(field.key) != 0u) {
+-                const auto kept = s.file.find(field.key);
+-                if (kept != s.file.end()) entries[field.key] = kept->second;
+-                else entries.erase(field.key);
+-                continue;
+-            }
+-            entries[field.key] = field.format(s.values);
+-        }
+-        entries.erase(kRetiredTypeNameKey);
+-        install::write_settings_file(s.data_dir, entries);
+-    } catch (const std::exception &e) {
+-        std::cerr << "[settings] cannot write settings.ini: " << e.what() << "\n";
+-    }
+-}
+-
+-std::string overridden_by(const char *key) {
+-    State &s = state();
+-    if (!s.loaded) load(s);
+-    const auto found = s.overrides.find(key);
+-    return found != s.overrides.end() ? found->second : std::string();
+-}
+-
+-} // namespace portablekit::settings
++#include "../profile.hpp"
++#include "settings/settings.hpp"
++
++#include "install/user_data.hpp"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <functional>
++#include <iostream>
++#include <map>
++#include <string>
++#include <vector>
++
++namespace portablekit::settings {
++namespace {
++
++// One setting: its key in settings.ini, the variable that overrides it, and
++// how both spell its value.
++struct Field {
++    const char *key;
++    const char *variable;  // null: no environment override
++    std::function<bool(Settings &, const std::string &)> parse;
++    std::function<std::string(const Settings &)> format;
++    // Reads the variable's value, which is spelled the way the variable has
++    // always been. Null: the variable uses the file's spelling.
++    std::function<void(Settings &, const char *)> parse_variable;
++};
++
++bool parse_bool(const std::string &text, bool &out) {
++    if (text == "1" || text == "true" || text == "on" || text == "yes") out = true;
++    else if (text == "0" || text == "false" || text == "off" || text == "no") out = false;
++    else return false;
++    return true;
++}
++
++bool parse_float(const std::string &text, float minimum, float maximum, float &out) {
++    char *end = nullptr;
++    const float value = std::strtof(text.c_str(), &end);
++    if (end == text.c_str() || *end != '\0') return false;
++    out = std::clamp(value, minimum, maximum);
++    return true;
++}
++
++bool parse_uint(const std::string &text, std::uint32_t minimum, std::uint32_t maximum, std::uint32_t &out) {
++    char *end = nullptr;
++    const unsigned long value = std::strtoul(text.c_str(), &end, 10);
++    if (end == text.c_str() || *end != '\0') return false;
++    out = static_cast<std::uint32_t>(std::clamp<unsigned long>(value, minimum, maximum));
++    return true;
++}
++
++// A resolution: a multiple of 480x272, or "auto" (0) for the window's own.
++bool parse_scale(const std::string &text, std::uint32_t &out) {
++    if (text == "auto") {
++        out = 0u;
++        return true;
++    }
++    return parse_uint(text, 0u, kMaxInternalScale, out);
++}
++
++std::string format_float(float value) {
++    char text[32];
++    std::snprintf(text, sizeof(text), "%.2f", static_cast<double>(value));
++    return text;
++}
++
++// Flags the host has always read as "set means on", whatever the value.
++bool variable_present(const char *) { return true; }
++
++// Flags read the way the pad code reads them: 0, no, off and false are off.
++bool variable_flag(const char *text) {
++    for (const char *off : {"0", "no", "off", "false"})
++        if (std::strcmp(text, off) == 0) return false;
++    return true;
++}
++
++float variable_float(const char *text, float fallback, float minimum, float maximum) {
++    char *end = nullptr;
++    const float value = std::strtof(text, &end);
++    return std::clamp(end != text ? value : fallback, minimum, maximum);
++}
++
++template <typename Enum>
++struct Names {
++    std::vector<std::pair<Enum, const char *>> values;
++
++    bool parse(const std::string &text, Enum &out) const {
++        for (const auto &[value, name] : values) {
++            if (text == name) {
++                out = value;
++                return true;
++            }
++        }
++        return false;
++    }
++    [[nodiscard]] std::string format(Enum value) const {
++        for (const auto &[candidate, name] : values)
++            if (candidate == value) return name;
++        return values.front().second;
++    }
++};
++
++const Names<PresentMode> kPresentModes{
++    {{PresentMode::Fifo, "vsync"}, {PresentMode::Mailbox, "mailbox"}, {PresentMode::Immediate, "immediate"}}};
++const Names<Aspect> kAspects{{{Aspect::Original, "original"}, {Aspect::Stretch, "stretch"}, {Aspect::Fill, "fill"}}};
++const Names<PerfDisplay> kPerfDisplays{{{PerfDisplay::Off, "off"},
++                                        {PerfDisplay::Overlay, "overlay"},
++                                        {PerfDisplay::OverlayAndLog, "overlay+log"},
++                                        {PerfDisplay::Log, "log"}}};
++const Names<input::tilt::Mode> kTiltModes{{{input::tilt::Mode::Angle, "angle"},
++                                            {input::tilt::Mode::AngleLevel, "level"},
++                                            {input::tilt::Mode::AngleLevel, "horizon"},
++                                            {input::tilt::Mode::Rate, "rate"}}};
++const Names<JumpButton> kJumpButtons{{{JumpButton::Off, "off"},
++                                      {JumpButton::LeftStick, "l3"},
++                                      {JumpButton::South, "south"},
++                                      {JumpButton::East, "east"},
++                                      {JumpButton::West, "west"},
++                                      {JumpButton::North, "north"}}};
++const Names<RightStick> kRightSticks{
++    {{RightStick::Camera, "camera"}, {RightStick::DPad, "dpad"}, {RightStick::Off, "off"}}};
++// A trigger profile by the key the game gives it, or "standard" for L and R.
++bool parse_trigger_profile(const std::string &text, std::uint32_t &out) {
++    if (text == "standard") {
++        out = 0u;
++        return true;
++    }
++    const std::span<const TriggerProfile> profiles = game().trigger_profiles;
++    for (std::size_t i = 0; i < profiles.size(); ++i) {
++        if (text == profiles[i].key) {
++            out = static_cast<std::uint32_t>(i + 1u);
++            return true;
++        }
++    }
++    return false;
++}
++
++std::string format_trigger_profile(std::uint32_t profile) {
++    const std::span<const TriggerProfile> profiles = game().trigger_profiles;
++    return profile == 0u || profile > profiles.size() ? std::string("standard") : std::string(profiles[profile - 1u].key);
++}
++const Names<NameEntry> kNameEntries{{{NameEntry::Keyboard, "keyboard"}, {NameEntry::Fixed, "fixed"}}};
++const Names<FrameRate> kFrameRates{{{FrameRate::Fps30, "30"},
++                                    {FrameRate::Fps45, "45"},
++                                    {FrameRate::Fps60, "60"},
++                                    {FrameRate::Fps90, "90"},
++                                    {FrameRate::Fps120, "120"},
++                                    {FrameRate::Display, "display"}}};
++
++// Written by earlier versions: 1 typed the name into the window, which the
++// on-screen keyboard now covers.
++constexpr const char *kRetiredTypeNameKey = "input.type_name";
++
++#define BOOL_FIELD(key, member)                                                                                       \
++    Field {                                                                                                            \
++        key, nullptr, [](Settings &s, const std::string &t) { return parse_bool(t, s.member); },                       \
++            [](const Settings &s) { return std::string(s.member ? "1" : "0"); }, nullptr                               \
++    }
++
++const std::vector<Field> &fields() {
++    static const std::vector<Field> table = {
++        {"video.internal_scale", "INTERNAL_SCALE",
++         [](Settings &s, const std::string &t) { return parse_scale(t, s.internal_scale); },
++         [](const Settings &s) { return s.internal_scale == 0u ? std::string("auto") : std::to_string(s.internal_scale); },
++         [](Settings &s, const char *t) {
++             std::uint32_t value = s.internal_scale;
++             if (parse_scale(t, value)) s.internal_scale = value;
++         }},
++        {"video.window_scale", nullptr,
++         [](Settings &s, const std::string &t) { return parse_uint(t, 1u, kMaxWindowScale, s.window_scale); },
++         [](const Settings &s) { return std::to_string(s.window_scale); }, nullptr},
++        BOOL_FIELD("video.fullscreen", fullscreen),
++        {"video.present_mode", nullptr,
++         [](Settings &s, const std::string &t) { return kPresentModes.parse(t, s.present_mode); },
++         [](const Settings &s) { return kPresentModes.format(s.present_mode); }, nullptr},
++        // Written by earlier versions, which had Original and Stretch only.
++        // Still written, so going back to one of them keeps the choice as
++        // near as it can; video.aspect follows it and decides.
++        {"video.keep_aspect", nullptr,
++         [](Settings &s, const std::string &t) {
++             bool keep = true;
++             if (!parse_bool(t, keep)) return false;
++             s.aspect = keep ? Aspect::Original : Aspect::Stretch;
++             return true;
++         },
++         [](const Settings &s) { return std::string(s.aspect == Aspect::Stretch ? "0" : "1"); }, nullptr},
++        {"video.aspect", nullptr, [](Settings &s, const std::string &t) { return kAspects.parse(t, s.aspect); },
++         [](const Settings &s) { return kAspects.format(s.aspect); }, nullptr},
++        BOOL_FIELD("video.sharp_screen", sharp_screen),
++        BOOL_FIELD("video.sharp_textures", sharp_textures),
++        {"video.texture_pack", "TEXTURE_PACK",
++         [](Settings &s, const std::string &t) { return parse_bool(t, s.texture_pack); },
++         [](const Settings &s) { return std::string(s.texture_pack ? "1" : "0"); },
++         // 0/off/no/false turn it off; anything else, a folder included, on.
++         [](Settings &s, const char *t) { s.texture_pack = variable_flag(t); }},
++        {"video.texture_pack_folder", nullptr,
++         [](Settings &s, const std::string &t) {
++             s.texture_pack_folder = t;
++             return true;
++         },
++         [](const Settings &s) { return s.texture_pack_folder; }, nullptr},
++        {"video.unthrottled", "UNTHROTTLED",
++         [](Settings &s, const std::string &t) { return parse_bool(t, s.unthrottled); },
++         [](const Settings &s) { return std::string(s.unthrottled ? "1" : "0"); },
++         [](Settings &s, const char *t) { s.unthrottled = variable_present(t); }},
++        {"video.fast_loading", "FAST_LOADING",
++         [](Settings &s, const std::string &t) { return parse_bool(t, s.fast_loading); },
++         [](const Settings &s) { return std::string(s.fast_loading ? "1" : "0"); },
++         [](Settings &s, const char *t) { s.fast_loading = variable_flag(t); }},
++        {"video.frame_rate", "FRAME_RATE",
++         [](Settings &s, const std::string &t) { return kFrameRates.parse(t, s.frame_rate); },
++         [](const Settings &s) { return kFrameRates.format(s.frame_rate); },
++         [](Settings &s, const char *t) {
++             if (!kFrameRates.parse(t, s.frame_rate)) s.frame_rate = FrameRate::Fps30;
++         }},
++        {"video.frame_rate_auto", "FRAME_RATE_AUTO",
++         [](Settings &s, const std::string &t) { return parse_bool(t, s.frame_rate_auto); },
++         [](const Settings &s) { return std::string(s.frame_rate_auto ? "1" : "0"); },
++         [](Settings &s, const char *t) { s.frame_rate_auto = variable_flag(t); }},
++        {"video.performance", "PERF",
++         [](Settings &s, const std::string &t) { return kPerfDisplays.parse(t, s.perf); },
++         [](const Settings &s) { return kPerfDisplays.format(s.perf); },
++         [](Settings &s, const char *t) {
++             // `1` has always meant the overlay and the log, `log` the log only.
++             if (std::strcmp(t, "log") == 0) s.perf = PerfDisplay::Log;
++             else s.perf = *t != '\0' && variable_flag(t) ? PerfDisplay::OverlayAndLog : PerfDisplay::Off;
++         }},
++        {"text.font", "FONT",
++         [](Settings &s, const std::string &t) {
++             s.font = t;
++             return true;
++         },
++         [](const Settings &s) { return s.font; }, [](Settings &s, const char *t) { s.font = t; }},
++        {"text.weight", nullptr,
++         [](Settings &s, const std::string &t) { return parse_uint(t, 0u, kMaxFontWeight, s.font_weight); },
++         [](const Settings &s) { return std::to_string(s.font_weight); }, nullptr},
++        {"audio.volume", nullptr,
++         [](Settings &s, const std::string &t) { return parse_uint(t, 0u, 100u, s.volume); },
++         [](const Settings &s) { return std::to_string(s.volume); }, nullptr},
++        BOOL_FIELD("audio.mute", mute),
++        {"input.confirm", "PAD_FACE",
++         [](Settings &s, const std::string &t) {
++             if (t == "south") s.confirm_south = true;
++             else if (t == "east") s.confirm_south = false;
++             else return false;
++             return true;
++         },
++         [](const Settings &s) { return std::string(s.confirm_south ? "south" : "east"); },
++         [](Settings &s, const char *t) { s.confirm_south = std::strcmp(t, "xbox") == 0 || std::strcmp(t, "south") == 0; }},
++        {"input.dead_zone", "PAD_DEADZONE",
++         [](Settings &s, const std::string &t) { return parse_float(t, 0.0f, 0.9f, s.dead_zone); },
++         [](const Settings &s) { return format_float(s.dead_zone); },
++         [](Settings &s, const char *t) { s.dead_zone = variable_float(t, 0.15f, 0.0f, 0.9f); }},
++        {"input.trigger", "PAD_TRIGGER",
++         [](Settings &s, const std::string &t) { return parse_float(t, 0.05f, 1.0f, s.trigger); },
++         [](const Settings &s) { return format_float(s.trigger); },
++         [](Settings &s, const char *t) { s.trigger = variable_float(t, 0.25f, 0.05f, 1.0f); }},
++        {"input.trigger_profile", "PAD_TRIGGERS",
++         [](Settings &s, const std::string &t) { return parse_trigger_profile(t, s.trigger_profile); },
++         [](const Settings &s) { return format_trigger_profile(s.trigger_profile); },
++         [](Settings &s, const char *t) {
++             if (!parse_trigger_profile(t, s.trigger_profile)) s.trigger_profile = 0u;
++         }},
++        {"input.right_stick", "PAD_RSTICK_DPAD",
++         [](Settings &s, const std::string &t) { return kRightSticks.parse(t, s.right_stick); },
++         [](const Settings &s) { return kRightSticks.format(s.right_stick); },
++         [](Settings &s, const char *t) { s.right_stick = variable_flag(t) ? RightStick::DPad : RightStick::Camera; }},
++        {"input.right_stick_zone", "PAD_RSTICK_ZONE",
++         [](Settings &s, const std::string &t) { return parse_float(t, 0.1f, 1.0f, s.right_stick_zone); },
++         [](const Settings &s) { return format_float(s.right_stick_zone); },
++         [](Settings &s, const char *t) { s.right_stick_zone = variable_float(t, 0.5f, 0.1f, 1.0f); }},
++        {"input.analog_camera", "ANALOG_CAMERA",
++         [](Settings &s, const std::string &t) { return parse_bool(t, s.analog_camera); },
++         [](const Settings &s) { return std::string(s.analog_camera ? "1" : "0"); },
++         [](Settings &s, const char *t) { s.analog_camera = variable_flag(t); }},
++        {"input.camera_speed", "CAMERA_SPEED",
++         [](Settings &s, const std::string &t) { return parse_float(t, 20.0f, 720.0f, s.camera_speed); },
++         [](const Settings &s) { return format_float(s.camera_speed); },
++         [](Settings &s, const char *t) { s.camera_speed = variable_float(t, 190.0f, 20.0f, 720.0f); }},
++        {"input.aim_speed", "AIM_SPEED",
++         [](Settings &s, const std::string &t) { return parse_float(t, 10.0f, 360.0f, s.aim_speed); },
++         [](const Settings &s) { return format_float(s.aim_speed); },
++         [](Settings &s, const char *t) { s.aim_speed = variable_float(t, 90.0f, 10.0f, 360.0f); }},
++        BOOL_FIELD("input.invert_camera_x", invert_camera_x),
++        BOOL_FIELD("input.invert_camera_y", invert_camera_y),
++        {"input.mouse", "MOUSE",
++         [](Settings &s, const std::string &t) { return parse_bool(t, s.mouse); },
++         [](const Settings &s) { return std::string(s.mouse ? "1" : "0"); },
++         [](Settings &s, const char *t) { s.mouse = variable_flag(t); }},
++        {"input.mouse_sensitivity", "MOUSE_SENSITIVITY",
++         [](Settings &s, const std::string &t) {
++             return parse_float(t, kMinMouseSensitivity, kMaxMouseSensitivity, s.mouse_sensitivity);
++         },
++         [](const Settings &s) { return format_float(s.mouse_sensitivity); },
++         [](Settings &s, const char *t) {
++             s.mouse_sensitivity = variable_float(t, 0.10f, kMinMouseSensitivity, kMaxMouseSensitivity);
++         }},
++        BOOL_FIELD("input.touch_controls", touch_controls),
++        BOOL_FIELD("input.touch_dpad", touch_dpad),
++        {"input.touch_opacity", nullptr,
++         [](Settings &s, const std::string &t) {
++             return parse_float(t, kMinTouchOpacity, kMaxTouchOpacity, s.touch_opacity);
++         },
++         [](const Settings &s) { return format_float(s.touch_opacity); }, nullptr},
++        {"input.touch_size", nullptr,
++         [](Settings &s, const std::string &t) { return parse_float(t, kMinTouchSize, kMaxTouchSize, s.touch_size); },
++         [](const Settings &s) { return format_float(s.touch_size); }, nullptr},
++        {"input.touch_camera_speed", nullptr,
++         [](Settings &s, const std::string &t) {
++             return parse_float(t, kMinTouchCameraSpeed, kMaxTouchCameraSpeed, s.touch_camera_speed);
++         },
++         [](const Settings &s) { return format_float(s.touch_camera_speed); }, nullptr},
++        BOOL_FIELD("input.invert_mouse_x", invert_mouse_x),
++        BOOL_FIELD("input.invert_mouse_y", invert_mouse_y),
++        {"input.tilt", "TILT",
++         [](Settings &s, const std::string &t) { return parse_bool(t, s.tilt); },
++         [](const Settings &s) { return std::string(s.tilt ? "1" : "0"); },
++         [](Settings &s, const char *t) { s.tilt = variable_flag(t); }},
++        {"input.tilt_mode", "TILT_MODE",
++         [](Settings &s, const std::string &t) { return kTiltModes.parse(t, s.tilt_mode); },
++         [](const Settings &s) { return kTiltModes.format(s.tilt_mode); },
++         [](Settings &s, const char *t) {
++             if (!kTiltModes.parse(t, s.tilt_mode)) std::cerr << "[settings] " << env_name("TILT_MODE") << ": angle, rate, or level (also horizon)\n";
++         }},
++        {"input.tilt_full", "TILT_FULL",
++         [](Settings &s, const std::string &t) {
++             return parse_float(t, input::tilt::kMinFullTilt, input::tilt::kMaxFullTilt, s.tilt_full);
++         },
++         [](const Settings &s) { return format_float(s.tilt_full); },
++         [](Settings &s, const char *t) {
++             s.tilt_full = variable_float(t, 12.0f, input::tilt::kMinFullTilt, input::tilt::kMaxFullTilt);
++         }},
++        {"input.tilt_dead_zone", "TILT_DEAD_ZONE",
++         [](Settings &s, const std::string &t) {
++             return parse_float(t, input::tilt::kMinDeadZone, input::tilt::kMaxDeadZone, s.tilt_dead_zone);
++         },
++         [](const Settings &s) { return format_float(s.tilt_dead_zone); },
++         [](Settings &s, const char *t) {
++             s.tilt_dead_zone = variable_float(t, 4.0f, input::tilt::kMinDeadZone, input::tilt::kMaxDeadZone);
++         }},
++        BOOL_FIELD("input.tilt_invert", tilt_invert),
++        {"input.jump_button", nullptr,
++         [](Settings &s, const std::string &t) { return kJumpButtons.parse(t, s.jump_button); },
++         [](const Settings &s) { return kJumpButtons.format(s.jump_button); }, nullptr},
++        {"input.tilt_level_limit", nullptr,
++         [](Settings &s, const std::string &t) {
++             return parse_float(t, input::tilt::kMinLevelLimit, input::tilt::kMaxLevelLimit, s.tilt_level_limit);
++         },
++         [](const Settings &s) { return format_float(s.tilt_level_limit); }, nullptr},
++        {"input.name_entry", "OSK_MODE",
++         [](Settings &s, const std::string &t) { return kNameEntries.parse(t, s.name_entry); },
++         [](const Settings &s) { return kNameEntries.format(s.name_entry); },
++         [](Settings &s, const char *t) {
++             if (!kNameEntries.parse(t, s.name_entry)) std::cerr << "[settings] " << env_name("OSK_MODE") << ": keyboard or fixed\n";
++         }},
++        {"input.name", "OSK_TEXT",
++         [](Settings &s, const std::string &t) {
++             if (t.empty()) return false;
++             s.name = t;
++             return true;
++         },
++         [](const Settings &s) { return s.name; }, [](Settings &s, const char *t) { s.name = t; }},
++        {"network.adhoc", "ADHOC",
++         [](Settings &s, const std::string &t) { return parse_bool(t, s.adhoc); },
++         [](const Settings &s) { return std::string(s.adhoc ? "1" : "0"); },
++         [](Settings &s, const char *t) { s.adhoc = variable_flag(t); }},
++        {"network.server", "ADHOC_SERVER",
++         [](Settings &s, const std::string &t) {
++             s.adhoc_server = t;
++             return true;
++         },
++         [](const Settings &s) { return s.adhoc_server; }, [](Settings &s, const char *t) { s.adhoc_server = t; }},
++        {"network.nickname", "ADHOC_NICKNAME",
++         [](Settings &s, const std::string &t) {
++             s.adhoc_nickname = t;
++             return true;
++         },
++         [](const Settings &s) { return s.adhoc_nickname; },
++         [](Settings &s, const char *t) { s.adhoc_nickname = t; }},
++        {"network.mac", "ADHOC_MAC",
++         [](Settings &s, const std::string &t) {
++             s.adhoc_mac = t;
++             return true;
++         },
++         [](const Settings &s) { return s.adhoc_mac; }, [](Settings &s, const char *t) { s.adhoc_mac = t; }},
++        {"ui.menu_pause", "MENU_PAUSE",
++         [](Settings &s, const std::string &t) { return parse_bool(t, s.menu_pause); },
++         [](const Settings &s) { return std::string(s.menu_pause ? "1" : "0"); },
++         [](Settings &s, const char *t) { s.menu_pause = variable_flag(t); }},
++        {"ui.menu_pause_multiplayer", "MENU_PAUSE_MULTIPLAYER",
++         [](Settings &s, const std::string &t) { return parse_bool(t, s.menu_pause_multiplayer); },
++         [](const Settings &s) { return std::string(s.menu_pause_multiplayer ? "1" : "0"); },
++         [](Settings &s, const char *t) { s.menu_pause_multiplayer = variable_flag(t); }},
++        {"network.recent", nullptr,
++         [](Settings &s, const std::string &t) {
++             s.adhoc_recent.clear();
++             std::size_t start = 0;
++             while (start <= t.size()) {
++                 const std::size_t end = std::min(t.find(',', start), t.size());
++                 if (end > start) s.adhoc_recent.push_back(t.substr(start, end - start));
++                 start = end + 1u;
++             }
++             return true;
++         },
++         [](const Settings &s) {
++             std::string text;
++             for (const std::string &address : s.adhoc_recent) text += (text.empty() ? "" : ",") + address;
++             return text;
++         },
++         nullptr},
++        {"network.host_port", "ADHOC_HOST_PORT",
++         [](Settings &s, const std::string &t) { return parse_uint(t, 1024u, 65534u, s.adhoc_host_port); },
++         [](const Settings &s) { return std::to_string(s.adhoc_host_port); },
++         [](Settings &s, const char *t) {
++             std::uint32_t value = s.adhoc_host_port;
++             if (parse_uint(t, 1024u, 65534u, value)) s.adhoc_host_port = value;
++         }},
++        BOOL_FIELD("ui.menu_hint_seen", menu_hint_seen),
++        BOOL_FIELD("saves.backup_timestamp", backup_timestamp),
++        {"ui.last_folder", nullptr,
++         [](Settings &s, const std::string &t) {
++             s.last_folder = t;
++             return true;
++         },
++         [](const Settings &s) { return s.last_folder; }, nullptr},
++    };
++    return table;
++}
++
++// One key per bound action, "input.bind.triangle=Mouse Left", after the
++// fixed table.
++const std::vector<Field> &all_fields() {
++    static const std::vector<Field> table = [] {
++        // Field keys are C strings; these hold them for the program's life.
++        static std::vector<std::string> keys(input::kActions);
++        std::vector<Field> list = fields();
++        for (std::size_t i = 0; i < input::kActions; ++i) {
++            keys[i] = std::string("input.bind.") + input::info(static_cast<input::Action>(i)).key;
++            list.push_back(Field{keys[i].c_str(), nullptr,
++                                 [i](Settings &s, const std::string &t) { return input::parse(t, s.bindings[i]); },
++                                 [i](const Settings &s) { return input::format(s.bindings[i]); }, nullptr});
++        }
++        return list;
++    }();
++    return table;
++}
++
++#undef BOOL_FIELD
++
++struct State {
++    bool loaded{};
++    Settings values;
++    std::filesystem::path data_dir;
++    // What settings.ini held, so values the environment decided are written
++    // back as the file had them.
++    install::SettingsEntries file;
++    std::map<std::string, std::string> overrides;
++};
++
++State &state() {
++    static State value;
++    return value;
++}
++
++void load(State &s) {
++    s.loaded = true;
++    s.values = defaults();
++    try {
++        s.data_dir = install::user_data_directory();
++        s.file = install::read_settings_file(s.data_dir);
++    } catch (const std::exception &e) {
++        std::cerr << "[settings] cannot read settings.ini: " << e.what() << "\n";
++    }
++    for (const Field &field : all_fields()) {
++        if (const auto found = s.file.find(field.key); found != s.file.end() && !field.parse(s.values, found->second))
++            std::cerr << "[settings] ignoring " << field.key << "=" << found->second << "\n";
++        if (field.variable == nullptr) continue;
++        const char *text = portablekit::env(field.variable);
++        if (text == nullptr) continue;
++        field.parse_variable(s.values, text);
++        s.overrides[field.key] = env_name(field.variable);
++    }
++    // Bindings settings.ini did not hold are defaults, which must not take a
++    // key it gave another control.
++    std::array<bool, input::kActions> saved{};
++    bool any_saved = false;
++    for (std::size_t i = 0; i < input::kActions; ++i) {
++        saved[i] = s.file.count(std::string("input.bind.") + input::info(static_cast<input::Action>(i)).key) != 0u;
++        any_saved = any_saved || saved[i];
++    }
++    if (any_saved) input::keep_saved(s.values.bindings, saved);
++    if (portablekit::env("TRACE_PAD") != nullptr) {
++        std::cout << "[pad] keyboard:";
++        for (std::size_t i = 0; i < input::kActions; ++i)
++            std::cout << " " << input::info(static_cast<input::Action>(i)).key << "="
++                      << input::format(s.values.bindings[i]) << (saved[i] ? "" : "*");
++        std::cout << " (* the game's default); mouse " << (s.values.mouse ? "on" : "off") << std::endl;
++    }
++    // A fixed name in the environment is meant for unattended runs, which
++    // nobody is there to type in, so it also answers at once unless
++    // the OSK_MODE variable says otherwise.
++    if (s.overrides.count("input.name_entry") == 0u && portablekit::env("OSK_TEXT") != nullptr) {
++        s.values.name_entry = NameEntry::Fixed;
++        s.overrides["input.name_entry"] = env_name("OSK_TEXT");
++    }
++}
++
++} // namespace
++
++Settings &current() {
++    State &s = state();
++    if (!s.loaded) load(s);
++    return s.values;
++}
++
++std::string game_default_name() {
++    const char *name = game().default_player_name;
++    return name != nullptr ? name : "";
++}
++
++Settings defaults_for(Platform platform) {
++    Settings values{};
++    // Confirm where a console of the game's region has it: cross, the south
++    // button, outside Japan; circle, the east button, in Japan.
++    values.confirm_south = active_confirm_button() == 1u;
++    // The game's keyboard first; a phone then turns the mouse off either way.
++    if (const auto keyboard = game().keyboard_defaults) keyboard(values.bindings, values.mouse);
++    if (platform == Platform::Android) {
++        values.aspect = Aspect::Fill;
++        values.fullscreen = true;
++        values.mouse = false;
++    }
++    return values;
++}
++
++const Settings &defaults() {
++    static const Settings value = defaults_for(kPlatform);
++    return value;
++}
++
++void save() {
++    State &s = state();
++    if (!s.loaded) load(s);
++    install::SettingsEntries entries;
++    try {
++        // Re-read, so a key the installer wrote since start-up survives.
++        entries = install::read_settings_file(s.data_dir);
++        for (const Field &field : all_fields()) {
++            if (s.overrides.count(field.key) != 0u) {
++                const auto kept = s.file.find(field.key);
++                if (kept != s.file.end()) entries[field.key] = kept->second;
++                else entries.erase(field.key);
++                continue;
++            }
++            entries[field.key] = field.format(s.values);
++        }
++        entries.erase(kRetiredTypeNameKey);
++        install::write_settings_file(s.data_dir, entries);
++    } catch (const std::exception &e) {
++        std::cerr << "[settings] cannot write settings.ini: " << e.what() << "\n";
++    }
++}
++
++std::string overridden_by(const char *key) {
++    State &s = state();
++    if (!s.loaded) load(s);
++    const auto found = s.overrides.find(key);
++    return found != s.overrides.end() ? found->second : std::string();
++}
++
++} // namespace portablekit::settings
+diff -ru a/host/ui/menu.cpp b/host/ui/menu.cpp
+--- a/host/ui/menu.cpp	2026-11-07 03:25:52.716135305 +0000
++++ b/host/ui/menu.cpp	2026-11-07 03:25:52.767909775 +0000
+@@ -706,7 +706,7 @@
+         info_row("Connected", pad == nullptr ? "No gamepad; the keyboard and mouse drive the game"
+                                              : (name != nullptr ? name : "Gamepad"));
+     }
+-    const bool cross_confirms = portablekit::game().confirm_button == 1u;
++    const bool cross_confirms = portablekit::active_confirm_button() == 1u;
+     if (choice_row("Confirm button", s.confirm_south ? "Bottom (Western)" : "Right (Japanese)",
+                    options_for("input.confirm",
+                                std::string("Which face button confirms, in the game and in this menu. The game's "
+@@ -916,7 +916,7 @@
+                            "cancels. A key taken from another control leaves that one."};
+         std::string label = input::info(action).label;
+         // The game's confirm and back buttons, as the console says.
+-        const bool cross_confirms = portablekit::game().confirm_button == 1u;
++        const bool cross_confirms = portablekit::active_confirm_button() == 1u;
+         if (action == input::Action::Circle) label += cross_confirms ? "  (back)" : "  (confirm)";
+         if (action == input::Action::Cross) label += cross_confirms ? "  (confirm)" : "  (back)";
+         if (value_row(label.c_str(), value, o) && !binding_) {

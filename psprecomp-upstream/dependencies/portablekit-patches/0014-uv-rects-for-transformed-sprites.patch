@@ -1,0 +1,75 @@
+diff -ru a/host/gpu/ge_state.hpp b/host/gpu/ge_state.hpp
+--- a/host/gpu/ge_state.hpp	2026-11-07 14:31:18.780885048 +0000
++++ b/host/gpu/ge_state.hpp	2026-11-07 14:41:00.824802164 +0000
+@@ -190,6 +190,12 @@
+     bool culling_enabled{};
+     bool cull_clockwise{};
+     bool clear_mode{};                   // CLEARMODE is active for this draw
++    // A transformed draw whose vertices carry the texture coordinates each may
++    // sample (raw units, before the scale and offset), as through tiles do:
++    // min in normal[0], normal[1], max in normal[2], position[3]. Its vertices
++    // have no normals of their own (lit, it is lit with a zero normal, as the
++    // GE does). Set by a game profile for flat 2D sprites (VC2 native draws).
++    bool uv_rects{};
+     std::uint32_t clear_flags{};         // CLEARMODE bits 8..10: color, alpha/stencil, depth
+     std::uint32_t vertex_type{};
+     // Where the vertices and indices were read from and how many the prim
+diff -ru a/host/gpu/shaders/ge.vert b/host/gpu/shaders/ge.vert
+--- a/host/gpu/shaders/ge.vert	2026-11-07 14:31:18.782635866 +0000
++++ b/host/gpu/shaders/ge.vert	2026-11-07 14:41:00.818331235 +0000
+@@ -216,7 +216,10 @@
+     vec3 world_position = (object.world * vec4(in_position.xyz, 1.0)).xyz;
+     // Skinned normals come out of the bone matrices far from unit length, so
+     // the GE's normalisation after the transform matters.
+-    vec3 normal = mat3(object.world) * in_normal;
++    // A sprite carrying its clamp rect (DrawCall::uv_rects) has no normal of
++    // its own: the GE lights it with a zero one.
++    vec3 vertex_normal = (int(push.viewport.w + 0.5) & 4) != 0 ? vec3(0.0) : in_normal;
++    vec3 normal = mat3(object.world) * vertex_normal;
+     float length_squared = dot(normal, normal);
+     normal = length_squared > 0.0 ? normal * inversesqrt(length_squared) : vec3(0.0, 0.0, 1.0);
+     if (object.material_specular.w > 0.5) normal = -normal;
+@@ -284,6 +287,14 @@
+     } else {
+         int enables = int(push.viewport.w + 0.5);
+         if ((enables & 2) != 0) light_vertex(frag_color, frag_specular);
++        // Flat 2D sprites drawn through the matrices (DrawCall::uv_rects): the
++        // texture coordinates they may sample, carried as through tiles carry
++        // them; their normal and w are otherwise unused.
++        if ((enables & 4) != 0) {
++            vec4 rect = vec4(in_normal.xy, in_normal.z, in_position.w);
++            frag_uv_rect = vec4(rect.xy * push.uv_transform.xy + push.uv_transform.zw,
++                                rect.zw * push.uv_transform.xy + push.uv_transform.zw);
++        }
+         // Fog runs linearly from 1 (clear) to 0 (fogged) with view-space z,
+         // which is negative in front of the camera: (z + end) * scale.
+         if ((enables & 1) != 0)
+diff -ru a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
+--- a/host/gpu/vulkan_renderer.cpp	2026-11-07 14:31:18.780912253 +0000
++++ b/host/gpu/vulkan_renderer.cpp	2026-11-07 14:41:00.822586285 +0000
+@@ -130,6 +130,7 @@
+ static_assert(sizeof(PushConstants) == 128u, "PushConstants must fit the guaranteed push constant size");
+ constexpr float kPushFog = 1.0f;
+ constexpr float kPushLighting = 2.0f;
++constexpr float kPushUvRect = 4.0f;  // transformed vertices carry a clamp rect (DrawCall::uv_rects)
+ 
+ struct GpuVertex {
+     float x{}, y{}, z{}, w{1.0f};
+@@ -5887,6 +5888,7 @@
+         out.nx = vertex.normal[0];
+         out.ny = vertex.normal[1];
+         out.nz = vertex.normal[2];
++        if (call.uv_rects && !call.through) out.w = vertex.position[3];
+         return out;
+     };
+     const auto push_vertex = [&](const Vertex &vertex) { impl.scratch.push_back(to_gpu(vertex)); };
+@@ -6512,7 +6514,8 @@
+     PushConstants push{};
+     push.transform = multiply(call.projection, view_world);
+     push.viewport = {static_cast<float>(kPspWidth), static_cast<float>(kPspHeight), call.through ? 1.0f : 0.0f,
+-                     (fogged ? kPushFog : 0.0f) + (lit ? kPushLighting : 0.0f)};
++                     (fogged ? kPushFog : 0.0f) + (lit ? kPushLighting : 0.0f) +
++                         (call.uv_rects && !call.through ? kPushUvRect : 0.0f)};
+     push.view_z = {view_world[2], view_world[6], view_world[10], view_world[14]};
+     // The GE's texture wrap register: clamp in u, in v, or repeat. The
+     // sampler repeats; the fragment shader clamps the axes flagged here

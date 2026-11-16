@@ -1,0 +1,262 @@
+Subject: [PATCH 0020] Texture override hook for game profiles
+
+A game profile may draw its own image for some textures, ahead of the
+texture pack and of the upscaler, and is shown the pack's image for the
+texture to paint over (VC2: the button prompt atlas redrawn for the device
+in use). When the profile's images change it bumps a generation and the
+textures it claimed are made again. gpu::set_texture_override(),
+gpu::bump_texture_override_generation(), TexturePack::decode_now().
+
+diff -ru a/host/gpu/ge_state.cpp b/host/gpu/ge_state.cpp
+--- a/host/gpu/ge_state.cpp	2026-11-09 02:47:09.688705890 +0000
++++ b/host/gpu/ge_state.cpp	2026-11-09 02:47:09.694583349 +0000
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+@@ -995,6 +996,18 @@
+ }
+ void set_texture_upscaler(TextureUpscaler upscaler) noexcept { g_texture_upscaler = upscaler; }
+ TextureUpscaler texture_upscaler() noexcept { return g_texture_upscaler; }
++namespace {
++TextureOverride g_texture_override = nullptr;
++std::atomic<std::uint32_t> g_texture_override_generation{0u};
++}
++void set_texture_override(TextureOverride override_function) noexcept { g_texture_override = override_function; }
++TextureOverride texture_override() noexcept { return g_texture_override; }
++void bump_texture_override_generation() noexcept {
++    g_texture_override_generation.fetch_add(1u, std::memory_order_release);
++}
++std::uint32_t texture_override_generation() noexcept {
++    return g_texture_override_generation.load(std::memory_order_acquire);
++}
+ 
+ void GeState::fill_draw_state(DrawCall &call) const {
+     call.through = (vertex_type_ & (1u << 23u)) != 0u;
+diff -ru a/host/gpu/ge_state.hpp b/host/gpu/ge_state.hpp
+--- a/host/gpu/ge_state.hpp	2026-11-09 02:47:09.689005531 +0000
++++ b/host/gpu/ge_state.hpp	2026-11-09 02:47:09.694704910 +0000
+@@ -286,6 +286,33 @@
+ void set_texture_upscaler(TextureUpscaler upscaler) noexcept;
+ [[nodiscard]] TextureUpscaler texture_upscaler() noexcept;
+ 
++// Optional images a profile draws in place of some textures, ahead of the
++// texture pack and of the upscaler (VC2: the button prompts of the device in
++// use). The renderer asks it about every texture it creates, first with
++// texels null: anything but Ignore claims the texture (it is then decoded at
++// once). Then it is given the decoded texels and the scale the render target
++// would use, with `pack_image` null: WantsPackImage asks to be called again
++// with the texture pack's image for the texture (RGBA, any size; width 0 when
++// there is none), decoded only then. Replace: `out` (a whole multiple of the
++// texture's size) is drawn instead, and the pack is not used for it. Keep:
++// the texture is drawn as it would have been. Unless the answer with texels
++// was Ignore, the texture is made again when texture_override_generation()
++// changes (the profile's images changed).
++struct TextureOverrideImage {
++    std::uint32_t width{};
++    std::uint32_t height{};
++    std::vector<std::uint32_t> pixels;  // RGBA, R in the low byte, rows packed
++};
++enum class TextureOverrideResult : std::uint8_t { Ignore, Keep, Replace, WantsPackImage };
++using TextureOverride = TextureOverrideResult (*)(const TextureState &texture, const std::uint32_t *texels,
++                                                  const TextureOverrideImage *pack_image, std::uint32_t wanted_scale,
++                                                  TextureOverrideImage &out);
++void set_texture_override(TextureOverride override_function) noexcept;
++[[nodiscard]] TextureOverride texture_override() noexcept;
++// Called by the profile when its images change; any thread.
++void bump_texture_override_generation() noexcept;
++[[nodiscard]] std::uint32_t texture_override_generation() noexcept;
++
+ // Executes display lists and reports the draw calls they produce. The backend
+ // installs a sink; with no sink the lists are still parsed (for callbacks).
+ class GeState {
+diff -ru a/host/gpu/texture_pack.cpp b/host/gpu/texture_pack.cpp
+--- a/host/gpu/texture_pack.cpp	2026-11-09 02:47:09.689198806 +0000
++++ b/host/gpu/texture_pack.cpp	2026-11-09 02:47:09.694877507 +0000
+@@ -592,6 +592,33 @@
+     }
+ }
+ 
++bool TexturePack::decode_now(const Replacement &replacement, std::uint32_t &width, std::uint32_t &height,
++                             std::vector<std::uint32_t> &pixels) {
++    std::vector<std::uint8_t> bytes = read_file(replacement.file);
++    if (bytes.empty()) {
++        std::filesystem::path folded;
++        {
++            std::lock_guard lock(resolve_mutex_);
++            folded = resolve(replacement.name);
++        }
++        if (!folded.empty()) bytes = read_file(folded);
++    }
++    int w = 0, h = 0, channels = 0;
++    stbi_uc *image = bytes.empty() ? nullptr
++                                   : stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h,
++                                                           &channels, 4);
++    if (image == nullptr || w <= 0 || h <= 0 || w > kMaxImageSide || h > kMaxImageSide) {
++        if (image != nullptr) stbi_image_free(image);
++        return false;
++    }
++    width = static_cast<std::uint32_t>(w);
++    height = static_cast<std::uint32_t>(h);
++    pixels.resize(static_cast<std::size_t>(width) * height);
++    std::memcpy(pixels.data(), image, pixels.size() * 4u);
++    stbi_image_free(image);
++    return true;
++}
++
+ void TexturePack::decode(Replacement &replacement) {
+     std::vector<std::uint8_t> bytes = read_file(replacement.file);
+     if (bytes.empty()) {
+diff -ru a/host/gpu/texture_pack.hpp b/host/gpu/texture_pack.hpp
+--- a/host/gpu/texture_pack.hpp	2026-11-09 02:47:09.689412011 +0000
++++ b/host/gpu/texture_pack.hpp	2026-11-09 02:47:09.695146896 +0000
+@@ -151,6 +151,11 @@
+     // The renderer has uploaded a Decoded replacement: frees its pixels and
+     // marks it Resident.
+     void consumed(Replacement &replacement);
++    // Decodes a replacement's image on the calling thread, leaving its state
++    // alone (for a profile's texture override, which paints over it). RGBA,
++    // R in the low byte. False when the file cannot be read.
++    bool decode_now(const Replacement &replacement, std::uint32_t &width, std::uint32_t &height,
++                    std::vector<std::uint32_t> &pixels);
+ 
+     [[nodiscard]] const std::filesystem::path &directory() const noexcept { return directory_; }
+     [[nodiscard]] const TexturePackOptions &options() const noexcept { return options_; }
+diff -ru a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
+--- a/host/gpu/vulkan_renderer.cpp	2026-11-09 02:47:09.689922227 +0000
++++ b/host/gpu/vulkan_renderer.cpp	2026-11-09 02:47:09.695325951 +0000
+@@ -671,6 +671,10 @@
+         // How far down a 512-tall texture has been drawn, which decides how
+         // much of it the pack's hash covers; see texture_pack.hpp.
+         std::uint16_t max_seen_v{};
++        // A profile's texture override claimed it (made again when its
++        // images change), and drew its own image for it (ahead of the pack).
++        bool override_claimed{};
++        bool override_replaced{};
+     };
+ 
+     RendererConfig config;
+@@ -1665,6 +1669,9 @@
+     };
+     std::map<TextureKeyInput, ListTexture> list_texture_keys;
+     std::uint64_t textures_erased{};
++    // The profile's texture override generation the cached textures it
++    // claimed were made for (texture_override_generation()).
++    std::uint32_t override_generation{};
+     TextureKeyInput last_texture_input{};
+     ListTexture *last_texture{};
+ 
+@@ -4186,6 +4193,28 @@
+ 
+ VulkanRenderer::Impl::Texture &VulkanRenderer::Impl::texture_for(const GuestMemory &memory, const DrawCall &call) {
+     const TextureState &state = call.texture;
++    // The profile's override images changed: the textures it claimed are made
++    // again (retired like evicted ones).
++    if (const std::uint32_t generation = texture_override_generation(); generation != override_generation) {
++        override_generation = generation;
++        bool erased = false;
++        for (auto it = textures.begin(); it != textures.end();) {
++            if (!it->second.override_claimed) {
++                ++it;
++                continue;
++            }
++            destroyed_texture_clock = std::max(destroyed_texture_clock, it->second.last_used);
++            if (async_uploads()) {
++                slots[slot].retired_textures.push_back(it->second);
++            } else {
++                vkQueueWaitIdle(queue);
++                destroy_texture(it->second);
++            }
++            it = textures.erase(it);
++            erased = true;
++        }
++        if (erased) ++textures_erased;
++    }
+     const TextureKeyInput input{state.address,
+                                 state.buffer_width,
+                                 static_cast<std::uint32_t>(state.width) << 16u | state.height,
+@@ -4210,7 +4239,7 @@
+     // image in the texture pack.
+     const auto use = [&](Texture &texture) -> Texture & {
+         texture.last_used = ++texture_clock;
+-        if (pack && state.height == 512u && texture.max_seen_v < 512u) {
++        if (pack && !texture.override_replaced && state.height == 512u && texture.max_seen_v < 512u) {
+             const std::uint16_t seen = update_max_seen_v(texture.max_seen_v, drawn_max_v(call), call.through);
+             if (seen != texture.max_seen_v) {
+                 texture.max_seen_v = seen;
+@@ -4233,7 +4262,13 @@
+     const TextureUpscaler upscaler = texture_upscaler();
+     std::vector<std::uint32_t> upscaled;
+     std::uint32_t upscale = 1u;
+-    const bool claimed = upscaler != nullptr && upscaler(state, nullptr, 0u, upscaled, upscale);
++    const TextureOverride override_function = texture_override();
++    TextureOverrideImage override_image;
++    const bool override_claimed =
++        override_function != nullptr &&
++        override_function(state, nullptr, nullptr, 0u, override_image) != TextureOverrideResult::Ignore;
++    const bool upscaler_claimed = upscaler != nullptr && upscaler(state, nullptr, 0u, upscaled, upscale);
++    const bool claimed = override_claimed || upscaler_claimed;
+     std::shared_ptr<DecodeJob> job;
+     if (recording && async_uploads() && background_decode() && !dumper && !claimed) {
+         job = std::make_shared<DecodeJob>();
+@@ -4290,15 +4325,40 @@
+         textures.erase(oldest);
+         ++textures_erased;
+     }
+-    if (claimed && !job) {
+-        const std::uint32_t wanted =
+-            std::clamp((target_extent.height + kPspHeight - 1u) / kPspHeight, 1u, 8u);
++    const std::uint32_t wanted = std::clamp((target_extent.height + kPspHeight - 1u) / kPspHeight, 1u, 8u);
++    // A profile's override first; when it asks, it is shown the pack's image,
++    // decoded now.
++    bool override_watched = false;
++    bool override_replaced = false;
++    if (override_claimed && !job) {
++        override_image = TextureOverrideImage{};
++        TextureOverrideResult result = override_function(state, pixels.data(), nullptr, wanted, override_image);
++        if (result == TextureOverrideResult::WantsPackImage) {
++            TextureOverrideImage pack_image;
++            if (std::shared_ptr<Replacement> from_pack = pack ? pack->find(memory, state, max_seen_v) : nullptr;
++                from_pack && !pack->decode_now(*from_pack, pack_image.width, pack_image.height, pack_image.pixels))
++                pack_image = TextureOverrideImage{};
++            override_image = TextureOverrideImage{};
++            result = override_function(state, pixels.data(), &pack_image, wanted, override_image);
++        }
++        override_watched = result != TextureOverrideResult::Ignore;
++        override_replaced = result == TextureOverrideResult::Replace && override_image.width >= state.width &&
++                            override_image.height >= state.height && override_image.width % state.width == 0u &&
++                            override_image.height % state.height == 0u &&
++                            override_image.pixels.size() ==
++                                static_cast<std::size_t>(override_image.width) * override_image.height;
++    }
++    if (upscaler_claimed && !job && !override_replaced) {
+         upscale = 1u;
+         if (!upscaler(state, pixels.data(), wanted, upscaled, upscale) || upscale < 2u ||
+             upscaled.size() != static_cast<std::size_t>(state.width) * state.height * upscale * upscale)
+             upscale = 1u;
++    } else {
++        upscale = 1u;
+     }
+     Texture texture = job ? create_texture_image(state.width, state.height)
++                      : override_replaced ? create_texture(override_image.width, override_image.height,
++                                                           override_image.pixels.data())
+                       : upscale > 1u ? create_texture(state.width * upscale, state.height * upscale, upscaled.data())
+                                      : create_texture(state.width, state.height, pixels.data());
+     if (texture.descriptor == VK_NULL_HANDLE) return white_texture;
+@@ -4311,9 +4371,11 @@
+         pending_textures.push_back({std::move(job), texture.image, state.width, state.height});
+     }
+     texture.max_seen_v = max_seen_v;
++    texture.override_claimed = override_watched;
++    texture.override_replaced = override_replaced;
+     // The pack's hash reads the whole texture, so it is taken here, once per
+     // upload, and never on the per-draw path above.
+-    if (pack) texture.replacement = pack->find(memory, state, max_seen_v);
++    if (pack && !override_replaced) texture.replacement = pack->find(memory, state, max_seen_v);
+     Texture &cached = textures.emplace(key, std::move(texture)).first->second;
+     memo->texture = &cached;
+     memo->erased = textures_erased;

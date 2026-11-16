@@ -1,0 +1,438 @@
+Subject: [PATCH 0016] Render resolution in pixels instead of a 480x272 multiplier
+
+video.resolution replaces video.internal_scale: "window" follows the
+window's size in pixels (no longer capped at 1632 lines), or any WxH up to
+8192 on a side, with presets the menu cycles through (480p to 5K, 16:10,
+ultrawide and super ultrawide). Under Fill the picture takes the chosen
+resolution's shape, shown with bars when the window's differs; Original and
+Stretch fit the PSP's shape inside it. An old video.internal_scale=N is read
+as 480N x 272N and no longer written. VulkanRenderer::set_internal_scale is
+now set_resolution(settings::Resolution).
+
+diff -ru a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
+--- a/host/gpu/vulkan_renderer.cpp	2026-11-07 23:33:43.345345656 +0000
++++ b/host/gpu/vulkan_renderer.cpp	2026-11-07 23:37:31.082602033 +0000
+@@ -66,11 +66,9 @@
+ 
+ constexpr std::uint32_t kPspWidth = 480u;
+ constexpr std::uint32_t kPspHeight = 272u;
+-// Auto resolution draws the game at the window's size in pixels, up to this
+-// many lines: 6 x 272, the largest multiple the menu offers.
+-constexpr std::uint32_t kMaxAutoLines = 6u * kPspHeight;
+-// Widest target, in pixels; every Vulkan device takes images this wide.
+-constexpr std::uint32_t kMaxTargetWidth = 8192u;
++// Widest and tallest target, in pixels; every Vulkan device takes images
++// this large.
++constexpr double kMaxTargetSide = settings::kMaxResolutionSide;
+ // Frames a new window size has to hold before the targets follow it, so
+ // dragging a window's edge does not rebuild them on every frame.
+ constexpr std::uint32_t kSettleFrames = 12u;
+@@ -840,7 +838,7 @@
+     settings::PresentMode requested_present{settings::PresentMode::Fifo};
+     settings::Aspect aspect{settings::Aspect::Original};
+     bool profile_places_interface{};  // set_profile_places_interface
+-    std::uint32_t requested_scale{2u};  // multiples of 480x272; 0: the window's size
++    settings::Resolution requested_resolution{};  // 0x0: the window's size
+     // A target size the window asks for, applied once it has held for
+     // kSettleFrames frames; a changed setting applies at the next chance.
+     VkExtent2D pending_extent{};
+@@ -2126,10 +2124,9 @@
+     Impl &impl = *impl_;
+     impl.config = config;
+     const settings::Settings &player = settings::current();
+-    impl.requested_scale = std::min(player.internal_scale, settings::kMaxInternalScale);
+-    // Until the window's size is known, which Auto and Fill need.
+-    const std::uint32_t scale = impl.requested_scale != 0u ? impl.requested_scale : 2u;
+-    impl.target_extent = {kPspWidth * scale, kPspHeight * scale};
++    impl.requested_resolution = player.resolution;
++    // Until the window's size is known, which Match window needs.
++    impl.target_extent = {kPspWidth * 2u, kPspHeight * 2u};
+     impl.requested_present = player.present_mode;
+     impl.aspect = usable_aspect(player.aspect);
+     impl.sharp_screen = player.sharp_screen;
+@@ -3466,8 +3463,9 @@
+ }
+ 
+ // Scales the game frame onto the swapchain image, which is in TRANSFER_DST
+-// layout: stretched over the whole window, or at the PSP's aspect ratio with
+-// black bars. Fill's target already has the window's shape.
++// layout: stretched over the whole window, or at its own shape with black
++// bars: the PSP's under Original, the target's under Fill (the window's under
++// Match window, so no bars; a chosen resolution of another shape gets them).
+ void VulkanRenderer::Impl::record_game_blit(VkCommandBuffer commands, VkImage source, VkImage destination) {
+     const auto width = static_cast<std::int32_t>(content_rect.extent.width);
+     const auto height = static_cast<std::int32_t>(content_rect.extent.height);
+@@ -3477,14 +3475,26 @@
+     VkOffset3D high{x0 + width, y0 + height, 1};
+     const bool partial = width < static_cast<std::int32_t>(swapchain_extent.width) ||
+                          height < static_cast<std::int32_t>(swapchain_extent.height);
+-    if (aspect == settings::Aspect::Original || partial) {
++    double shape_width = 0.0;
++    double shape_height = 0.0;
++    if (aspect == settings::Aspect::Original) {
++        shape_width = kPspWidth;
++        shape_height = kPspHeight;
++    } else if (aspect == settings::Aspect::Fill) {
++        shape_width = target_extent.width;
++        shape_height = target_extent.height;
++    }
++    if (shape_width > 0.0 || partial) {
+         std::int32_t shown_width = width;
+         std::int32_t shown_height = height;
+-        if (aspect == settings::Aspect::Original) {
++        if (shape_width > 0.0 && shape_height > 0.0) {
+             const double scale =
+-                std::min(static_cast<double>(width) / kPspWidth, static_cast<double>(height) / kPspHeight);
+-            shown_width = std::clamp(static_cast<std::int32_t>(std::lround(kPspWidth * scale)), 1, width);
+-            shown_height = std::clamp(static_cast<std::int32_t>(std::lround(kPspHeight * scale)), 1, height);
++                std::min(static_cast<double>(width) / shape_width, static_cast<double>(height) / shape_height);
++            shown_width = std::clamp(static_cast<std::int32_t>(std::lround(shape_width * scale)), 1, width);
++            shown_height = std::clamp(static_cast<std::int32_t>(std::lround(shape_height * scale)), 1, height);
++            // A pixel short from rounding is not a bar.
++            if (width - shown_width <= 1) shown_width = width;
++            if (height - shown_height <= 1) shown_height = height;
+         }
+         low = {x0 + (width - shown_width) / 2, y0 + (height - shown_height) / 2, 0};
+         high = {low.x + shown_width, low.y + shown_height, 1};
+@@ -5307,32 +5317,34 @@
+ std::string VulkanRenderer::device_name() const { return impl_ ? impl_->device_name : std::string{}; }
+ SDL_Gamepad *VulkanRenderer::gamepad() const noexcept { return impl_ ? impl_->gamepad : nullptr; }
+ 
++// The target's size: the chosen resolution, or the window's size in pixels
++// under Match window. Fill draws at that shape; Original and Stretch draw the
++// PSP's 480x272 shape fitted inside it (Stretch under Match window covers the
++// window instead, since it is stretched over all of it).
+ VkExtent2D VulkanRenderer::Impl::wanted_target_extent() const {
+     const bool known = content_rect.extent.width != 0u && content_rect.extent.height != 0u;
+-    const double window_width = known ? content_rect.extent.width : static_cast<double>(target_extent.width);
+-    const double window_height = known ? content_rect.extent.height : static_cast<double>(target_extent.height);
++    const bool follows = requested_resolution.follows_window();
++    double width = follows ? (known ? content_rect.extent.width : static_cast<double>(target_extent.width))
++                           : static_cast<double>(requested_resolution.width);
++    double height = follows ? (known ? content_rect.extent.height : static_cast<double>(target_extent.height))
++                            : static_cast<double>(requested_resolution.height);
++    width = std::max(width, 1.0);
++    height = std::max(height, 1.0);
++    // A small window is still drawn at the PSP's own 272 lines at least.
++    if (follows && height < kPspHeight) {
++        width *= kPspHeight / height;
++        height = kPspHeight;
++    }
+     if (aspect != settings::Aspect::Fill) {
+-        std::uint32_t scale = requested_scale;
+-        if (scale == 0u) {
+-            // The smallest multiple that covers the picture on the window.
+-            const double x = window_width / kPspWidth;
+-            const double y = window_height / kPspHeight;
+-            const double cover = aspect == settings::Aspect::Original ? std::min(x, y) : std::max(x, y);
+-            scale = static_cast<std::uint32_t>(std::clamp(std::ceil(cover - 0.01), 1.0,
+-                                                          static_cast<double>(kMaxAutoLines / kPspHeight)));
+-        }
+-        return {kPspWidth * scale, kPspHeight * scale};
+-    }
+-    // Fill: the window's shape, 272 lines per step or the window's own lines.
+-    const double shape = std::clamp(window_width / std::max(window_height, 1.0), 0.25, 8.0);
+-    double lines = requested_scale != 0u ? static_cast<double>(kPspHeight * requested_scale)
+-                                         : std::clamp(window_height, static_cast<double>(kPspHeight),
+-                                                      static_cast<double>(kMaxAutoLines));
+-    lines = std::min(lines, kMaxTargetWidth / shape);
+-    const auto height = static_cast<std::uint32_t>(std::max(1.0, std::round(lines)));
+-    const auto width = static_cast<std::uint32_t>(
+-        std::clamp(std::round(lines * shape), 1.0, static_cast<double>(kMaxTargetWidth)));
+-    return {width, height};
++        const double x = width / kPspWidth;
++        const double y = height / kPspHeight;
++        const double scale = aspect == settings::Aspect::Stretch && follows ? std::max(x, y) : std::min(x, y);
++        width = kPspWidth * scale;
++        height = kPspHeight * scale;
++    }
++    const double limit = std::min({1.0, kMaxTargetSide / width, kMaxTargetSide / height});
++    return {static_cast<std::uint32_t>(std::max(1.0, std::round(width * limit))),
++            static_cast<std::uint32_t>(std::max(1.0, std::round(height * limit)))};
+ }
+ 
+ bool VulkanRenderer::Impl::interface_fit(float &fit_x, float &fit_y) const {
+@@ -5428,9 +5440,9 @@
+     std::cout << "[render] internal resolution " << extent.width << "x" << extent.height << "\n";
+ }
+ 
+-void VulkanRenderer::set_internal_scale(std::uint32_t scale) {
++void VulkanRenderer::set_resolution(settings::Resolution resolution) {
+     if (!impl_) return;
+-    impl_->requested_scale = std::min(scale, settings::kMaxInternalScale);
++    impl_->requested_resolution = resolution;
+     impl_->resize_now = true;
+     impl_->follow_window();
+ }
+diff -ru a/host/gpu/vulkan_renderer.hpp b/host/gpu/vulkan_renderer.hpp
+--- a/host/gpu/vulkan_renderer.hpp	2026-11-07 23:33:43.351031913 +0000
++++ b/host/gpu/vulkan_renderer.hpp	2026-11-07 23:38:17.802135908 +0000
+@@ -74,8 +74,9 @@
+ 
+ // Vulkan backend for the GE. Draw calls are rendered into an offscreen target
+ // per guest framebuffer, which is blitted to the window once per guest frame.
+-// A target holds the game's 480x272 screen at a multiple of that size, or,
+-// under Fill, at the window's shape: then each PSP pixel is wider (or taller)
++// A target holds the game's 480x272 screen at the chosen resolution (fitted to
++// the PSP's shape), or, under Fill, at the resolution's own shape (the
++// window's under Match window): then each PSP pixel is wider (or taller)
+ // than square, the game draws a view of that shape (GameProfile::view_aspect_frame),
+ // and the 2D interface is drawn at its own proportions.
+ class VulkanRenderer {
+@@ -186,9 +187,9 @@
+     void capture_window(const std::string &path);
+ 
+     // Display settings, applied at once. The initial values come from
+-    // settings::current() in initialize(). A scale of 0 follows the window's
+-    // size in pixels, including every later change of it.
+-    void set_internal_scale(std::uint32_t scale);
++    // settings::current() in initialize(). A resolution of 0x0 follows the
++    // window's size in pixels, including every later change of it.
++    void set_resolution(settings::Resolution resolution);
+     void set_window_scale(std::uint32_t scale);
+     void set_fullscreen(bool fullscreen);
+     void set_present_mode(settings::PresentMode mode);
+diff -ru a/host/settings/settings.cpp b/host/settings/settings.cpp
+--- a/host/settings/settings.cpp	2026-11-07 23:33:43.340630856 +0000
++++ b/host/settings/settings.cpp	2026-11-07 23:35:37.674216324 +0000
+@@ -51,13 +51,19 @@
+     return true;
+ }
+ 
+-// A resolution: a multiple of 480x272, or "auto" (0) for the window's own.
+-bool parse_scale(const std::string &text, std::uint32_t &out) {
++// Written by earlier versions: the render resolution as a multiple of
++// 480x272, or "auto" for the window's own. Read when video.resolution is not
++// there (it comes later in the table, so it wins), and no longer written.
++constexpr const char *kRetiredInternalScaleKey = "video.internal_scale";
++bool parse_internal_scale(const std::string &text, Resolution &out) {
+     if (text == "auto") {
+-        out = 0u;
++        out = {};
+         return true;
+     }
+-    return parse_uint(text, 0u, kMaxInternalScale, out);
++    std::uint32_t scale = 0u;
++    if (!parse_uint(text, 0u, 16u, scale)) return false;
++    out = scale == 0u ? Resolution{} : Resolution{480u * scale, 272u * scale};
++    return true;
+ }
+ 
+ std::string format_float(float value) {
+@@ -161,12 +167,15 @@
+ 
+ const std::vector<Field> &fields() {
+     static const std::vector<Field> table = {
+-        {"video.internal_scale", "INTERNAL_SCALE",
+-         [](Settings &s, const std::string &t) { return parse_scale(t, s.internal_scale); },
+-         [](const Settings &s) { return s.internal_scale == 0u ? std::string("auto") : std::to_string(s.internal_scale); },
++        {kRetiredInternalScaleKey, nullptr,
++         [](Settings &s, const std::string &t) { return parse_internal_scale(t, s.resolution); },
++         [](const Settings &) { return std::string(); }, nullptr},
++        {"video.resolution", "RESOLUTION",
++         [](Settings &s, const std::string &t) { return parse_resolution(t, s.resolution); },
++         [](const Settings &s) { return format_resolution(s.resolution); },
+          [](Settings &s, const char *t) {
+-             std::uint32_t value = s.internal_scale;
+-             if (parse_scale(t, value)) s.internal_scale = value;
++             Resolution value = s.resolution;
++             if (parse_resolution(t, value)) s.resolution = value;
+          }},
+         {"video.window_scale", nullptr,
+          [](Settings &s, const std::string &t) { return parse_uint(t, 1u, kMaxWindowScale, s.window_scale); },
+@@ -557,12 +566,42 @@
+             entries[field.key] = field.format(s.values);
+         }
+         entries.erase(kRetiredTypeNameKey);
++        entries.erase(kRetiredInternalScaleKey);
+         install::write_settings_file(s.data_dir, entries);
+     } catch (const std::exception &e) {
+         std::cerr << "[settings] cannot write settings.ini: " << e.what() << "\n";
+     }
+ }
+ 
++std::string format_resolution(Resolution resolution) {
++    if (resolution.follows_window()) return "window";
++    return std::to_string(resolution.width) + "x" + std::to_string(resolution.height);
++}
++
++// "window" (or "auto"), or a size such as "1920x1080"; each side is kept
++// within kMinResolutionSide..kMaxResolutionSide.
++bool parse_resolution(const std::string &text, Resolution &out) {
++    if (text == "window" || text == "auto") {
++        out = {};
++        return true;
++    }
++    const std::size_t x = text.find_first_of("xX");
++    if (x == std::string::npos) return false;
++    std::uint32_t width = 0u;
++    std::uint32_t height = 0u;
++    if (!parse_uint(text.substr(0, x), kMinResolutionSide, kMaxResolutionSide, width) ||
++        !parse_uint(text.substr(x + 1u), kMinResolutionSide, kMaxResolutionSide, height))
++        return false;
++    out = {width, height};
++    return true;
++}
++
++std::string resolution_name(Resolution resolution) {
++    for (const ResolutionPreset &preset : kResolutionPresets)
++        if (preset.size == resolution) return preset.name;
++    return format_resolution(resolution);
++}
++
+ std::string overridden_by(const char *key) {
+     State &s = state();
+     if (!s.loaded) load(s);
+diff -ru a/host/settings/settings.hpp b/host/settings/settings.hpp
+--- a/host/settings/settings.hpp	2026-11-07 23:33:43.335162836 +0000
++++ b/host/settings/settings.hpp	2026-11-07 23:38:17.801858496 +0000
+@@ -42,9 +42,53 @@
+ // as they are, as before interpolation existed.
+ enum class FrameRate { Fps30, Fps45, Fps60, Fps90, Fps120, Display };
+ 
++// The size the game is drawn at, in pixels. 0x0 follows the window's own
++// size in pixels, including every later change of it. Under Fill the picture
++// has this shape (shown with bars when the window's shape differs); under
++// Original and Stretch it is the PSP's 480x272 shape fitted inside it.
++struct Resolution {
++    std::uint32_t width{};
++    std::uint32_t height{};
++    [[nodiscard]] constexpr bool follows_window() const noexcept { return width == 0u || height == 0u; }
++    friend constexpr bool operator==(const Resolution &, const Resolution &) = default;
++};
++inline constexpr std::uint32_t kMinResolutionSide = 16u;
++inline constexpr std::uint32_t kMaxResolutionSide = 8192u;
++struct ResolutionPreset {
++    const char *name;
++    Resolution size;
++};
++// What the menus offer, in order. Any other size can be set in settings.ini.
++inline constexpr ResolutionPreset kResolutionPresets[] = {
++    {"Match window", {0u, 0u}},
++    {"PSP", {480u, 272u}},
++    {"480p 4:3", {640u, 480u}},
++    {"480p", {854u, 480u}},
++    {"720p", {1280u, 720u}},
++    {"800p 16:10", {1280u, 800u}},
++    {"900p", {1600u, 900u}},
++    {"1080p", {1920u, 1080u}},
++    {"1080p 16:10", {1920u, 1200u}},
++    {"1080p ultrawide", {2560u, 1080u}},
++    {"1080p super ultrawide", {3840u, 1080u}},
++    {"1440p", {2560u, 1440u}},
++    {"1440p 16:10", {2560u, 1600u}},
++    {"1440p ultrawide", {3440u, 1440u}},
++    {"1440p super ultrawide", {5120u, 1440u}},
++    {"1800p", {3200u, 1800u}},
++    {"4K", {3840u, 2160u}},
++    {"4K ultrawide", {5120u, 2160u}},
++    {"5K", {5120u, 2880u}},
++};
++// "window" or "<width>x<height>", the spelling settings.ini uses.
++[[nodiscard]] std::string format_resolution(Resolution resolution);
++[[nodiscard]] bool parse_resolution(const std::string &text, Resolution &out);
++// The preset's name, "1920x1080" for a size no preset has.
++[[nodiscard]] std::string resolution_name(Resolution resolution);
++
+ struct Settings {
+     // Video
+-    std::uint32_t internal_scale{2u};  // render resolution, multiples of 480x272 (272 lines each); 0: the window's
++    Resolution resolution{};           // render resolution; 0x0: the window's (see Resolution)
+     std::uint32_t window_scale{2u};    // windowed size, multiples of 480x272
+     bool fullscreen{};
+     PresentMode present_mode{PresentMode::Fifo};
+@@ -137,7 +181,6 @@
+     bool backup_timestamp{true};       // a backup made from the menu goes to a new folder named by its time
+ };
+ 
+-inline constexpr std::uint32_t kMaxInternalScale = 8u;
+ inline constexpr std::uint32_t kMaxWindowScale = 4u;
+ inline constexpr std::uint32_t kMaxFontWeight = 2u;
+ inline constexpr float kMinMouseSensitivity = 0.01f;
+@@ -173,7 +216,7 @@
+ void save();
+ 
+ // The environment variable that decides the setting stored under `key`
+-// (for example "video.internal_scale") for this run, or null.
++// (for example "video.resolution") for this run, or null.
+ // The environment variable that decided this setting, or empty when the
+ // file or the default did. The name carries the game's own prefix.
+ [[nodiscard]] std::string overridden_by(const char *key);
+diff -ru a/host/ui/menu.cpp b/host/ui/menu.cpp
+--- a/host/ui/menu.cpp	2026-11-07 23:33:43.356524195 +0000
++++ b/host/ui/menu.cpp	2026-11-07 23:36:22.088144074 +0000
+@@ -66,14 +66,19 @@
+ // The longest fixed name the menu takes. A game's own request says what it
+ // takes when it asks; this only bounds what is typed here.
+ constexpr std::size_t kNameLength = 12u;
+-// Resolutions the menu offers. <prefix>_INTERNAL_SCALE goes up to 8, but a
+-// setting that runs out of video memory would fail on every start.
+-constexpr int kMenuMaxInternalScale = 6;
+-
+ std::string size_text(std::uint32_t scale) {
+     return std::to_string(480u * scale) + "×" + std::to_string(272u * scale);
+ }
+ 
++// The preset the resolution is, or the number of presets for a size set in
++// settings.ini that none of them has.
++int resolution_preset(settings::Resolution resolution) {
++    const int count = static_cast<int>(std::size(settings::kResolutionPresets));
++    for (int i = 0; i < count; ++i)
++        if (settings::kResolutionPresets[i].size == resolution) return i;
++    return count;
++}
++
+ // Row options for the setting stored under `key`: when an environment
+ // variable decides it for this run, the row is shown but locked.
+ RowOptions options_for(const char *key, std::string description) {
+@@ -205,21 +210,20 @@
+     settings::Settings &s = settings::current();
+     section("Picture");
+     {
+-        RowOptions o = options_for("video.internal_scale",
+-                                   "Auto draws the game at the window's own size and follows it (at most 1632 "
+-                                   "lines). ×1 to ×6 draw 272 lines per step, 480×272 times the step unless the "
+-                                   "aspect ratio is Fill. Higher is sharper and needs more from the GPU.");
++        RowOptions o = options_for("video.resolution",
++                                   "The size the game is drawn at. Match window follows the window's own size. "
++                                   "Under Fill the picture takes the resolution's shape, with bars when the "
++                                   "window's differs; Original and Stretch fit the PSP's shape inside it. Higher "
++                                   "is sharper and needs more from the GPU.");
+         const std::array<std::uint32_t, 2> size = renderer().target_size();
+         const std::string drawn = std::to_string(size[0]) + "×" + std::to_string(size[1]);
+-        const std::string value =
+-            (s.internal_scale == 0u ? std::string("Auto") : "×" + std::to_string(s.internal_scale)) + "   " + drawn;
++        const std::string value = settings::resolution_name(s.resolution) + "   " + drawn;
+         if (const int delta = choice_row("Resolution", value, o)) {
+-            // Auto, then ×1 up to the menu's largest (or a larger one a
+-            // variable once chose).
+-            const int limit = std::max<int>(kMenuMaxInternalScale, static_cast<int>(s.internal_scale));
+-            s.internal_scale =
+-                static_cast<std::uint32_t>(cycle(static_cast<int>(s.internal_scale), delta, limit + 1));
+-            renderer().set_internal_scale(s.internal_scale);
++            // The presets in order; a size from settings.ini steps to one.
++            const int count = static_cast<int>(std::size(settings::kResolutionPresets));
++            const int current = std::min(resolution_preset(s.resolution), delta > 0 ? count - 1 : count);
++            s.resolution = settings::kResolutionPresets[cycle(current, delta, count)].size;
++            renderer().set_resolution(s.resolution);
+             settings::save();
+         }
+     }
+@@ -420,7 +424,7 @@
+         const auto restore = [&](const char *key, auto &value, const auto &fallback) {
+             if (settings::overridden_by(key).empty()) value = fallback;
+         };
+-        restore("video.internal_scale", s.internal_scale, d.internal_scale);
++        restore("video.resolution", s.resolution, d.resolution);
+         restore("video.fullscreen", s.fullscreen, d.fullscreen);
+         restore("video.window_scale", s.window_scale, d.window_scale);
+         restore("video.aspect", s.aspect, d.aspect);
+@@ -433,7 +437,7 @@
+         restore("video.unthrottled", s.unthrottled, d.unthrottled);
+         restore("video.fast_loading", s.fast_loading, d.fast_loading);
+         restore("video.performance", s.perf, d.perf);
+-        renderer().set_internal_scale(s.internal_scale);
++        renderer().set_resolution(s.resolution);
+         renderer().set_fullscreen(s.fullscreen);
+         renderer().set_window_scale(s.window_scale);
+         renderer().set_aspect(s.aspect);

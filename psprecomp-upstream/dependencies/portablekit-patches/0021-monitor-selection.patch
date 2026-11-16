@@ -1,0 +1,110 @@
+Subject: [PATCH 0021] Monitor selection (video.monitor)
+
+video.monitor (env <prefix>_MONITOR) names the display the window opens on,
+as SDL names it (the monitor's own name on Windows); "<name> #k" is the k-th
+display of that name from the left. Empty, or not connected: the primary.
+The window is created centred on that display (SDL_CreateWindowWithProperties),
+so Fullscreen and Borderless take it too, and the starting window size fits
+that display's usable area.
+
+diff -ru a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
+--- a/host/gpu/vulkan_renderer.cpp	2026-11-09 14:09:29.546451763 +0000
++++ b/host/gpu/vulkan_renderer.cpp	2026-11-09 14:09:29.551431369 +0000
+@@ -2174,6 +2174,37 @@
+     // A missing gamepad subsystem is not fatal; the keyboard still drives the pad.
+     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) std::cout << "[pad] no gamepad support: " << SDL_GetError() << "\n";
+     else impl.scan_gamepads();
++    // The display to open on (video.monitor): by name, "<name> #k" for the k-th
++    // of that name from the left; else, or when it is not connected, the primary.
++    SDL_DisplayID chosen_display = SDL_GetPrimaryDisplay();
++    if (!player.monitor.empty()) {
++        std::string name = player.monitor;
++        std::size_t wanted = 1u;
++        if (const std::size_t hash = name.rfind(" #"); hash != std::string::npos && hash + 2u < name.size() &&
++            name.find_first_not_of("0123456789", hash + 2u) == std::string::npos) {
++            wanted = static_cast<std::size_t>(std::strtoul(name.c_str() + hash + 2u, nullptr, 10));
++            name.resize(hash);
++        }
++        int count = 0;
++        SDL_DisplayID *displays = SDL_GetDisplays(&count);
++        std::vector<std::pair<SDL_Rect, SDL_DisplayID>> named;
++        for (int i = 0; displays != nullptr && i < count; ++i) {
++            const char *display_name = SDL_GetDisplayName(displays[i]);
++            SDL_Rect bounds{};
++            if (display_name != nullptr && name == display_name && SDL_GetDisplayBounds(displays[i], &bounds))
++                named.push_back({bounds, displays[i]});
++        }
++        SDL_free(displays);
++        std::sort(named.begin(), named.end(), [](const auto &a, const auto &b) {
++            return a.first.x != b.first.x ? a.first.x < b.first.x : a.first.y < b.first.y;
++        });
++        if (wanted >= 1u && wanted <= named.size()) {
++            chosen_display = named[wanted - 1u].second;
++            std::cout << "[render] monitor \"" << player.monitor << "\"\n";
++        } else {
++            std::cout << "[render] monitor \"" << player.monitor << "\" is not connected; using the primary display\n";
++        }
++    }
+     SDL_WindowFlags window_flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE;
+     const settings::DisplayMode display_mode = settings::display_mode(player);
+     if (display_mode == settings::DisplayMode::Fullscreen) window_flags |= SDL_WINDOW_FULLSCREEN;
+@@ -2192,7 +2223,7 @@
+     int window_width = static_cast<int>(kPspWidth * window_scale);
+     int window_height = static_cast<int>(kPspHeight * window_scale);
+     if (!player.resolution.follows_window()) {
+-        const SDL_DisplayID display = SDL_GetPrimaryDisplay();
++        const SDL_DisplayID display = chosen_display;
+         float content_scale = display != 0u ? SDL_GetDisplayContentScale(display) : 1.0f;
+         if (!(content_scale > 0.0f)) content_scale = 1.0f;
+         double width = player.resolution.width / content_scale;
+@@ -2207,7 +2238,20 @@
+         window_width = std::max(320, static_cast<int>(std::lround(width)));
+         window_height = std::max(180, static_cast<int>(std::lround(height)));
+     }
+-    impl.window = SDL_CreateWindow(config.title.c_str(), window_width, window_height, window_flags);
++    // Centred on the chosen display, so fullscreen and borderless take that one.
++    {
++        const SDL_PropertiesID props = SDL_CreateProperties();
++        SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, config.title.c_str());
++        SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, window_width);
++        SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, window_height);
++        if (chosen_display != 0u) {
++            SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(chosen_display));
++            SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(chosen_display));
++        }
++        SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, static_cast<Sint64>(window_flags));
++        impl.window = SDL_CreateWindowWithProperties(props);
++        SDL_DestroyProperties(props);
++    }
+     if (impl.window == nullptr) {
+         error = std::string("SDL_CreateWindow failed: ") + SDL_GetError();
+         return false;
+diff -ru a/host/settings/settings.cpp b/host/settings/settings.cpp
+--- a/host/settings/settings.cpp	2026-11-09 14:09:29.548037950 +0000
++++ b/host/settings/settings.cpp	2026-11-09 14:09:29.553022007 +0000
+@@ -198,6 +198,12 @@
+              }
+          },
+          nullptr},
++        {"video.monitor", "MONITOR",
++         [](Settings &s, const std::string &t) {
++             s.monitor = t;
++             return true;
++         },
++         [](const Settings &s) { return s.monitor; }, [](Settings &s, const char *t) { s.monitor = t; }},
+         {"video.present_mode", nullptr,
+          [](Settings &s, const std::string &t) { return kPresentModes.parse(t, s.present_mode); },
+          [](const Settings &s) { return kPresentModes.format(s.present_mode); }, nullptr},
+diff -ru a/host/settings/settings.hpp b/host/settings/settings.hpp
+--- a/host/settings/settings.hpp	2026-11-09 14:09:29.549434536 +0000
++++ b/host/settings/settings.hpp	2026-11-09 14:09:29.553059226 +0000
+@@ -92,6 +92,9 @@
+     std::uint32_t window_scale{2u};    // windowed size, multiples of 480x272
+     bool fullscreen{};
+     bool borderless{};                 // windowed without a frame, covering its display (fullscreen off)
++    // The display the window opens on, by its name ("<name> #2" for the second
++    // of that name from the left); empty: the primary display.
++    std::string monitor;
+     PresentMode present_mode{PresentMode::Fifo};
+     Aspect aspect{Aspect::Original};
+     bool sharp_screen{};               // nearest instead of linear scaling to the window

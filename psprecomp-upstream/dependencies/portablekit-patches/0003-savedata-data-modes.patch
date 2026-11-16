@@ -1,0 +1,254 @@
+--- a/host/hle/hle_savedata.cpp
++++ b/host/hle/hle_savedata.cpp
+@@ -113,6 +113,7 @@
+ constexpr std::uint32_t kRwDataBroken = 0x80110326u;
+ constexpr std::uint32_t kRwNoData = 0x80110327u;
+ constexpr std::uint32_t kRwBadParams = 0x80110328u;
++constexpr std::uint32_t kRwFileNotFound = 0x80110329u;
+ constexpr std::uint32_t kDeleteNoData = 0x80110347u;
+ constexpr std::uint32_t kSaveAccessError = 0x80110385u;
+ constexpr std::uint32_t kSaveParam = 0x80110388u;
+@@ -271,14 +272,11 @@
+     return result::kOk;
+ }
+ 
+-std::uint32_t do_save(psprecomp::GuestMemory &memory, std::uint32_t params, const std::string &save_name) {
+-    const auto files = files_for(memory, params, save_name);
+-    const std::uint32_t buffer = memory.load32(params + param::kDataBuf);
+-    const std::uint32_t size = memory.load32(params + param::kDataSize);
+-    if (files.game_name.empty() || files.file_name.empty() || buffer == 0u) return result::kSaveParam;
+-
++// The data, PARAM.SFO text and media files a save request supplies.
++savedata::SaveContents contents_from(const psprecomp::GuestMemory &memory, std::uint32_t params) {
+     savedata::SaveContents contents;
+-    contents.data = read_guest(memory, buffer, size);
++    if (const std::uint32_t buffer = memory.load32(params + param::kDataBuf); buffer != 0u)
++        contents.data = read_guest(memory, buffer, memory.load32(params + param::kDataSize));
+     contents.title = read_cstring(memory, params + param::kTitle, 128u);
+     contents.savedata_title = read_cstring(memory, params + param::kSavedataTitle, 128u);
+     contents.detail = read_cstring(memory, params + param::kDetail, 1024u);
+@@ -287,6 +285,16 @@
+     contents.icon1 = read_file_data(memory, params + param::kIcon1);
+     contents.pic1 = read_file_data(memory, params + param::kPic1);
+     contents.snd0 = read_file_data(memory, params + param::kSnd0);
++    return contents;
++}
++
++std::uint32_t do_save(psprecomp::GuestMemory &memory, std::uint32_t params, const std::string &save_name) {
++    const auto files = files_for(memory, params, save_name);
++    const std::uint32_t buffer = memory.load32(params + param::kDataBuf);
++    const std::uint32_t size = memory.load32(params + param::kDataSize);
++    if (files.game_name.empty() || files.file_name.empty() || buffer == 0u) return result::kSaveParam;
++
++    const savedata::SaveContents contents = contents_from(memory, params);
+ 
+     std::string error;
+     if (!savedata::write_save(state().memory_stick, files, contents, error)) {
+@@ -486,12 +494,19 @@
+     const auto sfo = savedata::ParamSfo::parse(sfo_bytes);
+     if (!sfo) return result::kRwDataBroken;
+     std::vector<std::string> secure_names;
++    std::vector<std::string> encrypted_names;
+     if (const auto *list = sfo->binary("SAVEDATA_FILE_LIST"); list != nullptr) {
+-        // 32-byte entries: a 13-byte name, its hash and padding.
++        // 32-byte entries: a 13-byte name, its 16-byte hash and padding. An
++        // encrypted file carries a hash; a plain secure file is listed with
++        // a zero one.
+         for (std::size_t offset = 0; offset + 32u <= list->size(); offset += 32u) {
+             std::string name;
+             for (std::size_t i = 0; i < 13u && (*list)[offset + i] != 0u; ++i) name.push_back(static_cast<char>((*list)[offset + i]));
+-            if (!name.empty()) secure_names.push_back(std::move(name));
++            if (name.empty()) continue;
++            if (std::any_of(list->begin() + static_cast<std::ptrdiff_t>(offset + 13u),
++                            list->begin() + static_cast<std::ptrdiff_t>(offset + 29u), [](std::uint8_t b) { return b != 0u; }))
++                encrypted_names.push_back(name);
++            secure_names.push_back(std::move(name));
+         }
+     }
+ 
+@@ -520,7 +535,14 @@
+         if (array == 0u || count >= capacity) continue;
+         const std::uint32_t at = array + count * kEntrySize;
+         if (!memory.contains(at, kEntrySize)) continue;
+-        const std::uint64_t size = entry.file_size(error);
++        std::uint64_t size = entry.file_size(error);
++        // An encrypted secure file holds 16 bytes more than the data the game
++        // wrote, and the PSP reports the game's size. Valkyria Chronicles II
++        // compares these sizes with what it saved and deletes the save as
++        // corrupt when they differ.
++        if (kind == 0u && size >= 16u &&
++            std::find(encrypted_names.begin(), encrypted_names.end(), name) != encrypted_names.end())
++            size -= 16u;
+         const auto written = entry.last_write_time(error);
+         memory.store32(at, 0x21FFu);  // a file, readable and writable
+         memory.store32(at + 4u, 0u);
+@@ -536,6 +558,83 @@
+     return result::kOk;
+ }
+ 
++// The data modes (MAKEDATA, READDATA, WRITEDATA, their SECURE forms, ERASE
++// and DELETEDATA) work on one save folder with no dialog and report the RW_
++// family of errors. Traced in Valkyria Chronicles II (ULES01417): on first
++// boot it makes its system save with MAKEDATASECURE (no file name, no
++// buffer) and then writes DATA0-DATA4 into it with WRITEDATASECURE.
++
++// PARAM.SFO text a data request leaves empty keeps what the folder has.
++void keep_existing_text(const savedata::SaveFiles &files, savedata::SaveContents &contents) {
++    std::ifstream in(savedata::save_folder(state().memory_stick, files) / "PARAM.SFO", std::ios::binary);
++    if (!in) return;
++    const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
++    const auto sfo = savedata::ParamSfo::parse(bytes);
++    if (!sfo) return;
++    if (contents.title.empty()) contents.title = sfo->string("TITLE").value_or("");
++    if (contents.savedata_title.empty()) contents.savedata_title = sfo->string("SAVEDATA_TITLE").value_or("");
++    if (contents.detail.empty()) contents.detail = sfo->string("SAVEDATA_DETAIL").value_or("");
++    if (contents.parental_level == 0u) contents.parental_level = sfo->integer("PARENTAL_LEVEL").value_or(0u);
++}
++
++// MAKEDATA and WRITEDATA: write the folder, PARAM.SFO and any media the game
++// passes, and the data file when the request names one and supplies a buffer.
++std::uint32_t do_write_data(psprecomp::GuestMemory &memory, std::uint32_t params, const std::string &save_name,
++                            bool secure) {
++    auto files = files_for(memory, params, save_name);
++    if (files.game_name.empty()) return result::kRwBadParams;
++    files.secure = secure;
++    if (memory.load32(params + param::kDataBuf) == 0u) files.file_name.clear();
++    savedata::SaveContents contents = contents_from(memory, params);
++    keep_existing_text(files, contents);
++    std::string error;
++    if (!savedata::write_save(state().memory_stick, files, contents, error)) {
++        std::cerr << "[savedata] write failed: " << error << "\n";
++        return result::kSaveAccessError;
++    }
++    std::cerr << "[savedata] wrote " << (files.file_name.empty() ? std::string("PARAM.SFO") : files.file_name) << " ("
++              << contents.data.size() << " bytes) to " << savedata::save_folder(state().memory_stick, files).string()
++              << (secure ? " [secure]" : "") << (files.key ? " (encrypted)" : "") << "\n";
++    return result::kOk;
++}
++
++// READDATA: the named file of an existing save, into the game's buffer.
++std::uint32_t do_read_data(psprecomp::GuestMemory &memory, std::uint32_t params, const std::string &save_name) {
++    const auto files = files_for(memory, params, save_name);
++    if (files.game_name.empty() || files.file_name.empty()) return result::kRwBadParams;
++    const std::filesystem::path folder = savedata::save_folder(state().memory_stick, files);
++    std::error_code error;
++    if (!std::filesystem::is_directory(folder, error)) return result::kRwNoData;
++    if (!std::filesystem::is_regular_file(folder / files.file_name, error)) return result::kRwFileNotFound;
++    switch (const std::uint32_t outcome = do_load(memory, params, save_name)) {
++    case result::kLoadNoData:
++        return result::kRwNoData;
++    case result::kLoadDataBroken:
++        return result::kRwDataBroken;
++    case result::kLoadParam:
++        return result::kRwBadParams;
++    default:
++        return outcome;
++    }
++}
++
++// ERASE: one file of an existing save.
++std::uint32_t do_erase(psprecomp::GuestMemory &memory, std::uint32_t params, const std::string &save_name) {
++    const auto files = files_for(memory, params, save_name);
++    std::error_code error;
++    if (!std::filesystem::is_directory(savedata::save_folder(state().memory_stick, files), error))
++        return result::kRwNoData;
++    if (!savedata::erase_file(state().memory_stick, files)) return result::kRwFileNotFound;
++    std::cerr << "[savedata] erased " << files.file_name << " from "
++              << savedata::save_folder(state().memory_stick, files).string() << "\n";
++    return result::kOk;
++}
++
++// DELETEDATA: the whole save folder.
++std::uint32_t do_delete_data(psprecomp::GuestMemory &memory, std::uint32_t params, const std::string &save_name) {
++    return do_delete(memory, params, save_name) == result::kOk ? result::kOk : result::kRwNoData;
++}
++
+ std::uint32_t run_request(psprecomp::GuestMemory &memory, std::uint32_t params) {
+     const std::uint32_t mode = memory.load32(params + param::kMode);
+     const std::string save_name = save_name_at(memory, params + param::kSaveName);
+@@ -581,6 +680,20 @@
+         return do_list(memory, params);
+     case kFiles:
+         return do_files(memory, params, save_name);
++    case kMakeDataSecure:
++    case kWriteDataSecure:
++        return do_write_data(memory, params, save_name, true);
++    case kMakeData:
++    case kWriteData:
++        return do_write_data(memory, params, save_name, false);
++    case kReadDataSecure:
++    case kReadData:
++        return do_read_data(memory, params, save_name);
++    case kEraseSecure:
++    case kErase:
++        return do_erase(memory, params, save_name);
++    case kDeleteData:
++        return do_delete_data(memory, params, save_name);
+     default:
+         // Not used by this game. Report a parameter error so the guest takes
+         // its failure path instead of reading results that were never written.
+--- a/host/save_data/savedata_store.hpp
++++ b/host/save_data/savedata_store.hpp
+@@ -18,6 +18,10 @@
+     std::string save_name;   // appended to the game name; may be empty
+     std::string file_name;   // the data file, e.g. "DATA.BIN"
+     std::optional<Block> key;  // game key; saves are encrypted with it, and plain without one
++    // Written by a *SECURE data mode: the file is named in PARAM.SFO's
++    // SAVEDATA_FILE_LIST even when there is no key to encrypt it, so FILES
++    // reports it as secure the way a PSP does.
++    bool secure = false;
+ };
+ 
+ struct SaveContents {
+@@ -50,6 +54,9 @@
+ bool write_save(const std::filesystem::path &memory_stick, const SaveFiles &files, const SaveContents &contents,
+                 std::string &error);
+ bool delete_save(const std::filesystem::path &memory_stick, const SaveFiles &files);
++// Removes one data file from an existing save folder (ERASE); false when it
++// is not there.
++bool erase_file(const std::filesystem::path &memory_stick, const SaveFiles &files);
+ 
+ // Total size of the folder's files in bytes, 0 when it does not exist.
+ [[nodiscard]] std::uint64_t save_size(const std::filesystem::path &memory_stick, const SaveFiles &files);
+--- a/host/save_data/savedata_store.cpp
++++ b/host/save_data/savedata_store.cpp
+@@ -156,10 +156,14 @@
+             std::copy_n(list->begin(), std::min(list->size(), file_list.size()), file_list.begin());
+     }
+ 
++    // MAKEDATA writes the folder and PARAM.SFO alone: there is no data file.
++    const bool has_data_file = !files.file_name.empty();
+     std::vector<std::uint8_t> stored;
+-    if (files.key) {
+-        stored = encrypt_data(contents.data, kSaveMode, &*files.key, random_block());
+-        const Block hash = data_file_hash(stored, kSaveMode, &*files.key);
++    if (has_data_file && (files.key || files.secure)) {
++        stored = files.key ? encrypt_data(contents.data, kSaveMode, &*files.key, random_block()) : contents.data;
++        // A plain secure file is listed with a zero hash: load_save checks
++        // hashes only for encrypted saves.
++        const Block hash = files.key ? data_file_hash(stored, kSaveMode, &*files.key) : Block{};
+         // Replace this file's entry, or take the first free one.
+         std::size_t slot = file_list.size();
+         for (std::size_t offset = 0; offset < file_list.size(); offset += kFileListEntrySize) {
+@@ -208,7 +212,7 @@
+     // The data file first and PARAM.SFO last: PARAM.SFO carries the data
+     // file's hash, so a save interrupted in between is reported as broken
+     // rather than loaded with mismatched contents.
+-    if (!write_file(folder / files.file_name, stored)) {
++    if (has_data_file && !write_file(folder / files.file_name, stored)) {
+         error = "cannot write " + files.file_name;
+         return false;
+     }
+@@ -225,6 +229,12 @@
+     return !ec && removed > 0u;
+ }
+ 
++bool erase_file(const std::filesystem::path &memory_stick, const SaveFiles &files) {
++    if (files.file_name.empty()) return false;
++    std::error_code ec;
++    return std::filesystem::remove(save_folder(memory_stick, files) / files.file_name, ec) && !ec;
++}
++
+ std::uint64_t save_size(const std::filesystem::path &memory_stick, const SaveFiles &files) {
+     std::error_code ec;
+     std::uint64_t total = 0u;

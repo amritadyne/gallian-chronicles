@@ -1,0 +1,60 @@
+--- a/host/gpu/ge_state.hpp	2026-11-06 23:13:30.572466084 +0000
++++ b/host/gpu/ge_state.hpp	2026-11-06 23:13:30.614284439 +0000
+@@ -253,6 +253,13 @@
+     std::uint32_t bytes_per_pixel{};
+ };
+ 
++// Optional observer of every draw the display-list path builds, with the list
++// address of its PRIM command, called just before the draw reaches the sink.
++// A game profile uses it to check a draw description it built another way
++// (e.g. from the game's own graphics-library calls) against this one.
++using DrawObserver = void (*)(const DrawCall &call, std::uint32_t primitive_address);
++void set_draw_observer(DrawObserver observer) noexcept;
++
+ // Executes display lists and reports the draw calls they produce. The backend
+ // installs a sink; with no sink the lists are still parsed (for callbacks).
+ class GeState {
+@@ -354,6 +361,7 @@
+     std::uint64_t unhandled_commands_{};
+     bool raw_vertices_{};
+     bool raw_also_decoded_{};
++    std::uint32_t primitive_address_{};  // list address of the PRIM being drawn
+ };
+ 
+ // Copies the game makes out of VRAM with the DMA controller, remembered for
+--- a/host/gpu/ge_state.cpp	2026-11-06 23:13:30.572920467 +0000
++++ b/host/gpu/ge_state.cpp	2026-11-06 23:13:30.614357792 +0000
+@@ -170,6 +170,8 @@
+     return value;
+ }
+ 
++DrawObserver g_draw_observer = nullptr;
++
+ std::uint32_t expand_color(std::uint32_t value, std::uint32_t format) {
+     switch (format) {
+     case 4u: {  // 5650
+@@ -985,6 +987,8 @@
+                   << entry.first_value << std::dec << "\n";
+ }
+ 
++void set_draw_observer(DrawObserver observer) noexcept { g_draw_observer = observer; }
++
+ void GeState::fill_draw_state(DrawCall &call) const {
+     call.through = (vertex_type_ & (1u << 23u)) != 0u;
+     call.texture = texture_;
+@@ -1140,6 +1144,7 @@
+ 
+     ++draw_count_;
+     vertex_count_ += call.raw_vertices != nullptr ? call.raw_count : call.vertices.size();
++    if (g_draw_observer != nullptr) g_draw_observer(call, primitive_address_);
+     if (draw_sink_) draw_sink_(call);
+ }
+ 
+@@ -1492,6 +1497,7 @@
+             continue;
+         }
+         case kPrimitive:
++            primitive_address_ = pc - 4u;
+             draw_primitive(memory, data);
+             continue;
+         case kBezier:

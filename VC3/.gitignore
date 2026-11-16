@@ -1,0 +1,13 @@
+# Made from the game (the disc image, its executable, the code translated from
+# it) and everything else local: never committed.
+/*.iso
+/analysis/
+/game/
+/generated/
+/out/
+/portablekit/out/
+/editions/
+/logs/
+/resources/vc3.ico
+/VC3_E2_EN_texture_pack_*/
+/baton-pass.state.json

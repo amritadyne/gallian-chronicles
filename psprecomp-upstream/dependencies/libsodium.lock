@@ -1,0 +1,14 @@
+# libsodium dependency record (online play: encryption and key exchange)
+#
+# Fetched by profiles/vc2/cmake/vc2_libsodium.cmake when missing, with the
+# system curl, and used only when its SHA-256 matches. Linked statically.
+
+repository = https://github.com/jedisct1/libsodium
+release = 1.0.22
+archive = libsodium-1.0.22-mingw.tar.gz
+url = https://github.com/jedisct1/libsodium/releases/download/1.0.22-RELEASE/libsodium-1.0.22-mingw.tar.gz
+sha256 = 1d99e0afaf27bce664249232e9dc628ae6bb7b49f0ab53ad6db372b028a35d9d
+license = ISC
+linkage = static
+retrieved_utc = 2026-11-14
+purpose = Online play: X25519 key exchange, BLAKE2b, HMAC-SHA-512-256, XChaCha20-Poly1305 (profiles/vc2/host/online)

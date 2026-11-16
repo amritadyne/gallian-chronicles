@@ -1,0 +1,26 @@
+#pragma once
+
+#include "psprecomp/decoder.hpp"
+
+#include <string_view>
+
+namespace psprecomp::codegen {
+
+// PSP cache-maintenance instructions operate on a cache that does not exist in
+// the native host mapping.  Guest RAM is already coherent, so CACHE is only a
+// hint here and must not become a host synchronization point.  SYNC remains a
+// real ordering operation.
+[[nodiscard]] constexpr std::string_view memory_ordering_statement(OpcodeKind kind) noexcept {
+    switch (kind) {
+    case OpcodeKind::Sync:
+        // A plain fence: generated code sees only corpus_abi.hpp, which has
+        // no GuestMemory to ask.
+        return "    std::atomic_thread_fence(std::memory_order_seq_cst);\n";
+    case OpcodeKind::Cache:
+        return "    // PSP CACHE is a no-op in coherent host memory.\n";
+    default:
+        return {};
+    }
+}
+
+} // namespace psprecomp::codegen

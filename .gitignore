@@ -1,0 +1,73 @@
+# Gallian Chronicles: what never enters the repository (docs/GAME_FILES.md).
+
+# Disc images and executables of the games
+*.iso
+*.cso
+*.zso
+EBOOT.BIN
+EBOOT.ELF
+*.ELF
+*.elf
+PSP_GAME/
+PSP_DATA/
+SAVEDATA/
+
+# Code translated from the games' executables
+/psprecomp-upstream/profiles/*/generated/
+/psprecomp-upstream/profiles/*/generated-variants/
+/psprecomp-upstream/profiles/*/overlays/
+/VC3/generated/
+
+# Installed data, dumps, captures, logs, saves
+/psprecomp-upstream/profiles/*/game/
+/psprecomp-upstream/profiles/*/analysis/
+/psprecomp-upstream/profiles/*/progress/
+/psprecomp-upstream/profiles/*/captures/
+/psprecomp-upstream/profiles/*/data/captures/
+/VC3/game/
+/VC3/analysis/
+/VC3/logs/
+/VC3/editions/
+/VC3/VC3_E2_EN_texture_pack_*/
+/VC3/baton-pass.state.json
+*.decrypted
+*.pkl
+
+# The games' text and rewrites of it
+*-text-overrides*.json
+*-text-index*.tsv
+*-script-originals*.json
+
+# The games' artwork
+/psprecomp-upstream/profiles/vc2/resources/vc2native.ico
+/VC3/resources/vc3.ico
+*texture_pack*/
+*Texture Pack*/
+*Texture Dump*/
+*_DLC/
+*.EDAT
+*.PBP
+*.SFO
+
+# Build output and downloaded third-party trees
+out/
+/psprecomp-upstream/third_party/PortableKit/
+/psprecomp-upstream/third_party/SDL3-*/
+/psprecomp-upstream/third_party/libsodium-*/
+/work/
+/release/
+*.exe
+*.dll
+*.lib
+*.a
+*.o
+*.obj
+*.pdb
+*.log
+
+# Editors and tools
+.vs/
+.vscode/
+.idea/
+__pycache__/
+*.pyc

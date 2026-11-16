@@ -1,0 +1,22 @@
+# FFmpeg runtime dependency record
+#
+# PortableKit fetches this dynamic LGPL build when PORTABLEKIT_FFMPEG=bundled.
+# It is a development/runtime dependency only; no FFmpeg source or game media
+# is copied into this repository.
+
+provider = BtbN FFmpeg-Builds
+release = n7.1.5-1-g7d0e842004
+archive = ffmpeg-n7.1.5-1-g7d0e842004-win64-lgpl-shared-7.1.zip
+url = https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34/ffmpeg-n7.1.5-1-g7d0e842004-win64-lgpl-shared-7.1.zip
+sha256 = 03a8003e245c08df4277d7b0adc50b93a97ddd4a3aaafea21943c4384df59895
+verified_utc = 2026-11-06
+license = LGPL-2.1-or-later
+linkage = dynamic
+runtime_dlls = avcodec-61.dll, avutil-59.dll, swresample-5.dll
+purpose = ATRAC/H.264/PSMF support for VC2 streamed audio and movies
+
+# CMake's download attempt was rejected by the local certificate chain before
+# writing an archive.  The same pinned URL was then retrieved with curl using
+# Windows Schannel verification and accepted only after its SHA-256 matched the
+# framework-pinned value above.  PortableKit places its upstream source and
+# license notices alongside the runtime DLLs in the local build output.

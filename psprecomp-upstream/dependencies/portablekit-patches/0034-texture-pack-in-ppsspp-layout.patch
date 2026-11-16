@@ -1,0 +1,56 @@
+Texture packs in a PPSSPP layout: a chosen folder without its own textures.ini uses the
+folder for this game up to two folders down (PSP/TEXTURES/<game id>): named after the game id,
+else one whose textures.ini names the game in [games], else the only one with a textures.ini. (2026-11-15)
+
+--- a/host/gpu/texture_pack.cpp
++++ b/host/gpu/texture_pack.cpp
+@@ -297,15 +297,45 @@
+     return games;
+ }
+ 
+-std::unique_ptr<TexturePack> TexturePack::parse(const std::filesystem::path &directory, const std::string &game_id,
++namespace {
++// A pack as PPSSPP lays it out (PSP/TEXTURES/<game id>/textures.ini), chosen
++// one or two folders up (TEXTURES, or PSP): the folder for this game inside
++// it. That is a folder named after the game id, else one whose textures.ini
++// names the game in [games], else the only folder with a textures.ini. The
++// folder itself when it has its own textures.ini (or none of these is found).
++std::filesystem::path pack_folder(const std::filesystem::path &directory, const std::string &game_id) {
++    std::error_code ec;
++    if (std::filesystem::exists(directory / "textures.ini", ec)) return directory;
++    std::vector<std::filesystem::path> with_ini;
++    const auto look = [&](const std::filesystem::path &folder) {
++        for (const auto &entry : std::filesystem::directory_iterator(folder, ec))
++            if (entry.is_directory(ec) && std::filesystem::exists(entry.path() / "textures.ini", ec))
++                with_ini.push_back(entry.path());
++    };
++    look(directory);
++    for (const auto &entry : std::filesystem::directory_iterator(directory, ec))
++        if (entry.is_directory(ec)) look(entry.path());
++    for (const std::filesystem::path &folder : with_ini)
++        if (!game_id.empty() && lower(folder.filename().string()) == lower(game_id)) return folder;
++    for (const std::filesystem::path &folder : with_ini) {
++        const std::vector<std::string> games = texture_pack_games(folder / "textures.ini");
++        if (std::find(games.begin(), games.end(), game_id) != games.end()) return folder;
++    }
++    return with_ini.size() == 1u ? with_ini.front() : directory;
++}
++}  // namespace
++
++std::unique_ptr<TexturePack> TexturePack::parse(const std::filesystem::path &chosen, const std::string &game_id,
+                                                 std::string &error) {
+     std::unique_ptr<TexturePack> pack(new TexturePack());
+-    pack->directory_ = directory;
+     std::error_code ec;
+-    if (!std::filesystem::is_directory(directory, ec)) {
+-        error = "no texture pack folder at " + directory.string();
++    if (!std::filesystem::is_directory(chosen, ec)) {
++        error = "no texture pack folder at " + chosen.string();
+         return nullptr;
+     }
++    const std::filesystem::path directory = pack_folder(chosen, game_id);
++    if (directory != chosen) std::cerr << "[texpack] using " << directory.string() << " (the pack's folder for " << game_id << ")\n";
++    pack->directory_ = directory;
+     if (std::filesystem::exists(directory / "textures.zip", ec) && !std::filesystem::exists(directory / "textures.ini", ec)) {
+         error = "zipped packs (textures.zip) are not supported; unpack it into " + directory.string();
+         return nullptr;

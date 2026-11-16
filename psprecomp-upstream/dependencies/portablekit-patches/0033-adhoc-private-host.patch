@@ -1,0 +1,144 @@
+Online play support: the built-in server can listen on 127.0.0.1 alone and go
+unannounced (adhoc_host_set_private), for a game whose own encrypted session layer
+carries its players to it; and a server address for this run only
+(adhoc_set_session_server), not saved among the settings or recent ones. (2026-11-14)
+
+--- a/host/adhoc/server.cpp
++++ b/host/adhoc/server.cpp
+@@ -49,8 +49,8 @@
+ }
+ 
+ // A listening TCP socket on every interface: IPv6 with IPv4 mapped where the
+-// system has IPv6, IPv4 alone otherwise.
+-Socket open_listener(std::uint16_t port, std::string &error) {
++// system has IPv6, IPv4 alone otherwise. With `loopback_only`, on 127.0.0.1.
++Socket open_listener(std::uint16_t port, std::string &error, bool loopback_only = false) {
+     const auto finish = [](Socket s) {
+         if (::listen(s, 64) != 0 || !set_nonblocking(s)) {
+             close_socket(s);
+@@ -65,7 +65,7 @@
+         set_option(s, SOL_SOCKET, SO_REUSEADDR, 1);
+ #endif
+     };
+-    Socket s = ::socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
++    Socket s = loopback_only ? kNoSocket : ::socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+     if (s != kNoSocket) {
+         prepare(s);
+         set_option(s, IPPROTO_IPV6, IPV6_V6ONLY, 0);
+@@ -89,7 +89,7 @@
+     prepare(s);
+     sockaddr_in address{};
+     address.sin_family = AF_INET;
+-    address.sin_addr.s_addr = htonl(INADDR_ANY);
++    address.sin_addr.s_addr = htonl(loopback_only ? INADDR_LOOPBACK : INADDR_ANY);
+     address.sin_port = htons(port);
+     if (::bind(s, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) != 0) {
+         const int failure = socket_error();
+@@ -722,8 +722,8 @@
+     Impl &s = *impl_;
+     std::string error;
+     const std::uint16_t relay_port = relay_port_for(config.adhocctl_port);
+-    Socket ctl = open_listener(config.adhocctl_port, error);
+-    Socket relay = ctl == kNoSocket ? kNoSocket : open_listener(relay_port, error);
++    Socket ctl = open_listener(config.adhocctl_port, error, config.loopback_only);
++    Socket relay = ctl == kNoSocket ? kNoSocket : open_listener(relay_port, error, config.loopback_only);
+     if (ctl == kNoSocket || relay == kNoSocket) {
+         if (ctl != kNoSocket) close_socket(ctl);
+         log_event("cannot start: " + error, true);
+@@ -750,8 +750,9 @@
+         s.status_snapshot.relay_port = relay_port;
+     }
+     s.thread = std::thread([&s] { s.run(); });
+-    log_event("listening on TCP " + std::to_string(config.adhocctl_port) + " (matchmaking) and " +
+-                  std::to_string(relay_port) + " (relay)",
++    log_event(std::string(config.loopback_only ? "listening on 127.0.0.1 TCP " : "listening on TCP ") +
++                  std::to_string(config.adhocctl_port) + " (matchmaking) and " + std::to_string(relay_port) +
++                  " (relay)",
+               true);
+     return true;
+ }
+--- a/host/adhoc/server.hpp
++++ b/host/adhoc/server.hpp
+@@ -40,6 +40,9 @@
+ 
+ struct ServerConfig {
+     std::uint16_t adhocctl_port{kAdhocctlPort};  // the relay listens on relay_port_for() this
++    // Listen on 127.0.0.1 alone: only this PC's programs can connect (a game
++    // hosting an online session, whose players come through it).
++    bool loopback_only{};
+     // Written to the network log as it happens; to the console as well when
+     // set, as in the standalone server.
+     bool print_events{};
+--- a/host/adhoc/session.hpp
++++ b/host/adhoc/session.hpp
+@@ -44,6 +44,14 @@
+ // once when the game ends, however it ends, before static destructors run.
+ void adhoc_shutdown() noexcept;
+ 
++// Online play (a game's own session layer): while set, the built-in server
++// listens on 127.0.0.1 alone and is not announced on the local network; the
++// game's players reach it through that layer.
++void adhoc_host_set_private(bool private_only);
++// Online play, joining: the server this instance's game uses, for this run
++// only (not saved, not among the recent ones). Empty: the Server setting.
++void adhoc_set_session_server(const std::string &address);
++
+ // Joining: makes `address` ("host" or "host:port") the server, remembers it
+ // among the recent ones, turns ad hoc play on and uses it at once. Stops
+ // hosting first if this instance hosts.
+--- a/host/adhoc/host.cpp
++++ b/host/adhoc/host.cpp
+@@ -24,6 +24,8 @@
+     adhoc::Server server;
+     std::string error;
+     std::uint16_t port{};
++    bool private_only{};
++    std::string session_server;
+ };
+ 
+ // Never destroyed: the discovery thread asks the server for its player count
+@@ -49,9 +51,27 @@
+         const std::uint16_t port = host().port;
+         return port == adhoc::kAdhocctlPort ? std::string("127.0.0.1") : "127.0.0.1:" + std::to_string(port);
+     }
++    {
++        std::lock_guard lock(host().mutex);
++        if (!host().session_server.empty()) return host().session_server;
++    }
+     return settings::current().adhoc_server;
+ }
+ 
++void adhoc_host_set_private(bool private_only) {
++    std::lock_guard lock(host().mutex);
++    host().private_only = private_only;
++}
++
++void adhoc_set_session_server(const std::string &address) {
++    {
++        std::lock_guard lock(host().mutex);
++        host().session_server = address;
++    }
++    adhoc::Client::log("[adhoc] " + (address.empty() ? std::string("the Server setting again")
++                                                     : "this run's server: " + address), true);
++}
++
+ bool adhoc_host_start() {
+     HostState &state = host();
+     {
+@@ -59,6 +79,7 @@
+         if (state.server.running()) return true;
+         adhoc::ServerConfig config;
+         config.adhocctl_port = static_cast<std::uint16_t>(settings::current().adhoc_host_port);
++        config.loopback_only = state.private_only;
+         if (!state.server.start(config)) {
+             state.error = state.server.status().error;
+             return false;
+@@ -66,7 +87,7 @@
+         state.error.clear();
+         state.port = config.adhocctl_port;
+         adhoc::Server *server = &state.server;
+-        adhoc::Discovery::get().start_announcing(config.adhocctl_port, [server] {
++        if (!state.private_only) adhoc::Discovery::get().start_announcing(config.adhocctl_port, [server] {
+             adhoc::Announcement info;
+             info.name = adhoc_player_name();
+             info.product = portablekit::game().adhoc_product_code;

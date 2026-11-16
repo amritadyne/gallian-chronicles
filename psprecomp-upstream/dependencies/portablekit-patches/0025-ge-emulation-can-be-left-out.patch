@@ -1,0 +1,84 @@
+--- a/host/gpu/ge_state.cpp	2026-11-11 19:27:27.149398182 +0000
++++ b/host/gpu/ge_state.cpp	2026-11-11 19:27:27.197735413 +0000
+@@ -160,11 +160,11 @@
+ 
+ // GE pointers carry their high byte in the companion width register; when that
+ // byte is zero the address is an offset inside VRAM.
+-std::uint32_t resolve_ge_address(std::uint32_t address) {
++[[maybe_unused]] std::uint32_t resolve_ge_address(std::uint32_t address) {
+     return (address & 0xFF000000u) == 0u ? (address | 0x04000000u) : address;
+ }
+ 
+-float decode_float24(std::uint32_t data) {
++[[maybe_unused]] float decode_float24(std::uint32_t data) {
+     const std::uint32_t bits = data << 8u;
+     float value{};
+     std::memcpy(&value, &bits, sizeof(value));
+@@ -174,7 +174,7 @@
+ DrawObserver g_draw_observer = nullptr;
+ NativeDrawSource g_native_draw_source = nullptr;
+ 
+-std::uint32_t expand_color(std::uint32_t value, std::uint32_t format) {
++[[maybe_unused]] std::uint32_t expand_color(std::uint32_t value, std::uint32_t format) {
+     switch (format) {
+     case 4u: {  // 5650
+         const std::uint32_t r = (value & 0x1Fu) * 255u / 31u;
+@@ -201,11 +201,11 @@
+     }
+ }
+ 
+-std::uint32_t align_up(std::uint32_t value, std::uint32_t alignment) {
++[[maybe_unused]] std::uint32_t align_up(std::uint32_t value, std::uint32_t alignment) {
+     return (value + alignment - 1u) & ~(alignment - 1u);
+ }
+ 
+-void identity(std::array<float, 16> &matrix) {
++[[maybe_unused]] void identity(std::array<float, 16> &matrix) {
+     matrix.fill(0.0f);
+     matrix[0] = matrix[5] = matrix[10] = matrix[15] = 1.0f;
+ }
+@@ -596,6 +596,11 @@
+     return stride;
+ }
+ 
++#if !defined(PORTABLEKIT_NO_GE_EMULATION)
++// The GE emulation: register commands, primitives, patches and the list
++// runner. A port whose display lists the GE never draws from (all of its draws
++// made on the host) builds with PORTABLEKIT_NO_GE_EMULATION and leaves all of
++// it out; GeState::execute then refuses every list.
+ void GeState::handle_command(const GuestMemory &memory, std::uint32_t command, std::uint32_t data) {
+     registers_[command] = data;
+     // Which of 0x53..0x5C actually carries the colour the guest sets is worth
+@@ -921,6 +926,7 @@
+         break;
+     }
+ }
++#endif  // !PORTABLEKIT_NO_GE_EMULATION
+ 
+ namespace {
+ 
+@@ -1009,6 +1015,7 @@
+     return g_texture_override_generation.load(std::memory_order_acquire);
+ }
+ 
++#if !defined(PORTABLEKIT_NO_GE_EMULATION)
+ void GeState::fill_draw_state(DrawCall &call) const {
+     call.through = (vertex_type_ & (1u << 23u)) != 0u;
+     call.texture = texture_;
+@@ -1540,5 +1547,16 @@
+     }
+     return pc;
+ }
++#else
++// Built without the GE emulation: a list handed to the GE is not run.
++std::uint32_t GeState::execute(const GuestMemory &, std::uint32_t pc, std::uint32_t, bool &finished) {
++    static std::atomic<std::uint64_t> refused{0u};
++    if (refused.fetch_add(1u) < 5u)
++        std::cerr << "[ge] a display list was handed to the GE at " << psprecomp::hex32(pc)
++                  << ", but this build has no GE emulation (PORTABLEKIT_NO_GE_EMULATION): not run\n";
++    finished = true;
++    return pc;
++}
++#endif  // !PORTABLEKIT_NO_GE_EMULATION
+ 
+ } // namespace portablekit::gpu

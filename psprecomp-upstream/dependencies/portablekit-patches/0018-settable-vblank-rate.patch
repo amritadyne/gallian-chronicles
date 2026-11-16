@@ -1,0 +1,106 @@
+Subject: [PATCH 0018] Vblank rate a game profile can set
+
+Kernel::set_vblank_period_us / vblank_period_us: the kernel's vblanks come
+at the PSP's 59.94 Hz unless a game profile sets another rate (VC2's first
+high-frame-rate experiment, VC2_TICK_HZ: its frames are counted in
+vblanks). Everything timed from vblanks follows the kernel's period: the
+flip's frame grid, sceDisplayWaitVblank's blank window, the hcount and
+sceDisplayIsVblank. kVBlankPeriodUs stays as the PSP's own period.
+
+diff -ru a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+--- a/host/hle/hle_media.cpp	2026-11-08 00:20:24.953456261 +0000
++++ b/host/hle/hle_media.cpp	2026-11-08 00:20:37.114397672 +0000
+@@ -252,7 +252,7 @@
+ std::uint64_t frame_start_us(std::uint64_t latest_vblank_us) {
+     static std::uint64_t previous = 0u;
+     static bool known = false;
+-    static const std::uint64_t kStep = std::max<std::uint64_t>(portablekit::game().frame_vblanks, 1u) * kVBlankPeriodUs;
++    const std::uint64_t kStep = std::max<std::uint64_t>(portablekit::game().frame_vblanks, 1u) * kernel().vblank_period_us();
+     std::uint64_t start = latest_vblank_us;
+     if (known && latest_vblank_us >= previous + kStep && latest_vblank_us < previous + 3u * kStep)
+         start = previous + kStep * ((latest_vblank_us - previous) / kStep);
+@@ -635,7 +635,8 @@
+ 
+ // How long the display's vertical blank lasts at the start of each 16.683 ms
+ // period: 14 of its 286 lines.
+-constexpr std::uint64_t kVBlankDurationUs = kVBlankPeriodUs * 14u / 286u;
++// The last 14 of the frame's 286 lines, at the kernel's vblank rate.
++std::uint64_t vblank_duration_us() { return kernel().vblank_period_us() * 14u / 286u; }
+ 
+ // Waiting for the display to start its vertical blank, which is how a game
+ // paces its frame loop. Without these the loop spins: a stub returns at once,
+@@ -664,7 +665,7 @@
+     hle.add("sceDisplay", "sceDisplayWaitVblank", [](Runtime &, AllegrexContext &ctx) {
+         trace_pacing("sceDisplayWaitVblank");
+         static const bool returns = portablekit::env("VBLANK_WAIT_RETURNS") != nullptr;
+-        if (returns || kernel().now_us() - kernel().last_vblank_us() < kVBlankDurationUs) {
++        if (returns || kernel().now_us() - kernel().last_vblank_us() < vblank_duration_us()) {
+             kernel().finish(ctx, 1u);
+             return;
+         }
+@@ -694,12 +695,12 @@
+     hle.add("sceDisplay", "sceDisplayGetCurrentHcount", [](Runtime &, AllegrexContext &ctx) {
+         log_once("display-hcount", "[display] sceDisplayGetCurrentHcount (UNVERIFIED: no game traced yet)");
+         const std::uint64_t since = kernel().now_us() - kernel().last_vblank_us();
+-        kernel().finish(ctx, static_cast<std::uint32_t>(since * 286u / 16683u % 286u));
++        kernel().finish(ctx, static_cast<std::uint32_t>(since * 286u / kernel().vblank_period_us() % 286u));
+     });
+     hle.add("sceDisplay", "sceDisplayIsVblank", [](Runtime &, AllegrexContext &ctx) {
+         log_once("display-isvblank", "[display] sceDisplayIsVblank (UNVERIFIED: no game traced yet)");
+         const std::uint64_t since = kernel().now_us() - kernel().last_vblank_us();
+-        kernel().finish(ctx, since * 286u / 16683u % 286u >= 272u ? 1u : 0u);
++        kernel().finish(ctx, since * 286u / kernel().vblank_period_us() % 286u >= 272u ? 1u : 0u);
+     });
+     hle.add("sceDisplay", "sceDisplayGetVcount", [](Runtime &, AllegrexContext &ctx) {
+         trace_pacing("sceDisplayGetVcount", static_cast<std::int64_t>(kernel().vblank_count()));
+diff -ru a/host/kernel/kernel.cpp b/host/kernel/kernel.cpp
+--- a/host/kernel/kernel.cpp	2026-11-08 00:20:24.949900180 +0000
++++ b/host/kernel/kernel.cpp	2026-11-08 00:20:37.114015026 +0000
+@@ -590,7 +590,7 @@
+ 
+ void Kernel::process_timers() {
+     while (now_us_ >= next_vblank_us_) {
+-        next_vblank_us_ += kVBlankPeriodUs;
++        next_vblank_us_ += vblank_period_us_;
+         if (current_uid_ == 0) ++idle_vblanks_;
+         on_vblank();
+     }
+diff -ru a/host/kernel/kernel.hpp b/host/kernel/kernel.hpp
+--- a/host/kernel/kernel.hpp	2026-11-08 00:20:24.946354169 +0000
++++ b/host/kernel/kernel.hpp	2026-11-08 00:20:37.113719812 +0000
+@@ -84,6 +84,8 @@
+ // runtime was given rather than fixed, because the two are not the same
+ // console and a stack allocated past the end faults on first use.
+ 
++// The PSP's vblank period. The kernel's own can be set otherwise by a game
++// profile (Kernel::set_vblank_period_us), so read that one for timing.
+ inline constexpr std::uint64_t kVBlankPeriodUs = 16'683u;
+ inline constexpr std::uint64_t kHostWaitPollUs = 1'000u;
+ inline constexpr std::uint32_t kVBlankInterrupt = 30u;
+@@ -242,7 +244,17 @@
+     [[nodiscard]] std::uint64_t now_us() const noexcept { return now_us_; }
+     [[nodiscard]] std::uint64_t vblank_count() const noexcept { return vblank_count_; }
+     // Emulated time of the latest vblank, at or before now_us().
+-    [[nodiscard]] std::uint64_t last_vblank_us() const noexcept { return next_vblank_us_ - kVBlankPeriodUs; }
++    [[nodiscard]] std::uint64_t last_vblank_us() const noexcept { return next_vblank_us_ - vblank_period_us_; }
++    // Emulated microseconds between vblanks: the PSP's kVBlankPeriodUs unless
++    // a game profile sets its own rate (a game whose frames are counted in
++    // vblanks then runs that many more frames a second). The next vblank
++    // comes one new period after the latest.
++    [[nodiscard]] std::uint64_t vblank_period_us() const noexcept { return vblank_period_us_; }
++    void set_vblank_period_us(std::uint64_t period_us) noexcept {
++        const std::uint64_t last = last_vblank_us();
++        vblank_period_us_ = period_us < 1'000u ? 1'000u : period_us;
++        next_vblank_us_ = last + vblank_period_us_;
++    }
+     // Forgets how far emulated time was ahead of or behind real time. Called
+     // after the game was paused, so it resumes at normal speed rather than
+     // racing to make up the pause.
+@@ -425,6 +437,7 @@
+     std::uint64_t pacing_virtual_base_{};
+     IdleHook idle_hook_;
+     PollHook poll_hook_;
++    std::uint64_t vblank_period_us_{kVBlankPeriodUs};
+     std::uint64_t next_vblank_us_{kVBlankPeriodUs};
+     std::uint64_t vblank_count_{};
+     bool dispatch_enabled_{true};

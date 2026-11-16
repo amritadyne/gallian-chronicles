@@ -1,0 +1,102 @@
+Ad hoc streams: an accepted stream keeps what the game sends before its relay connection
+is open, and sends it once it is (on the PSP an accepted stream can send at once; VC2
+sends its first battle message straight after accepting and never again). A stream queues
+up to 256 KB for sending whatever buffer size the game gave it (VC2 sends about 18 KB
+of battle setup at once on an 8 KB stream and drops what does not go). (2026-11-14)
+
+--- a/host/adhoc/client.cpp
++++ b/host/adhoc/client.cpp
+@@ -52,6 +52,11 @@
+ // older pending connection is not worth accepting.
+ constexpr auto kPendingConnectionLife = milliseconds(4500);
+ constexpr std::size_t kMaxQueuedOutput = 512u * 1024u;
++// The most a stream queues for sending, whatever buffer size the game gave it.
++// On the PSP a stream's sends leave for the network as they are made, so a
++// game can send more in one go than its buffer holds (VC2's battle setup
++// sends about 18 KB on an 8 KB stream, and drops what does not go).
++constexpr std::size_t kStreamSendRoom = 256u * 1024u;
+ constexpr std::size_t kReadChunk = 16u * 1024u;
+ 
+ using net::Address;
+@@ -351,6 +356,9 @@
+     std::uint32_t retries_left{};
+     // Accept
+     bool accept_pending{};
++    // What the game sent on an accepted stream before its relay connection
++    // was opened (framed): on the PSP an accepted stream can send at once.
++    std::string early;
+     bool closing{};
+ };
+ 
+@@ -841,6 +849,8 @@
+                                     "ptp accept " + std::to_string(socket.local_port) + " <- " +
+                                         format_mac(socket.peer) + " port " + std::to_string(socket.peer_port));
+                     if (!socket.link.active()) socket.state = StreamState::Disconnected;
++                    else socket.link.output += socket.early;
++                    socket.early.clear();
+                 }
+                 if (socket.link.failed) {
+                     socket.link.failed = false;
+@@ -1514,7 +1524,7 @@
+     info.peer = socket.peer;
+     info.peer_port = socket.peer_port;
+     info.readable = socket.kind == StreamKind::Listen ? socket.backlog.size() : socket.received.size();
+-    info.unsent = socket.link.output.size();
++    info.unsent = socket.link.output.size() + socket.early.size();
+     // The game's data among the queued bytes. The game's stream messages are
+     // small, so the queue holds at most a block or two, each with a 4-byte
+     // size in front; before the relay link is up it holds the init record.
+@@ -1538,15 +1548,22 @@
+     auto found = impl_->streams.find(handle);
+     if (found == impl_->streams.end()) return 0u;
+     StreamSocket &socket = found->second;
+-    if (socket.state != StreamState::Established || !socket.link.active()) return 0u;
+-    const std::size_t queued = socket.link.output.size();
+-    const std::size_t room = queued >= socket.capacity ? 0u : socket.capacity - queued;
++    if (socket.state != StreamState::Established) return 0u;
++    // An accepted stream whose relay connection is not open yet keeps what
++    // the game sends until it is (VC2 sends its first message straight after
++    // sceNetAdhocPtpAccept, and does not send it again).
++    const bool early = socket.kind == StreamKind::Accept && socket.accept_pending;
++    if (!early && !socket.link.active()) return 0u;
++    std::string &output = early ? socket.early : socket.link.output;
++    const std::size_t queued = output.size();
++    const std::size_t limit = std::max(socket.capacity, kStreamSendRoom);
++    const std::size_t room = queued >= limit ? 0u : limit - queued;
+     const std::size_t count = std::min(size, room);
+     const char *bytes = static_cast<const char *>(data);
+     for (std::size_t done = 0; done < count;) {
+         const std::size_t block = std::min(count - done, relay::kPtpBlockMax);
+-        wire::put32(socket.link.output, static_cast<std::uint32_t>(block));
+-        socket.link.output.append(bytes + done, block);
++        wire::put32(output, static_cast<std::uint32_t>(block));
++        output.append(bytes + done, block);
+         done += block;
+     }
+     socket.sent_total += count;
+@@ -1554,7 +1571,9 @@
+         ++impl_->traffic.packets_out;
+         impl_->traffic.bytes_out += count;
+     }
+-    if (count != 0u) trace("relay > ptp " + std::to_string(handle) + " data " + std::to_string(count));
++    if (count != 0u)
++        trace("relay > ptp " + std::to_string(handle) + " data " + std::to_string(count) +
++              (early ? " (kept until the relay connection opens)" : ""));
+     return count;
+ }
+ 
+--- a/host/hle/hle_adhoc.cpp
++++ b/host/hle/hle_adhoc.cpp
+@@ -666,9 +666,9 @@
+     if (info.state != adhoc::StreamState::Established) return stream_error(info);
+     const std::uint32_t length = memory.load32(length_address);
+     if (length == 0u) return 0u;
+-    const std::size_t room = info.unsent >= info.capacity ? 0u : info.capacity - info.unsent;
+-    if (room == 0u) return std::nullopt;
+-    std::string bytes(std::min<std::size_t>(room, length), '\0');
++    // How much fits is the client's to say (it queues more than the game's
++    // buffer size: see kStreamSendRoom).
++    std::string bytes(std::min<std::uint32_t>(length, 256u * 1024u), '\0');
+     for (std::size_t i = 0; i < bytes.size(); ++i)
+         bytes[i] = static_cast<char>(memory.load8(data + static_cast<std::uint32_t>(i)));
+     const std::size_t sent = Client::get().ptp_send(handle, bytes.data(), bytes.size());

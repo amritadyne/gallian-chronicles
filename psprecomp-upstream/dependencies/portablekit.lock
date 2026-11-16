@@ -1,0 +1,11 @@
+# PortableKit dependency record
+#
+# Retrieval (do not place game data in this checkout):
+#   git clone https://github.com/TeamGDB/PortableKit.git third_party/PortableKit
+#   git -C third_party/PortableKit checkout --detach 33800c4060c53f3233e08f8ab2cc4590a0872063
+
+repository = https://github.com/TeamGDB/PortableKit.git
+revision = 33800c4060c53f3233e08f8ab2cc4590a0872063
+retrieved_utc = 2026-11-06
+license = MIT
+purpose = Native C++ AOT framework, Vulkan renderer, shared PSP host services, and development-time interpreter

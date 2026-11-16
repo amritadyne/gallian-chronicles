@@ -1,0 +1,528 @@
+diff -ru a/cmake/PortableKit.cmake b/cmake/PortableKit.cmake
+--- a/cmake/PortableKit.cmake	2026-11-12 01:47:01.030926036 +0000
++++ b/cmake/PortableKit.cmake	2026-11-12 01:47:01.110926040 +0000
+@@ -315,13 +315,12 @@
+                 "kGeCheckVertexShader=GE_RAW_VERTICES,GE_CHECK_DECODE@${PORTABLEKIT_ROOT}/host/gpu/shaders/ge.vert"
+                 "kGeFragmentShader=${PORTABLEKIT_ROOT}/host/gpu/shaders/ge.frag"
+                 "kLevelVertexShader=${PORTABLEKIT_ROOT}/host/gpu/shaders/level.vert"
+-                "kLevelFragmentShader=${PORTABLEKIT_ROOT}/host/gpu/shaders/level.frag")
+-            if(ANDROID)
+-                # Pre-rotation of the finished frame for a display turned sideways.
+-                list(APPEND shaders
+-                    "kRotateVertexShader=${PORTABLEKIT_ROOT}/host/gpu/shaders/rotate.vert"
+-                    "kRotateFragmentShader=${PORTABLEKIT_ROOT}/host/gpu/shaders/rotate.frag")
+-            endif()
++                "kLevelFragmentShader=${PORTABLEKIT_ROOT}/host/gpu/shaders/level.frag"
++                # Pre-rotation of the finished frame for a display turned
++                # sideways (Android), and, unturned, loading a picture into a
++                # multisampled target (every platform).
++                "kRotateVertexShader=${PORTABLEKIT_ROOT}/host/gpu/shaders/rotate.vert"
++                "kRotateFragmentShader=${PORTABLEKIT_ROOT}/host/gpu/shaders/rotate.frag")
+             set(shader_sources ${shaders})
+             list(TRANSFORM shader_sources REPLACE "^[A-Za-z]+=([A-Z_,]+@)?" "")
+             list(REMOVE_DUPLICATES shader_sources)
+diff -ru a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
+--- a/host/gpu/vulkan_renderer.cpp	2026-11-12 01:47:00.566926008 +0000
++++ b/host/gpu/vulkan_renderer.cpp	2026-11-12 01:47:00.570926008 +0000
+@@ -1120,6 +1120,20 @@
+         std::array<VkDescriptorSet, 2> copy_descriptors{};
+         std::uint64_t copy_serial{};
+         bool copy_valid{};
++        // Multisampling (video.msaa above 1): passes draw into `msaa`, which
++        // is resolved into `color` only when `color` is read (the game
++        // sampling it, write-back, presenting: resolve_msaa); everything
++        // else reads and writes `color`. Resolving at the end of every pass
++        // cost a third of the frame rate at 8x (2026-11-12). After `color`
++        // is written outside a pass (a movie frame, a resize), `msaa_stale`
++        // has the next pass load it into `msaa` first, through `msaa_load_*`.
++        VkImage msaa{};
++        VkDeviceMemory msaa_memory{};
++        VkImageView msaa_view{};
++        VkFramebuffer msaa_load_framebuffer{};
++        VkDescriptorSet msaa_load_set{};
++        bool msaa_stale{true};
++        bool msaa_unresolved{};  // drawn into since `color` was last resolved
+     };
+     std::map<std::uint32_t, Target> targets;
+     // Write-back of the displayed framebuffer to guest VRAM (write_back_frame):
+@@ -1254,6 +1268,28 @@
+     // a tiled GPU then does not read the target from memory first.
+     // <prefix>_NO_CLEAR_LOAD always loads, as before.
+     std::array<VkRenderPass, 4> discard_passes{};
++    // Samples per pixel of the targets (settings video.msaa, as far as the
++    // GPU allows); 1: no multisampling, as before.
++    VkSampleCountFlagBits msaa_samples{VK_SAMPLE_COUNT_1_BIT};
++    [[nodiscard]] bool multisampled() const { return msaa_samples != VK_SAMPLE_COUNT_1_BIT; }
++    void choose_msaa();
++    // Loading a target's resolved picture into its multisampled image: one
++    // triangle over the target, each sample taking the pixel's colour.
++    VkRenderPass msaa_load_pass{};
++    VkSampler msaa_load_sampler{};
++    VkDescriptorSetLayout msaa_load_set_layout{};
++    VkDescriptorPool msaa_load_pool{};
++    VkPipelineLayout msaa_load_layout{};
++    VkShaderModule msaa_load_vertex{};
++    VkShaderModule msaa_load_fragment{};
++    VkPipeline msaa_load_pipeline{};
++    bool create_msaa_load(std::string &error);
++    void destroy_msaa_load();
++    void load_msaa(VkCommandBuffer commands, Target &target);
++    void resolve_msaa(VkCommandBuffer commands, Target &target);
++    void resolve_all_msaa(VkCommandBuffer commands) {
++        for (auto &[address, target] : targets) resolve_msaa(commands, target);
++    }
+     VkExtent2D target_extent{};
+ 
+     VkShaderModule vertex_shader{};
+@@ -1853,14 +1889,14 @@
+ 
+     bool create_image(std::uint32_t width, std::uint32_t height, VkFormat format, VkImageUsageFlags usage,
+                       VkImage &image, VkDeviceMemory &memory, VkImageView &view, VkImageAspectFlags aspect,
+-                      std::string &error) {
++                      std::string &error, VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT) {
+         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+         info.imageType = VK_IMAGE_TYPE_2D;
+         info.format = format;
+         info.extent = {width, height, 1u};
+         info.mipLevels = 1u;
+         info.arrayLayers = 1u;
+-        info.samples = VK_SAMPLE_COUNT_1_BIT;
++        info.samples = samples;
+         info.tiling = VK_IMAGE_TILING_OPTIMAL;
+         info.usage = usage;
+         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+@@ -2442,9 +2478,14 @@
+     // No target exists yet: they are made at this size when first drawn.
+     impl.target_extent = impl.wanted_target_extent();
+ 
++    impl.choose_depth_format();
++    impl.choose_msaa();
++    const bool msaa = impl.multisampled();
++    // Multisampled, the colour attachment is the target's `msaa` image,
++    // resolved into its picture when that is read (resolve_msaa).
+     std::array<VkAttachmentDescription, 2> attachments{};
+     attachments[0].format = VK_FORMAT_R8G8B8A8_UNORM;
+-    attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
++    attachments[0].samples = impl.msaa_samples;
+     attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+     attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+     attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+@@ -2452,7 +2493,6 @@
+     attachments[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+     attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+     attachments[1] = attachments[0];
+-    impl.choose_depth_format();
+     attachments[1].format = impl.depth_format;
+     // The stencil persists across passes like the depth does.
+     attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+@@ -2485,6 +2525,7 @@
+                 impl.discard_passes[variant] = VK_NULL_HANDLE;
+         }
+     }
++    if (msaa && !impl.create_msaa_load(error)) return false;
+ 
+     // Shaders, descriptors and pipeline layout.
+     const auto create_shader = [&](const std::uint32_t *code, std::size_t size, VkShaderModule &module) {
+@@ -3798,6 +3839,11 @@
+ }
+ 
+ void VulkanRenderer::Impl::destroy_target(Target &target) {
++    if (target.msaa_load_set != VK_NULL_HANDLE) vkFreeDescriptorSets(device, msaa_load_pool, 1u, &target.msaa_load_set);
++    vkDestroyFramebuffer(device, target.msaa_load_framebuffer, nullptr);
++    vkDestroyImageView(device, target.msaa_view, nullptr);
++    vkDestroyImage(device, target.msaa, nullptr);
++    vkFreeMemory(device, target.msaa_memory, nullptr);
+     for (VkDescriptorSet &descriptor : target.copy_descriptors)
+         if (descriptor != VK_NULL_HANDLE) vkFreeDescriptorSets(device, descriptor_pool, 1u, &descriptor);
+     vkDestroyImageView(device, target.copy_opaque_view, nullptr);
+@@ -3850,17 +3896,24 @@
+ }
+ 
+ bool VulkanRenderer::Impl::create_target(Target &target, std::string &error) {
++    const bool msaa = multisampled();
++    // Multisampled, the resolved picture is also read to load the samples.
+     if (!create_image(target_extent.width, target_extent.height, VK_FORMAT_R8G8B8A8_UNORM,
+                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+-                          VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++                          VK_IMAGE_USAGE_TRANSFER_DST_BIT | (msaa ? VK_IMAGE_USAGE_SAMPLED_BIT : 0u),
+                       target.color,
+                       target.color_memory, target.color_view, VK_IMAGE_ASPECT_COLOR_BIT, error))
+         return false;
++    if (msaa && !create_image(target_extent.width, target_extent.height, VK_FORMAT_R8G8B8A8_UNORM,
++                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, target.msaa,
++                              target.msaa_memory,
++                              target.msaa_view, VK_IMAGE_ASPECT_COLOR_BIT, error, msaa_samples))
++        return false;
+     if (!create_image(target_extent.width, target_extent.height, depth_format,
+                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, target.depth, target.depth_memory,
+-                      target.depth_view, depth_aspect(), error))
++                      target.depth_view, depth_aspect(), error, msaa_samples))
+         return false;
+-    const std::array<VkImageView, 2> views{target.color_view, target.depth_view};
++    const std::array<VkImageView, 2> views{msaa ? target.msaa_view : target.color_view, target.depth_view};
+     VkFramebufferCreateInfo info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+     info.renderPass = render_pass;
+     info.attachmentCount = static_cast<std::uint32_t>(views.size());
+@@ -3868,7 +3921,229 @@
+     info.width = target_extent.width;
+     info.height = target_extent.height;
+     info.layers = 1u;
+-    return check(vkCreateFramebuffer(device, &info, nullptr, &target.framebuffer), "vkCreateFramebuffer", error);
++    if (!check(vkCreateFramebuffer(device, &info, nullptr, &target.framebuffer), "vkCreateFramebuffer", error))
++        return false;
++    target.msaa_stale = true;
++    target.msaa_unresolved = false;
++    if (!msaa) return true;
++    VkFramebufferCreateInfo load_info = info;
++    load_info.renderPass = msaa_load_pass;
++    load_info.attachmentCount = 1u;
++    load_info.pAttachments = &target.msaa_view;
++    if (!check(vkCreateFramebuffer(device, &load_info, nullptr, &target.msaa_load_framebuffer), "vkCreateFramebuffer",
++               error))
++        return false;
++    VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
++    allocate.descriptorPool = msaa_load_pool;
++    allocate.descriptorSetCount = 1u;
++    allocate.pSetLayouts = &msaa_load_set_layout;
++    if (!check(vkAllocateDescriptorSets(device, &allocate, &target.msaa_load_set), "vkAllocateDescriptorSets", error))
++        return false;
++    const VkDescriptorImageInfo image_info{msaa_load_sampler, target.color_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
++    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
++    write.dstSet = target.msaa_load_set;
++    write.descriptorCount = 1u;
++    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++    write.pImageInfo = &image_info;
++    vkUpdateDescriptorSets(device, 1u, &write, 0u, nullptr);
++    return true;
++}
++
++void VulkanRenderer::Impl::choose_msaa() {
++    const std::uint32_t wanted = settings::current().msaa;
++    VkPhysicalDeviceProperties properties{};
++    vkGetPhysicalDeviceProperties(physical_device, &properties);
++    VkSampleCountFlags allowed = properties.limits.framebufferColorSampleCounts &
++                                 properties.limits.framebufferDepthSampleCounts;
++    if ((depth_aspect() & VK_IMAGE_ASPECT_STENCIL_BIT) != 0u) allowed &= properties.limits.framebufferStencilSampleCounts;
++    msaa_samples = VK_SAMPLE_COUNT_1_BIT;
++    for (const VkSampleCountFlagBits samples : {VK_SAMPLE_COUNT_8_BIT, VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_2_BIT})
++        if (wanted >= static_cast<std::uint32_t>(samples) && (allowed & samples) != 0u) {
++            msaa_samples = samples;
++            break;
++        }
++    if (wanted > 1u)
++        std::cout << "[render] MSAA " << static_cast<std::uint32_t>(msaa_samples) << "x"
++                  << (static_cast<std::uint32_t>(msaa_samples) < wanted ? " (the most this GPU allows here)" : "")
++                  << "\n";
++}
++
++bool VulkanRenderer::Impl::create_msaa_load(std::string &error) {
++    VkAttachmentDescription attachment{};
++    attachment.format = VK_FORMAT_R8G8B8A8_UNORM;
++    attachment.samples = msaa_samples;
++    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;  // every sample is written
++    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++    attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++    attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++    VkAttachmentReference reference{0u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
++    VkSubpassDescription subpass{};
++    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++    subpass.colorAttachmentCount = 1u;
++    subpass.pColorAttachments = &reference;
++    VkRenderPassCreateInfo pass_info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
++    pass_info.attachmentCount = 1u;
++    pass_info.pAttachments = &attachment;
++    pass_info.subpassCount = 1u;
++    pass_info.pSubpasses = &subpass;
++    if (!check(vkCreateRenderPass(device, &pass_info, nullptr, &msaa_load_pass), "vkCreateRenderPass", error))
++        return false;
++    VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
++    sampler_info.magFilter = VK_FILTER_NEAREST;
++    sampler_info.minFilter = VK_FILTER_NEAREST;
++    sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    if (!check(vkCreateSampler(device, &sampler_info, nullptr, &msaa_load_sampler), "vkCreateSampler", error))
++        return false;
++    VkDescriptorSetLayoutBinding binding{};
++    binding.binding = 0u;
++    binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++    binding.descriptorCount = 1u;
++    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
++    VkDescriptorSetLayoutCreateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
++    set_info.bindingCount = 1u;
++    set_info.pBindings = &binding;
++    if (!check(vkCreateDescriptorSetLayout(device, &set_info, nullptr, &msaa_load_set_layout),
++               "vkCreateDescriptorSetLayout", error))
++        return false;
++    // One set per target (the game's framebuffers, frame interpolation's).
++    constexpr std::uint32_t kMaxTargets = 256u;
++    VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxTargets};
++    VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
++    pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
++    pool_info.maxSets = kMaxTargets;
++    pool_info.poolSizeCount = 1u;
++    pool_info.pPoolSizes = &pool_size;
++    if (!check(vkCreateDescriptorPool(device, &pool_info, nullptr, &msaa_load_pool), "vkCreateDescriptorPool", error))
++        return false;
++    // The pre-rotation shaders, unturned (push constant 0).
++    VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT, 0u, sizeof(std::int32_t)};
++    VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++    layout_info.setLayoutCount = 1u;
++    layout_info.pSetLayouts = &msaa_load_set_layout;
++    layout_info.pushConstantRangeCount = 1u;
++    layout_info.pPushConstantRanges = &push;
++    if (!check(vkCreatePipelineLayout(device, &layout_info, nullptr, &msaa_load_layout), "vkCreatePipelineLayout",
++               error))
++        return false;
++    const auto create_shader = [&](const std::uint32_t *code, std::size_t size, VkShaderModule &module) {
++        VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++        info.codeSize = size;
++        info.pCode = code;
++        return check(vkCreateShaderModule(device, &info, nullptr, &module), "vkCreateShaderModule", error);
++    };
++    if (!create_shader(kRotateVertexShader, sizeof(kRotateVertexShader), msaa_load_vertex)) return false;
++    if (!create_shader(kRotateFragmentShader, sizeof(kRotateFragmentShader), msaa_load_fragment)) return false;
++    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
++    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++    stages[0].module = msaa_load_vertex;
++    stages[0].pName = "main";
++    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++    stages[1].module = msaa_load_fragment;
++    stages[1].pName = "main";
++    VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++    VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++    VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++    viewport.viewportCount = 1u;
++    viewport.scissorCount = 1u;
++    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++    raster.polygonMode = VK_POLYGON_MODE_FILL;
++    raster.cullMode = VK_CULL_MODE_NONE;
++    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++    raster.lineWidth = 1.0f;
++    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++    multisample.rasterizationSamples = msaa_samples;
++    VkPipelineColorBlendAttachmentState blend_attachment{};
++    blend_attachment.colorWriteMask =
++        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
++    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++    blend.attachmentCount = 1u;
++    blend.pAttachments = &blend_attachment;
++    const std::array<VkDynamicState, 2> dynamic_states{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
++    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
++    dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamic_states.size());
++    dynamic.pDynamicStates = dynamic_states.data();
++    VkGraphicsPipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++    pipeline_info.stageCount = static_cast<std::uint32_t>(stages.size());
++    pipeline_info.pStages = stages.data();
++    pipeline_info.pVertexInputState = &vertex_input;
++    pipeline_info.pInputAssemblyState = &assembly;
++    pipeline_info.pViewportState = &viewport;
++    pipeline_info.pRasterizationState = &raster;
++    pipeline_info.pMultisampleState = &multisample;
++    pipeline_info.pColorBlendState = &blend;
++    pipeline_info.pDynamicState = &dynamic;
++    pipeline_info.layout = msaa_load_layout;
++    pipeline_info.renderPass = msaa_load_pass;
++    return check(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1u, &pipeline_info, nullptr, &msaa_load_pipeline),
++                 "vkCreateGraphicsPipelines", error);
++}
++
++void VulkanRenderer::Impl::destroy_msaa_load() {
++    if (msaa_load_pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, msaa_load_pipeline, nullptr);
++    if (msaa_load_layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, msaa_load_layout, nullptr);
++    if (msaa_load_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, msaa_load_pool, nullptr);
++    if (msaa_load_set_layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, msaa_load_set_layout, nullptr);
++    if (msaa_load_sampler != VK_NULL_HANDLE) vkDestroySampler(device, msaa_load_sampler, nullptr);
++    if (msaa_load_vertex != VK_NULL_HANDLE) vkDestroyShaderModule(device, msaa_load_vertex, nullptr);
++    if (msaa_load_fragment != VK_NULL_HANDLE) vkDestroyShaderModule(device, msaa_load_fragment, nullptr);
++    if (msaa_load_pass != VK_NULL_HANDLE) vkDestroyRenderPass(device, msaa_load_pass, nullptr);
++    msaa_load_pipeline = VK_NULL_HANDLE;
++    msaa_load_layout = VK_NULL_HANDLE;
++    msaa_load_pool = VK_NULL_HANDLE;
++    msaa_load_set_layout = VK_NULL_HANDLE;
++    msaa_load_sampler = VK_NULL_HANDLE;
++    msaa_load_vertex = VK_NULL_HANDLE;
++    msaa_load_fragment = VK_NULL_HANDLE;
++    msaa_load_pass = VK_NULL_HANDLE;
++}
++
++// Outside a pass, with `color` in the layout passes leave it in.
++void VulkanRenderer::Impl::load_msaa(VkCommandBuffer commands, Target &target) {
++    target.msaa_stale = false;
++    if (msaa_load_pipeline == VK_NULL_HANDLE || target.msaa_load_framebuffer == VK_NULL_HANDLE) return;
++    transition(commands, target.color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
++    pass.renderPass = msaa_load_pass;
++    pass.framebuffer = target.msaa_load_framebuffer;
++    pass.renderArea = {{0, 0}, target_extent};
++    vkCmdBeginRenderPass(commands, &pass, VK_SUBPASS_CONTENTS_INLINE);
++    const VkViewport viewport{0.0f, 0.0f, static_cast<float>(target_extent.width),
++                              static_cast<float>(target_extent.height), 0.0f, 1.0f};
++    const VkRect2D scissor{{0, 0}, target_extent};
++    vkCmdSetViewport(commands, 0u, 1u, &viewport);
++    vkCmdSetScissor(commands, 0u, 1u, &scissor);
++    vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, msaa_load_pipeline);
++    vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, msaa_load_layout, 0u, 1u,
++                            &target.msaa_load_set, 0u, nullptr);
++    const std::int32_t unturned = 0;
++    vkCmdPushConstants(commands, msaa_load_layout, VK_SHADER_STAGE_VERTEX_BIT, 0u, sizeof(unturned), &unturned);
++    vkCmdDraw(commands, 3u, 1u, 0u, 0u);
++    vkCmdEndRenderPass(commands);
++    perf::count_render_pass();
++    transition(commands, target.color, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++}
++
++// Outside a pass: the samples drawn since the last resolve into `color`.
++void VulkanRenderer::Impl::resolve_msaa(VkCommandBuffer commands, Target &target) {
++    if (target.msaa == VK_NULL_HANDLE || !target.msaa_unresolved) return;
++    target.msaa_unresolved = false;
++    transition(commands, target.msaa, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    transition(commands, target.color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    VkImageResolve region{};
++    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
++    region.dstSubresource = region.srcSubresource;
++    region.extent = {target_extent.width, target_extent.height, 1u};
++    vkCmdResolveImage(commands, target.msaa, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target.color,
++                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &region);
++    transition(commands, target.msaa, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    transition(commands, target.color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+ }
+ 
+ // Attachments are loaded, not cleared, so a new target starts undefined:
+@@ -3878,6 +4153,10 @@
+     transition(commands, target.color, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+     transition(commands, target.depth, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                depth_aspect());
++    if (target.msaa != VK_NULL_HANDLE) {
++        transition(commands, target.msaa, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++        target.msaa_stale = false;  // nothing to load: the picture is undefined too
++    }
+     target.initialized = true;
+ }
+ 
+@@ -3940,8 +4219,15 @@
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+         transition(command_buffer, target->depth, VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, depth_aspect());
++        if (target->msaa != VK_NULL_HANDLE) {
++            transition(command_buffer, target->msaa, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++            target->msaa_stale = false;  // nothing to load: the picture is undefined too
++        }
+         target->initialized = true;
+     }
++    // The picture changed outside a pass (a movie frame, a resize): the
++    // samples take it first.
++    if (target->msaa != VK_NULL_HANDLE && target->msaa_stale) load_msaa(command_buffer, *target);
+     VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+     pass.renderPass = discard_passes[overwritten & 3u] != VK_NULL_HANDLE ? discard_passes[overwritten & 3u] : render_pass;
+     pass.framebuffer = target->framebuffer;
+@@ -3966,6 +4252,8 @@
+     if (!pass_active) return;
+     vkCmdEndRenderPass(command_buffer);
+     pass_active = false;
++    if (multisampled())
++        if (const auto drawn = targets.find(current_target); drawn != targets.end()) drawn->second.msaa_unresolved = true;
+ }
+ 
+ VulkanRenderer::Impl::Texture VulkanRenderer::Impl::create_texture(std::uint32_t width, std::uint32_t height,
+@@ -4809,6 +5097,7 @@
+     }
+     if (!target.copy_valid || target.copy_serial != target.draw_serial) {
+         end_pass();
++        resolve_msaa(command_buffer, target);
+         transition(command_buffer, target.color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+         transition(command_buffer, target.copy,
+@@ -5133,7 +5422,7 @@
+     raster.lineWidth = 1.0f;
+ 
+     VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++    multisample.rasterizationSamples = msaa_samples;
+ 
+     VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+     depth.depthTestEnable = key.depth_test ? VK_TRUE : VK_FALSE;
+@@ -5897,6 +6186,7 @@
+     if (!impl.ready) return;
+     if (!impl.recording) begin_frame();
+     impl.end_pass();
++    impl.resolve_all_msaa(impl.command_buffer);
+     VkImage source = VK_NULL_HANDLE;
+     if (show_game) {
+         if (const auto shown = impl.targets.find(impl.presented_target); shown != impl.targets.end())
+@@ -6056,6 +6346,8 @@
+     impl.transition(impl.command_buffer, target->color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+     impl.last_drawn_target = display_address;
++    target->msaa_stale = true;
++    target->msaa_unresolved = false;  // the picture is newer than the samples
+     // The frame came from guest memory, which texturing reads correctly anyway.
+     ++target->draw_serial;
+     target->guest_words.clear();
+@@ -7053,6 +7345,7 @@
+     if (!any) return;
+     if (!impl.recording) begin_frame();
+     impl.end_pass();
++    impl.resolve_msaa(impl.command_buffer, impl.targets.at(found));
+     impl.record_writeback(found);
+     Impl::FrameSlot &frame = impl.slots[impl.slot];
+     if (!frame.writeback_in_flight) return;
+@@ -7501,6 +7794,8 @@
+             }
+             const Clock::time_point replay_start = Clock::now();
+             replay(commands, slot, present.t);
++            target.msaa_unresolved = true;
++            resolve_msaa(commands, target);
+             present_regions[slot] = replay_regions;
+             stats.replay_time += Clock::now() - replay_start;
+             if (present_timer != VK_NULL_HANDLE) {
+@@ -7971,6 +8266,8 @@
+     if (!impl.ready) return false;
+     if (!impl.recording) begin_frame();
+     impl.end_pass();
++    // What presenting, the write-back and the paused frame read.
++    impl.resolve_all_msaa(impl.command_buffer);
+ 
+     static const bool trace3d = portablekit::env("TRACE_3D") != nullptr;
+     static const bool trace_camera = portablekit::env("TRACE_CAMERA") != nullptr;
+@@ -8395,6 +8692,7 @@
+     impl.destroy_interpolation_targets();
+     for (VkFence fence : impl.present_fences) vkDestroyFence(impl.device, fence, nullptr);
+     if (impl.present_timer != VK_NULL_HANDLE) vkDestroyQueryPool(impl.device, impl.present_timer, nullptr);
++    impl.destroy_msaa_load();
+     vkDestroyRenderPass(impl.device, impl.render_pass, nullptr);
+     for (VkRenderPass pass : impl.discard_passes)
+         if (pass != VK_NULL_HANDLE) vkDestroyRenderPass(impl.device, pass, nullptr);
+diff -ru a/host/settings/settings.cpp b/host/settings/settings.cpp
+--- a/host/settings/settings.cpp	2026-11-12 01:47:00.670926014 +0000
++++ b/host/settings/settings.cpp	2026-11-12 01:47:00.746926019 +0000
+@@ -222,6 +222,13 @@
+          [](const Settings &s) { return kAspects.format(s.aspect); }, nullptr},
+         BOOL_FIELD("video.sharp_screen", sharp_screen),
+         BOOL_FIELD("video.sharp_textures", sharp_textures),
++        // Read when the renderer starts; the GPU may allow fewer samples.
++        {"video.msaa", "MSAA", [](Settings &s, const std::string &t) { return parse_uint(t, 1u, 8u, s.msaa); },
++         [](const Settings &s) { return std::to_string(s.msaa); },
++         [](Settings &s, const char *t) {
++             std::uint32_t samples = 1u;
++             if (parse_uint(t, 1u, 8u, samples)) s.msaa = samples;
++         }},
+         {"video.texture_pack", "TEXTURE_PACK",
+          [](Settings &s, const std::string &t) { return parse_bool(t, s.texture_pack); },
+          [](const Settings &s) { return std::string(s.texture_pack ? "1" : "0"); },
+diff -ru a/host/settings/settings.hpp b/host/settings/settings.hpp
+--- a/host/settings/settings.hpp	2026-11-12 01:47:00.850926025 +0000
++++ b/host/settings/settings.hpp	2026-11-12 01:47:00.930926030 +0000
+@@ -99,6 +99,7 @@
+     Aspect aspect{Aspect::Original};
+     bool sharp_screen{};               // nearest instead of linear scaling to the window
+     bool sharp_textures{};             // nearest instead of linear texture sampling
++    std::uint32_t msaa{1u};            // samples per pixel of the game's targets: 1 (off), 2, 4 or 8
+     bool texture_pack{true};           // draw an installed HD texture pack's images instead of the game's
+     std::string texture_pack_folder;   // a pack used where it is instead of textures/<disc id>; empty: none
+     bool unthrottled{};                // let emulated time run ahead of real time

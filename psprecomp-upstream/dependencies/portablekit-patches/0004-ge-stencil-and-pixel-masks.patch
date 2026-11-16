@@ -1,0 +1,285 @@
+--- a/host/gpu/ge_state.hpp
++++ b/host/gpu/ge_state.hpp
+@@ -109,6 +109,21 @@
+     std::uint32_t mask{0xFFu};
+ };
+ 
++// STE (0x24), STST (0xDC) and SOP (0xDD). The PSP keeps the stencil in the
++// framebuffer's alpha bits; the renderer gives it a stencil buffer of its own.
++// Functions use the GE compare encoding (0 never .. 7 greater-or-equal), ops
++// the GE stencil-op encoding (0 keep, 1 zero, 2 replace, 3 invert, 4 incr,
++// 5 decr).
++struct StencilState {
++    bool enabled{};
++    std::uint32_t function{1u};
++    std::uint32_t reference{};
++    std::uint32_t mask{0xFFu};
++    std::uint32_t fail{};
++    std::uint32_t depth_fail{};
++    std::uint32_t pass{};
++};
++
+ struct ViewportState {
+     float x_scale{}, y_scale{}, z_scale{};
+     float x_offset{}, y_offset{}, z_offset{};
+@@ -166,6 +181,11 @@
+     BlendState blend;
+     DepthState depth;
+     AlphaTestState alpha_test;
++    StencilState stencil;
++    // PMSKC (0xE8) and PMSKA (0xE9): a set bit is one the draw may NOT write.
++    // The alpha mask also guards the stencil, which lives in the alpha bits.
++    std::uint32_t color_write_mask{};
++    std::uint32_t alpha_write_mask{};
+     ViewportState viewport;
+     bool culling_enabled{};
+     bool cull_clockwise{};
+@@ -291,6 +311,9 @@
+     BlendState blend_{};
+     DepthState depth_{};
+     AlphaTestState alpha_test_{};
++    StencilState stencil_{};
++    std::uint32_t color_write_mask_{};
++    std::uint32_t alpha_write_mask_{};
+     ViewportState viewport_{};
+     bool culling_enabled_{};
+     bool cull_clockwise_{};
+--- a/host/gpu/ge_state.cpp
++++ b/host/gpu/ge_state.cpp
+@@ -43,6 +43,7 @@
+     kAlphaBlendEnable = 0x21,
+     kAlphaTestEnable = 0x22,
+     kDepthTestEnable = 0x23,
++    kStencilTestEnable = 0x24,
+     kBoneMatrixNumber = 0x2A,
+     kBoneMatrixData = 0x2B,
+     kWorldMatrixNumber = 0x3A,
+@@ -124,11 +125,15 @@
+     kMinZ = 0xD6,
+     kMaxZ = 0xD7,
+     kAlphaTest = 0xDB,
++    kStencilTest = 0xDC,
++    kStencilOp = 0xDD,
+     kDepthTest = 0xDE,
+     kBlendMode = 0xDF,
+     kBlendFixedA = 0xE0,
+     kBlendFixedB = 0xE1,
+     kDepthWriteDisable = 0xE7,
++    kPixelMaskColor = 0xE8,
++    kPixelMaskAlpha = 0xE9,
+     // Block transfer registers, read off a trace of the quest reward screen,
+     // which copies the 16-bit framebuffer at 0x04000000 (512 pixels a row) to
+     // 0x093E7EF0 in main memory and then textures from there as 512x512 5650
+@@ -630,6 +635,22 @@
+     case kAlphaBlendEnable: blend_.enabled = (data & 1u) != 0u; break;
+     case kAlphaTestEnable: alpha_test_.enabled = (data & 1u) != 0u; break;
+     case kDepthTestEnable: depth_.test_enabled = (data & 1u) != 0u; break;
++    // Stencil and pixel masks. Traced in Valkyria Chronicles II (ULES01417):
++    // its unit shadows draw volumes with every colour bit masked and stencil
++    // INVERT on depth fail, then darken where the stencil test passes.
++    case kStencilTestEnable: stencil_.enabled = (data & 1u) != 0u; break;
++    case kStencilTest:
++        stencil_.function = data & 7u;
++        stencil_.reference = (data >> 8u) & 0xFFu;
++        stencil_.mask = (data >> 16u) & 0xFFu;
++        break;
++    case kStencilOp:
++        stencil_.fail = data & 7u;
++        stencil_.depth_fail = (data >> 8u) & 7u;
++        stencil_.pass = (data >> 16u) & 7u;
++        break;
++    case kPixelMaskColor: color_write_mask_ = data & 0x00FFFFFFu; break;
++    case kPixelMaskAlpha: alpha_write_mask_ = data & 0xFFu; break;
+     case kDepthWriteDisable: depth_.write_enabled = (data & 1u) == 0u; break;
+     case kDepthTest: depth_.function = data & 7u; break;
+     case kMinZ: depth_.range_near = static_cast<std::uint16_t>(data); break;
+@@ -971,6 +992,9 @@
+     call.blend = blend_;
+     call.depth = depth_;
+     call.alpha_test = alpha_test_;
++    call.stencil = stencil_;
++    call.color_write_mask = color_write_mask_;
++    call.alpha_write_mask = alpha_write_mask_;
+     call.viewport = viewport_;
+     call.culling_enabled = culling_enabled_;
+     call.cull_clockwise = cull_clockwise_;
+--- a/host/gpu/vulkan_renderer.cpp
++++ b/host/gpu/vulkan_renderer.cpp
+@@ -276,10 +276,31 @@
+     // The raw vertex shader, which decodes the guest's vertex bytes, and its
+     // check build (<prefix>_CHECK_GPU_DECODE).
+     bool raw{};
++    // The GE stencil test and ops (GE encodings), with the 8-bit reference,
++    // compare mask and write mask. Fixed per pipeline: a game uses a handful.
++    bool stencil_test{};
++    std::uint32_t stencil_function{1u};
++    std::uint32_t stencil_reference{};
++    std::uint32_t stencil_compare_mask{0xFFu};
++    std::uint32_t stencil_write_mask{};
++    std::uint32_t stencil_fail{};
++    std::uint32_t stencil_depth_fail{};
++    std::uint32_t stencil_pass{};
+ 
+     auto operator<=>(const PipelineKey &) const = default;
+ };
+ 
++VkStencilOp to_stencil_op(std::uint32_t operation) {
++    switch (operation) {
++    case 1u: return VK_STENCIL_OP_ZERO;
++    case 2u: return VK_STENCIL_OP_REPLACE;
++    case 3u: return VK_STENCIL_OP_INVERT;
++    case 4u: return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
++    case 5u: return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
++    default: return VK_STENCIL_OP_KEEP;
++    }
++}
++
+ // GU_FIX takes its factor from a colour register rather than from the source or
+ // destination pixel. Vulkan offers a single blend constant per attachment, so a
+ // fixed factor collapses to ONE or ZERO when the colour is white or black, and
+@@ -673,17 +694,18 @@
+                    : VK_IMAGE_ASPECT_DEPTH_BIT;
+     }
+     void choose_depth_format() {
+-        const VkFormat candidates[] = {VK_FORMAT_D32_SFLOAT, VK_FORMAT_D24_UNORM_S8_UINT,
+-                                       VK_FORMAT_X8_D24_UNORM_PACK32, VK_FORMAT_D16_UNORM,
+-                                       VK_FORMAT_D32_SFLOAT_S8_UINT};
++        // Formats with a stencil first: the GE's stencil test and ops need one
++        // (games keep it in the framebuffer alpha; here it is its own buffer).
++        const VkFormat candidates[] = {VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT,
++                                       VK_FORMAT_D32_SFLOAT, VK_FORMAT_X8_D24_UNORM_PACK32, VK_FORMAT_D16_UNORM};
+         for (const VkFormat format : candidates) {
+             VkFormatProperties properties{};
+             vkGetPhysicalDeviceFormatProperties(physical_device, format, &properties);
+             if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0u) {
+                 depth_format = format;
+-                if (format != VK_FORMAT_D32_SFLOAT)
+-                    std::cout << "[render] no 32-bit float depth buffer; using format " << static_cast<int>(format)
+-                              << "\n";
++                if (format != VK_FORMAT_D32_SFLOAT_S8_UINT)
++                    std::cout << "[render] depth/stencil buffer format " << static_cast<int>(format)
++                              << (depth_aspect() & VK_IMAGE_ASPECT_STENCIL_BIT ? "" : " (no stencil)") << "\n";
+                 return;
+             }
+         }
+@@ -2347,6 +2369,9 @@
+     attachments[1] = attachments[0];
+     impl.choose_depth_format();
+     attachments[1].format = impl.depth_format;
++    // The stencil persists across passes like the depth does.
++    attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++    attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+     attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+     attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+     VkAttachmentReference color_reference{0u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+@@ -4715,14 +4740,16 @@
+ namespace {
+ 
+ constexpr std::uint32_t kPipelineKeysMagic = 0x4B504B59u;  // "YKPK"
+-constexpr std::uint32_t kPipelineKeysVersion = 1u;
+-constexpr std::uint32_t kPipelineKeyWords = 12u;
++constexpr std::uint32_t kPipelineKeysVersion = 2u;  // 2: stencil state
++constexpr std::uint32_t kPipelineKeyWords = 20u;
+ constexpr std::uint32_t kMaxPipelineKeys = 4096u;
+ 
+ std::array<std::uint32_t, kPipelineKeyWords> key_words(const PipelineKey &key) {
+     return {key.blend ? 1u : 0u, key.source_factor,  key.destination_factor, key.equation,
+             key.depth_test ? 1u : 0u, key.depth_write ? 1u : 0u, key.depth_function, key.cull ? 1u : 0u,
+-            key.cull_clockwise ? 1u : 0u, key.color_mask, key.alpha_test ? 1u : 0u, key.raw ? 1u : 0u};
++            key.cull_clockwise ? 1u : 0u, key.color_mask, key.alpha_test ? 1u : 0u, key.raw ? 1u : 0u,
++            key.stencil_test ? 1u : 0u, key.stencil_function, key.stencil_reference, key.stencil_compare_mask,
++            key.stencil_write_mask, key.stencil_fail, key.stencil_depth_fail, key.stencil_pass};
+ }
+ 
+ PipelineKey key_from(const std::array<std::uint32_t, kPipelineKeyWords> &words) {
+@@ -4739,6 +4766,14 @@
+     key.color_mask = words[9] & 0xFu;
+     key.alpha_test = words[10] != 0u;
+     key.raw = words[11] != 0u;
++    key.stencil_test = words[12] != 0u;
++    key.stencil_function = words[13] & 7u;
++    key.stencil_reference = words[14] & 0xFFu;
++    key.stencil_compare_mask = words[15] & 0xFFu;
++    key.stencil_write_mask = words[16] & 0xFFu;
++    key.stencil_fail = words[17] & 7u;
++    key.stencil_depth_fail = words[18] & 7u;
++    key.stencil_pass = words[19] & 7u;
+     return key;
+ }
+ 
+@@ -4937,6 +4972,20 @@
+     depth.depthTestEnable = key.depth_test ? VK_TRUE : VK_FALSE;
+     depth.depthWriteEnable = key.depth_write ? VK_TRUE : VK_FALSE;
+     depth.depthCompareOp = to_compare_op(key.depth_function);
++    if (key.stencil_test) {
++        // Vulkan, like the GE, tests (reference & mask) OP (stencil & mask).
++        VkStencilOpState stencil{};
++        stencil.failOp = to_stencil_op(key.stencil_fail);
++        stencil.depthFailOp = to_stencil_op(key.stencil_depth_fail);
++        stencil.passOp = to_stencil_op(key.stencil_pass);
++        stencil.compareOp = to_compare_op(key.stencil_function);
++        stencil.compareMask = key.stencil_compare_mask;
++        stencil.writeMask = key.stencil_write_mask;
++        stencil.reference = key.stencil_reference;
++        depth.stencilTestEnable = VK_TRUE;
++        depth.front = stencil;
++        depth.back = stencil;
++    }
+ 
+     VkPipelineColorBlendAttachmentState blend_attachment{};
+     blend_attachment.blendEnable = key.blend ? VK_TRUE : VK_FALSE;
+@@ -6391,6 +6440,21 @@
+                                                           VK_COLOR_COMPONENT_B_BIT)
+                                                        : 0u) |
+                          ((call.clear_flags & 2u) != 0u ? VK_COLOR_COMPONENT_A_BIT : 0u);
++        // The alpha/stencil bit clears the stencil too: on the PSP it is the
++        // alpha the clear colour carries, at the target's alpha precision.
++        if ((call.clear_flags & 2u) != 0u) {
++            const std::uint32_t alpha = call.vertices.empty() ? 0u : (call.vertices.front().color >> 24u) & 0xFFu;
++            std::uint32_t value = alpha;
++            if (call.target.color_format == 0u) value = 0u;                         // 5650: no stencil
++            else if (call.target.color_format == 1u) value = alpha >= 0x80u ? 0xFFu : 0u;  // 5551
++            else if (call.target.color_format == 2u) value = (alpha >> 4u) * 0x11u;      // 4444
++            key.stencil_test = true;
++            key.stencil_function = 1u;  // always
++            key.stencil_reference = value;
++            key.stencil_compare_mask = 0xFFu;
++            key.stencil_write_mask = 0xFFu;
++            key.stencil_fail = key.stencil_depth_fail = key.stencil_pass = 2u;  // replace
++        }
+     } else {
+         key.blend = call.blend.enabled;
+         key.source_factor = resolve_fixed_factor(call.blend.source_factor, call.blend.fixed_source);
+@@ -6407,6 +6471,23 @@
+         key.depth_function = call.depth.function;
+         key.cull = call.culling_enabled && !call.through && call.primitive != PrimitiveType::Sprites;
+         key.cull_clockwise = call.cull_clockwise;
++        // PMSKC/PMSKA: a channel whose bits are all masked is not written.
++        // Vulkan masks whole channels only; a partial mask writes the channel.
++        if ((call.color_write_mask & 0x0000FFu) == 0x0000FFu) key.color_mask &= ~static_cast<std::uint32_t>(VK_COLOR_COMPONENT_R_BIT);
++        if ((call.color_write_mask & 0x00FF00u) == 0x00FF00u) key.color_mask &= ~static_cast<std::uint32_t>(VK_COLOR_COMPONENT_G_BIT);
++        if ((call.color_write_mask & 0xFF0000u) == 0xFF0000u) key.color_mask &= ~static_cast<std::uint32_t>(VK_COLOR_COMPONENT_B_BIT);
++        if ((call.alpha_write_mask & 0xFFu) == 0xFFu) key.color_mask &= ~static_cast<std::uint32_t>(VK_COLOR_COMPONENT_A_BIT);
++        if (call.stencil.enabled) {
++            key.stencil_test = true;
++            key.stencil_function = call.stencil.function & 7u;
++            key.stencil_reference = call.stencil.reference & 0xFFu;
++            key.stencil_compare_mask = call.stencil.mask & 0xFFu;
++            // The stencil is the alpha bits, so PMSKA guards it as well.
++            key.stencil_write_mask = ~call.alpha_write_mask & 0xFFu;
++            key.stencil_fail = call.stencil.fail;
++            key.stencil_depth_fail = call.stencil.depth_fail;
++            key.stencil_pass = call.stencil.pass;
++        }
+     }
+     // Matches texture_params.w below: without an alpha test the pipeline's
+     // shader has no discard. <prefix>_NO_ALPHA_VARIANTS keeps the one shader
+@@ -7244,7 +7325,7 @@
+     clears[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+     clears[0].colorAttachment = 0u;
+     clears[0].clearValue.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+-    clears[1].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
++    clears[1].aspectMask = depth_aspect();
+     clears[1].clearValue.depthStencil = {0.0f, 0u};
+     const VkClearRect whole{{{0, 0}, target_extent}, 0u, 1u};
+     vkCmdClearAttachments(commands, static_cast<std::uint32_t>(clears.size()), clears.data(), 1u, &whole);

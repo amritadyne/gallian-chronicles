@@ -1,0 +1,42 @@
+Subject: [PATCH 0019] Window opens at the render resolution
+
+In Windowed mode the window opens at the chosen render resolution (in the
+display's points: pixels over its content scale), shrunk with its shape kept
+to fit the display's usable area. Under Match window it opens at 480x272
+times video.window_scale as before; the launcher no longer offers that size.
+
+diff -ru a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
+--- a/host/gpu/vulkan_renderer.cpp	2026-11-08 13:24:35.035952948 +0000
++++ b/host/gpu/vulkan_renderer.cpp	2026-11-08 13:24:35.051524442 +0000
+@@ -2178,8 +2178,29 @@
+     // under them). The safe area keeps the picture clear of a camera cutout.
+     window_flags |= SDL_WINDOW_FULLSCREEN;
+ #endif
+-    impl.window = SDL_CreateWindow(config.title.c_str(), static_cast<int>(kPspWidth * window_scale),
+-                                   static_cast<int>(kPspHeight * window_scale), window_flags);
++    // A window opens at the chosen render resolution, shrunk (same shape) to
++    // fit the display's usable area; under Match window, 480x272 times the
++    // window scale. Sizes here are in the display's points: pixels over its
++    // content scale (Windows display scaling).
++    int window_width = static_cast<int>(kPspWidth * window_scale);
++    int window_height = static_cast<int>(kPspHeight * window_scale);
++    if (!player.resolution.follows_window()) {
++        const SDL_DisplayID display = SDL_GetPrimaryDisplay();
++        float content_scale = display != 0u ? SDL_GetDisplayContentScale(display) : 1.0f;
++        if (!(content_scale > 0.0f)) content_scale = 1.0f;
++        double width = player.resolution.width / content_scale;
++        double height = player.resolution.height / content_scale;
++        SDL_Rect usable{};
++        if (display != 0u && SDL_GetDisplayUsableBounds(display, &usable) && usable.w > 0 && usable.h > 0) {
++            // Leave room for the window's frame.
++            const double fit = std::min({1.0, usable.w * 0.95 / width, usable.h * 0.9 / height});
++            width *= fit;
++            height *= fit;
++        }
++        window_width = std::max(320, static_cast<int>(std::lround(width)));
++        window_height = std::max(180, static_cast<int>(std::lround(height)));
++    }
++    impl.window = SDL_CreateWindow(config.title.c_str(), window_width, window_height, window_flags);
+     if (impl.window == nullptr) {
+         error = std::string("SDL_CreateWindow failed: ") + SDL_GetError();
+         return false;

@@ -1,0 +1,126 @@
+diff -ru a/host/gpu/texture_pack.cpp b/host/gpu/texture_pack.cpp
+--- a/host/gpu/texture_pack.cpp	2026-11-12 04:52:39.450599515 +0000
++++ b/host/gpu/texture_pack.cpp	2026-11-12 04:52:39.457955926 +0000
+@@ -680,8 +680,21 @@
+         // Images named by their key need no ini line; this makes the folder a
+         // pack as it is.
+         std::ofstream out(ini);
+-        out << "[options]\nversion = 1\nhash = xxh64\nignoreAddress = true\n\n[hashes]\n";
++        out << "[options]\nversion = 1\nhash = xxh64\nignoreAddress = true\nignoreMipmap = true\n\n[hashes]\n";
+     }
++    // An earlier session's images: not written again.
++    std::size_t earlier = 0u;
++    for (const auto &entry : std::filesystem::directory_iterator(directory_, ec)) {
++        if (entry.path().extension() != ".png") continue;
++        const std::string stem = entry.path().stem().string();
++        if (is_hex_name(stem)) {
++            written_.emplace(stem, true);
++            ++earlier;
++        }
++    }
++    index_.open(directory_ / "dump-index.txt", std::ios::app);
++    std::cout << "[texdump] writing new textures to " << directory_.string() << " (" << earlier
++              << " there from earlier sessions)\n";
+     writer_ = std::thread([this] { writer_main(); });
+ }
+ 
+@@ -691,6 +704,7 @@
+         stopping_ = true;
+     }
+     wake_.notify_all();
++    drained_.notify_all();
+     writer_.join();
+ }
+ 
+@@ -700,11 +714,15 @@
+     std::uint32_t covered_width = 0u, covered_height = 0u;
+     if (!compute_texture_pack_key(memory, texture, max_seen_v, options, key, covered_width, covered_height)) return;
+     const std::string name = format_texture_pack_key(key);
+-    std::lock_guard lock(mutex_);
++    std::unique_lock lock(mutex_);
+     if (!written_.try_emplace(name, true).second) return;
+-    // Hundreds of textures load in the first seconds; drop rather than queue
+-    // without bound.
+-    if (jobs_.size() > 256u) return;
++    // Hundreds of textures load in the first seconds: a long queue waits for
++    // the writer instead of dropping any.
++    drained_.wait(lock, [&] { return stopping_ || jobs_.size() < 512u; });
++    if (index_)
++        index_ << name << " " << covered_width << "x" << covered_height << " format "
++               << static_cast<int>(texture.format) << " clut 0x" << std::hex << texture.clut_format_word << std::dec
++               << " " << texture.clut_load_bytes << " bytes\n";
+     Job job;
+     job.path = directory_ / (name + ".png");
+     job.width = covered_width;
+@@ -727,6 +745,7 @@
+             job = std::move(jobs_.front());
+             jobs_.pop_front();
+         }
++        drained_.notify_all();
+         std::error_code ec;
+         if (std::filesystem::exists(job.path, ec)) continue;
+         int length = 0;
+@@ -737,6 +756,13 @@
+         std::ofstream out(job.path, std::ios::binary);
+         out.write(reinterpret_cast<const char *>(png), length);
+         STBIW_FREE(png);
++        std::size_t count;
++        {
++            std::lock_guard lock(mutex_);
++            count = ++written_count_;
++            if (index_) index_.flush();
++        }
++        if (count % 100u == 0u) std::cout << "[texdump] " << count << " textures written this session\n";
+     }
+ }
+ 
+diff -ru a/host/gpu/texture_pack.hpp b/host/gpu/texture_pack.hpp
+--- a/host/gpu/texture_pack.hpp	2026-11-12 04:52:39.452551305 +0000
++++ b/host/gpu/texture_pack.hpp	2026-11-12 04:52:39.458569363 +0000
+@@ -7,6 +7,7 @@
+ #include <cstdint>
+ #include <deque>
+ #include <filesystem>
++#include <fstream>
+ #include <memory>
+ #include <mutex>
+ #include <string>
+@@ -211,6 +212,10 @@
+ // <prefix>_TEXTURE_DUMP=<folder>: writes every texture the game uploads, once,
+ // as <key>.png into the folder, keyed the way a pack with `options` would key
+ // it, so a pack can be started from the dump. Runs on a background thread.
++// Nothing is dropped: a burst waits for the writer rather than losing
++// textures. Images already in the folder (an earlier session's) are not
++// written again. Each texture written gets a line in dump-index.txt (key,
++// size, format, palette), and every 100 a [texdump] line in the log.
+ class TextureDumper {
+ public:
+     explicit TextureDumper(std::filesystem::path directory);
+@@ -234,8 +239,11 @@
+     std::mutex mutex_;
+     std::condition_variable wake_;
+     std::deque<Job> jobs_;
++    std::condition_variable drained_;
+     std::unordered_map<std::string, bool> written_;
+     bool stopping_{};
++    std::size_t written_count_{};
++    std::ofstream index_;
+     std::thread writer_;
+ };
+ 
+diff -ru a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
+--- a/host/gpu/vulkan_renderer.cpp	2026-11-12 04:52:39.455028512 +0000
++++ b/host/gpu/vulkan_renderer.cpp	2026-11-12 04:52:39.459504416 +0000
+@@ -4624,7 +4624,11 @@
+     }
+     const std::uint16_t max_seen_v =
+         state.height == 512u ? update_max_seen_v(0u, drawn_max_v(call), call.through) : 0u;
+-    if (dumper) {
++    // Not dumped: what the profile draws itself (claimed), and, unless
++    // <prefix>_TEXTURE_DUMP_ALL is set, what the loaded pack already replaces,
++    // so a session with the pack on dumps just what the pack still lacks.
++    static const bool dump_all = portablekit::env("TEXTURE_DUMP_ALL") != nullptr;
++    if (dumper && !claimed && (dump_all || !pack || !pack->find(memory, state, max_seen_v))) {
+         static const TexturePackOptions kDumpOptions = [] {
+             TexturePackOptions options;
+             options.ignore_address = true;

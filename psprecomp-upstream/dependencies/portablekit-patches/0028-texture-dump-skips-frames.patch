@@ -1,0 +1,17 @@
+Texture dump: skip full-screen 32-bit textures (movie frames, screen copies), 512x272 format 3,
+unless <prefix>_TEXTURE_DUMP_FRAMES is set. (2026-11-12)
+
+--- a/host/gpu/texture_pack.cpp
++++ b/host/gpu/texture_pack.cpp
+@@ -713,6 +713,11 @@
+     TexturePackKey key;
+     std::uint32_t covered_width = 0u, covered_height = 0u;
+     if (!compute_texture_pack_key(memory, texture, max_seen_v, options, key, covered_width, covered_height)) return;
++    // A full-screen 32-bit texture (512x272, format 3) is a movie frame or a
++    // copy of the screen, a new one every frame: not dumped, unless
++    // <prefix>_TEXTURE_DUMP_FRAMES is set.
++    static const bool dump_frames = portablekit::env("TEXTURE_DUMP_FRAMES") != nullptr;
++    if (!dump_frames && texture.format == TextureFormat::Rgba8888 && covered_width == 512u && covered_height == 272u) return;
+     const std::string name = format_texture_pack_key(key);
+     std::unique_lock lock(mutex_);
+     if (!written_.try_emplace(name, true).second) return;

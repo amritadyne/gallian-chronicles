@@ -1,0 +1,682 @@
+#include "../profile.hpp"
+#include "settings/settings.hpp"
+
+#include "install/user_data.hpp"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace portablekit::settings {
+namespace {
+
+// One setting: its key in settings.ini, the variable that overrides it, and
+// how both spell its value.
+struct Field {
+    const char *key;
+    const char *variable;  // null: no environment override
+    std::function<bool(Settings &, const std::string &)> parse;
+    std::function<std::string(const Settings &)> format;
+    // Reads the variable's value, which is spelled the way the variable has
+    // always been. Null: the variable uses the file's spelling.
+    std::function<void(Settings &, const char *)> parse_variable;
+};
+
+bool parse_bool(const std::string &text, bool &out) {
+    if (text == "1" || text == "true" || text == "on" || text == "yes") out = true;
+    else if (text == "0" || text == "false" || text == "off" || text == "no") out = false;
+    else return false;
+    return true;
+}
+
+bool parse_float(const std::string &text, float minimum, float maximum, float &out) {
+    char *end = nullptr;
+    const float value = std::strtof(text.c_str(), &end);
+    if (end == text.c_str() || *end != '\0') return false;
+    out = std::clamp(value, minimum, maximum);
+    return true;
+}
+
+bool parse_uint(const std::string &text, std::uint32_t minimum, std::uint32_t maximum, std::uint32_t &out) {
+    char *end = nullptr;
+    const unsigned long value = std::strtoul(text.c_str(), &end, 10);
+    if (end == text.c_str() || *end != '\0') return false;
+    out = static_cast<std::uint32_t>(std::clamp<unsigned long>(value, minimum, maximum));
+    return true;
+}
+
+// Written by earlier versions: the render resolution as a multiple of
+// 480x272, or "auto" for the window's own. Read when video.resolution is not
+// there (it comes later in the table, so it wins), and no longer written.
+constexpr const char *kRetiredInternalScaleKey = "video.internal_scale";
+bool parse_internal_scale(const std::string &text, Resolution &out) {
+    if (text == "auto") {
+        out = {};
+        return true;
+    }
+    std::uint32_t scale = 0u;
+    if (!parse_uint(text, 0u, 16u, scale)) return false;
+    out = scale == 0u ? Resolution{} : Resolution{480u * scale, 272u * scale};
+    return true;
+}
+
+std::string format_float(float value) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.2f", static_cast<double>(value));
+    return text;
+}
+
+// Flags the host has always read as "set means on", whatever the value.
+bool variable_present(const char *) { return true; }
+
+// Flags read the way the pad code reads them: 0, no, off and false are off.
+bool variable_flag(const char *text) {
+    for (const char *off : {"0", "no", "off", "false"})
+        if (std::strcmp(text, off) == 0) return false;
+    return true;
+}
+
+float variable_float(const char *text, float fallback, float minimum, float maximum) {
+    char *end = nullptr;
+    const float value = std::strtof(text, &end);
+    return std::clamp(end != text ? value : fallback, minimum, maximum);
+}
+
+template <typename Enum>
+struct Names {
+    std::vector<std::pair<Enum, const char *>> values;
+
+    bool parse(const std::string &text, Enum &out) const {
+        for (const auto &[value, name] : values) {
+            if (text == name) {
+                out = value;
+                return true;
+            }
+        }
+        return false;
+    }
+    [[nodiscard]] std::string format(Enum value) const {
+        for (const auto &[candidate, name] : values)
+            if (candidate == value) return name;
+        return values.front().second;
+    }
+};
+
+const Names<PresentMode> kPresentModes{
+    {{PresentMode::Fifo, "vsync"}, {PresentMode::Mailbox, "mailbox"}, {PresentMode::Immediate, "immediate"}}};
+const Names<Aspect> kAspects{{{Aspect::Original, "original"}, {Aspect::Stretch, "stretch"}, {Aspect::Fill, "fill"}}};
+const Names<PerfDisplay> kPerfDisplays{{{PerfDisplay::Off, "off"},
+                                        {PerfDisplay::Overlay, "overlay"},
+                                        {PerfDisplay::OverlayAndLog, "overlay+log"},
+                                        {PerfDisplay::Log, "log"},
+                                        {PerfDisplay::Fps, "fps"}}};
+const Names<input::tilt::Mode> kTiltModes{{{input::tilt::Mode::Angle, "angle"},
+                                            {input::tilt::Mode::AngleLevel, "level"},
+                                            {input::tilt::Mode::AngleLevel, "horizon"},
+                                            {input::tilt::Mode::Rate, "rate"}}};
+const Names<JumpButton> kJumpButtons{{{JumpButton::Off, "off"},
+                                      {JumpButton::LeftStick, "l3"},
+                                      {JumpButton::South, "south"},
+                                      {JumpButton::East, "east"},
+                                      {JumpButton::West, "west"},
+                                      {JumpButton::North, "north"}}};
+const Names<RightStick> kRightSticks{
+    {{RightStick::Camera, "camera"}, {RightStick::DPad, "dpad"}, {RightStick::Off, "off"}}};
+// A trigger profile by the key the game gives it, or "standard" for L and R.
+bool parse_trigger_profile(const std::string &text, std::uint32_t &out) {
+    if (text == "standard") {
+        out = 0u;
+        return true;
+    }
+    const std::span<const TriggerProfile> profiles = game().trigger_profiles;
+    for (std::size_t i = 0; i < profiles.size(); ++i) {
+        if (text == profiles[i].key) {
+            out = static_cast<std::uint32_t>(i + 1u);
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string format_trigger_profile(std::uint32_t profile) {
+    const std::span<const TriggerProfile> profiles = game().trigger_profiles;
+    return profile == 0u || profile > profiles.size() ? std::string("standard") : std::string(profiles[profile - 1u].key);
+}
+const Names<NameEntry> kNameEntries{{{NameEntry::Keyboard, "keyboard"}, {NameEntry::Fixed, "fixed"}}};
+const Names<FrameRate> kFrameRates{{{FrameRate::Fps30, "30"},
+                                    {FrameRate::Fps45, "45"},
+                                    {FrameRate::Fps60, "60"},
+                                    {FrameRate::Fps90, "90"},
+                                    {FrameRate::Fps120, "120"},
+                                    {FrameRate::Display, "display"}}};
+
+// Written by earlier versions: 1 typed the name into the window, which the
+// on-screen keyboard now covers.
+constexpr const char *kRetiredTypeNameKey = "input.type_name";
+
+#define BOOL_FIELD(key, member)                                                                                       \
+    Field {                                                                                                            \
+        key, nullptr, [](Settings &s, const std::string &t) { return parse_bool(t, s.member); },                       \
+            [](const Settings &s) { return std::string(s.member ? "1" : "0"); }, nullptr                               \
+    }
+
+const std::vector<Field> &fields() {
+    static const std::vector<Field> table = {
+        {kRetiredInternalScaleKey, nullptr,
+         [](Settings &s, const std::string &t) { return parse_internal_scale(t, s.resolution); },
+         [](const Settings &) { return std::string(); }, nullptr},
+        {"video.resolution", "RESOLUTION",
+         [](Settings &s, const std::string &t) { return parse_resolution(t, s.resolution); },
+         [](const Settings &s) { return format_resolution(s.resolution); },
+         [](Settings &s, const char *t) {
+             Resolution value = s.resolution;
+             if (parse_resolution(t, value)) s.resolution = value;
+         }},
+        {"video.window_scale", nullptr,
+         [](Settings &s, const std::string &t) { return parse_uint(t, 1u, kMaxWindowScale, s.window_scale); },
+         [](const Settings &s) { return std::to_string(s.window_scale); }, nullptr},
+        BOOL_FIELD("video.fullscreen", fullscreen),
+        // After video.fullscreen, which older versions read, so it decides.
+        {"video.display_mode", nullptr,
+         [](Settings &s, const std::string &t) {
+             if (t == "window") set_display_mode(s, DisplayMode::Window);
+             else if (t == "borderless") set_display_mode(s, DisplayMode::Borderless);
+             else if (t == "fullscreen") set_display_mode(s, DisplayMode::Fullscreen);
+             else return false;
+             return true;
+         },
+         [](const Settings &s) {
+             switch (display_mode(s)) {
+             case DisplayMode::Borderless: return std::string("borderless");
+             case DisplayMode::Fullscreen: return std::string("fullscreen");
+             default: return std::string("window");
+             }
+         },
+         nullptr},
+        {"video.monitor", "MONITOR",
+         [](Settings &s, const std::string &t) {
+             s.monitor = t;
+             return true;
+         },
+         [](const Settings &s) { return s.monitor; }, [](Settings &s, const char *t) { s.monitor = t; }},
+        {"video.present_mode", nullptr,
+         [](Settings &s, const std::string &t) { return kPresentModes.parse(t, s.present_mode); },
+         [](const Settings &s) { return kPresentModes.format(s.present_mode); }, nullptr},
+        // Written by earlier versions, which had Original and Stretch only.
+        // Still written, so going back to one of them keeps the choice as
+        // near as it can; video.aspect follows it and decides.
+        {"video.keep_aspect", nullptr,
+         [](Settings &s, const std::string &t) {
+             bool keep = true;
+             if (!parse_bool(t, keep)) return false;
+             s.aspect = keep ? Aspect::Original : Aspect::Stretch;
+             return true;
+         },
+         [](const Settings &s) { return std::string(s.aspect == Aspect::Stretch ? "0" : "1"); }, nullptr},
+        {"video.aspect", nullptr,
+         [](Settings &s, const std::string &t) { return parse_aspect(t, s.aspect, s.shape_width, s.shape_height); },
+         [](const Settings &s) { return format_aspect(s); }, nullptr},
+        BOOL_FIELD("video.sharp_screen", sharp_screen),
+        BOOL_FIELD("video.sharp_textures", sharp_textures),
+        // Read when the renderer starts; the GPU may allow fewer samples.
+        {"video.msaa", "MSAA", [](Settings &s, const std::string &t) { return parse_uint(t, 1u, 8u, s.msaa); },
+         [](const Settings &s) { return std::to_string(s.msaa); },
+         [](Settings &s, const char *t) {
+             std::uint32_t samples = 1u;
+             if (parse_uint(t, 1u, 8u, samples)) s.msaa = samples;
+         }},
+        {"video.texture_pack", "TEXTURE_PACK",
+         [](Settings &s, const std::string &t) { return parse_bool(t, s.texture_pack); },
+         [](const Settings &s) { return std::string(s.texture_pack ? "1" : "0"); },
+         // 0/off/no/false turn it off; anything else, a folder included, on.
+         [](Settings &s, const char *t) { s.texture_pack = variable_flag(t); }},
+        {"video.texture_pack_folder", nullptr,
+         [](Settings &s, const std::string &t) {
+             s.texture_pack_folder = t;
+             return true;
+         },
+         [](const Settings &s) { return s.texture_pack_folder; }, nullptr},
+        {"video.unthrottled", "UNTHROTTLED",
+         [](Settings &s, const std::string &t) { return parse_bool(t, s.unthrottled); },
+         [](const Settings &s) { return std::string(s.unthrottled ? "1" : "0"); },
+         [](Settings &s, const char *t) { s.unthrottled = variable_present(t); }},
+        {"video.fast_loading", "FAST_LOADING",
+         [](Settings &s, const std::string &t) { return parse_bool(t, s.fast_loading); },
+         [](const Settings &s) { return std::string(s.fast_loading ? "1" : "0"); },
+         [](Settings &s, const char *t) { s.fast_loading = variable_flag(t); }},
+        {"video.frame_rate", "FRAME_RATE",
+         [](Settings &s, const std::string &t) { return kFrameRates.parse(t, s.frame_rate); },
+         [](const Settings &s) { return kFrameRates.format(s.frame_rate); },
+         [](Settings &s, const char *t) {
+             if (!kFrameRates.parse(t, s.frame_rate)) s.frame_rate = FrameRate::Fps30;
+         }},
+        {"video.frame_rate_auto", "FRAME_RATE_AUTO",
+         [](Settings &s, const std::string &t) { return parse_bool(t, s.frame_rate_auto); },
+         [](const Settings &s) { return std::string(s.frame_rate_auto ? "1" : "0"); },
+         [](Settings &s, const char *t) { s.frame_rate_auto = variable_flag(t); }},
+        {"video.performance", "PERF",
+         [](Settings &s, const std::string &t) { return kPerfDisplays.parse(t, s.perf); },
+         [](const Settings &s) { return kPerfDisplays.format(s.perf); },
+         [](Settings &s, const char *t) {
+             // `1` has always meant the overlay and the log, `log` the log only.
+             if (std::strcmp(t, "log") == 0) s.perf = PerfDisplay::Log;
+             else s.perf = *t != '\0' && variable_flag(t) ? PerfDisplay::OverlayAndLog : PerfDisplay::Off;
+         }},
+        {"text.font", "FONT",
+         [](Settings &s, const std::string &t) {
+             s.font = t;
+             return true;
+         },
+         [](const Settings &s) { return s.font; }, [](Settings &s, const char *t) { s.font = t; }},
+        {"text.weight", nullptr,
+         [](Settings &s, const std::string &t) { return parse_uint(t, 0u, kMaxFontWeight, s.font_weight); },
+         [](const Settings &s) { return std::to_string(s.font_weight); }, nullptr},
+        {"audio.volume", nullptr,
+         [](Settings &s, const std::string &t) { return parse_uint(t, 0u, 100u, s.volume); },
+         [](const Settings &s) { return std::to_string(s.volume); }, nullptr},
+        BOOL_FIELD("audio.mute", mute),
+        {"input.confirm", "PAD_FACE",
+         [](Settings &s, const std::string &t) {
+             if (t == "south") s.confirm_south = true;
+             else if (t == "east") s.confirm_south = false;
+             else return false;
+             return true;
+         },
+         [](const Settings &s) { return std::string(s.confirm_south ? "south" : "east"); },
+         [](Settings &s, const char *t) { s.confirm_south = std::strcmp(t, "xbox") == 0 || std::strcmp(t, "south") == 0; }},
+        {"input.dead_zone", "PAD_DEADZONE",
+         [](Settings &s, const std::string &t) { return parse_float(t, 0.0f, 0.9f, s.dead_zone); },
+         [](const Settings &s) { return format_float(s.dead_zone); },
+         [](Settings &s, const char *t) { s.dead_zone = variable_float(t, 0.15f, 0.0f, 0.9f); }},
+        {"input.trigger", "PAD_TRIGGER",
+         [](Settings &s, const std::string &t) { return parse_float(t, 0.05f, 1.0f, s.trigger); },
+         [](const Settings &s) { return format_float(s.trigger); },
+         [](Settings &s, const char *t) { s.trigger = variable_float(t, 0.25f, 0.05f, 1.0f); }},
+        {"input.trigger_profile", "PAD_TRIGGERS",
+         [](Settings &s, const std::string &t) { return parse_trigger_profile(t, s.trigger_profile); },
+         [](const Settings &s) { return format_trigger_profile(s.trigger_profile); },
+         [](Settings &s, const char *t) {
+             if (!parse_trigger_profile(t, s.trigger_profile)) s.trigger_profile = 0u;
+         }},
+        {"input.right_stick", "PAD_RSTICK_DPAD",
+         [](Settings &s, const std::string &t) { return kRightSticks.parse(t, s.right_stick); },
+         [](const Settings &s) { return kRightSticks.format(s.right_stick); },
+         [](Settings &s, const char *t) { s.right_stick = variable_flag(t) ? RightStick::DPad : RightStick::Camera; }},
+        {"input.right_stick_zone", "PAD_RSTICK_ZONE",
+         [](Settings &s, const std::string &t) { return parse_float(t, 0.1f, 1.0f, s.right_stick_zone); },
+         [](const Settings &s) { return format_float(s.right_stick_zone); },
+         [](Settings &s, const char *t) { s.right_stick_zone = variable_float(t, 0.5f, 0.1f, 1.0f); }},
+        {"input.analog_camera", "ANALOG_CAMERA",
+         [](Settings &s, const std::string &t) { return parse_bool(t, s.analog_camera); },
+         [](const Settings &s) { return std::string(s.analog_camera ? "1" : "0"); },
+         [](Settings &s, const char *t) { s.analog_camera = variable_flag(t); }},
+        {"input.camera_speed", "CAMERA_SPEED",
+         [](Settings &s, const std::string &t) { return parse_float(t, 20.0f, 720.0f, s.camera_speed); },
+         [](const Settings &s) { return format_float(s.camera_speed); },
+         [](Settings &s, const char *t) { s.camera_speed = variable_float(t, 190.0f, 20.0f, 720.0f); }},
+        {"input.aim_speed", "AIM_SPEED",
+         [](Settings &s, const std::string &t) { return parse_float(t, 10.0f, 360.0f, s.aim_speed); },
+         [](const Settings &s) { return format_float(s.aim_speed); },
+         [](Settings &s, const char *t) { s.aim_speed = variable_float(t, 90.0f, 10.0f, 360.0f); }},
+        BOOL_FIELD("input.invert_camera_x", invert_camera_x),
+        BOOL_FIELD("input.invert_camera_y", invert_camera_y),
+        {"input.mouse", "MOUSE",
+         [](Settings &s, const std::string &t) { return parse_bool(t, s.mouse); },
+         [](const Settings &s) { return std::string(s.mouse ? "1" : "0"); },
+         [](Settings &s, const char *t) { s.mouse = variable_flag(t); }},
+        {"input.mouse_sensitivity", "MOUSE_SENSITIVITY",
+         [](Settings &s, const std::string &t) {
+             return parse_float(t, kMinMouseSensitivity, kMaxMouseSensitivity, s.mouse_sensitivity);
+         },
+         [](const Settings &s) { return format_float(s.mouse_sensitivity); },
+         [](Settings &s, const char *t) {
+             s.mouse_sensitivity = variable_float(t, 0.10f, kMinMouseSensitivity, kMaxMouseSensitivity);
+         }},
+        BOOL_FIELD("input.touch_controls", touch_controls),
+        BOOL_FIELD("input.touch_dpad", touch_dpad),
+        {"input.touch_opacity", nullptr,
+         [](Settings &s, const std::string &t) {
+             return parse_float(t, kMinTouchOpacity, kMaxTouchOpacity, s.touch_opacity);
+         },
+         [](const Settings &s) { return format_float(s.touch_opacity); }, nullptr},
+        {"input.touch_size", nullptr,
+         [](Settings &s, const std::string &t) { return parse_float(t, kMinTouchSize, kMaxTouchSize, s.touch_size); },
+         [](const Settings &s) { return format_float(s.touch_size); }, nullptr},
+        {"input.touch_camera_speed", nullptr,
+         [](Settings &s, const std::string &t) {
+             return parse_float(t, kMinTouchCameraSpeed, kMaxTouchCameraSpeed, s.touch_camera_speed);
+         },
+         [](const Settings &s) { return format_float(s.touch_camera_speed); }, nullptr},
+        BOOL_FIELD("input.invert_mouse_x", invert_mouse_x),
+        BOOL_FIELD("input.invert_mouse_y", invert_mouse_y),
+        {"input.tilt", "TILT",
+         [](Settings &s, const std::string &t) { return parse_bool(t, s.tilt); },
+         [](const Settings &s) { return std::string(s.tilt ? "1" : "0"); },
+         [](Settings &s, const char *t) { s.tilt = variable_flag(t); }},
+        {"input.tilt_mode", "TILT_MODE",
+         [](Settings &s, const std::string &t) { return kTiltModes.parse(t, s.tilt_mode); },
+         [](const Settings &s) { return kTiltModes.format(s.tilt_mode); },
+         [](Settings &s, const char *t) {
+             if (!kTiltModes.parse(t, s.tilt_mode)) std::cerr << "[settings] " << env_name("TILT_MODE") << ": angle, rate, or level (also horizon)\n";
+         }},
+        {"input.tilt_full", "TILT_FULL",
+         [](Settings &s, const std::string &t) {
+             return parse_float(t, input::tilt::kMinFullTilt, input::tilt::kMaxFullTilt, s.tilt_full);
+         },
+         [](const Settings &s) { return format_float(s.tilt_full); },
+         [](Settings &s, const char *t) {
+             s.tilt_full = variable_float(t, 12.0f, input::tilt::kMinFullTilt, input::tilt::kMaxFullTilt);
+         }},
+        {"input.tilt_dead_zone", "TILT_DEAD_ZONE",
+         [](Settings &s, const std::string &t) {
+             return parse_float(t, input::tilt::kMinDeadZone, input::tilt::kMaxDeadZone, s.tilt_dead_zone);
+         },
+         [](const Settings &s) { return format_float(s.tilt_dead_zone); },
+         [](Settings &s, const char *t) {
+             s.tilt_dead_zone = variable_float(t, 4.0f, input::tilt::kMinDeadZone, input::tilt::kMaxDeadZone);
+         }},
+        BOOL_FIELD("input.tilt_invert", tilt_invert),
+        {"input.jump_button", nullptr,
+         [](Settings &s, const std::string &t) { return kJumpButtons.parse(t, s.jump_button); },
+         [](const Settings &s) { return kJumpButtons.format(s.jump_button); }, nullptr},
+        {"input.tilt_level_limit", nullptr,
+         [](Settings &s, const std::string &t) {
+             return parse_float(t, input::tilt::kMinLevelLimit, input::tilt::kMaxLevelLimit, s.tilt_level_limit);
+         },
+         [](const Settings &s) { return format_float(s.tilt_level_limit); }, nullptr},
+        {"input.name_entry", "OSK_MODE",
+         [](Settings &s, const std::string &t) { return kNameEntries.parse(t, s.name_entry); },
+         [](const Settings &s) { return kNameEntries.format(s.name_entry); },
+         [](Settings &s, const char *t) {
+             if (!kNameEntries.parse(t, s.name_entry)) std::cerr << "[settings] " << env_name("OSK_MODE") << ": keyboard or fixed\n";
+         }},
+        {"input.name", "OSK_TEXT",
+         [](Settings &s, const std::string &t) {
+             if (t.empty()) return false;
+             s.name = t;
+             return true;
+         },
+         [](const Settings &s) { return s.name; }, [](Settings &s, const char *t) { s.name = t; }},
+        {"network.adhoc", "ADHOC",
+         [](Settings &s, const std::string &t) { return parse_bool(t, s.adhoc); },
+         [](const Settings &s) { return std::string(s.adhoc ? "1" : "0"); },
+         [](Settings &s, const char *t) { s.adhoc = variable_flag(t); }},
+        {"network.server", "ADHOC_SERVER",
+         [](Settings &s, const std::string &t) {
+             s.adhoc_server = t;
+             return true;
+         },
+         [](const Settings &s) { return s.adhoc_server; }, [](Settings &s, const char *t) { s.adhoc_server = t; }},
+        {"network.nickname", "ADHOC_NICKNAME",
+         [](Settings &s, const std::string &t) {
+             s.adhoc_nickname = t;
+             return true;
+         },
+         [](const Settings &s) { return s.adhoc_nickname; },
+         [](Settings &s, const char *t) { s.adhoc_nickname = t; }},
+        {"network.mac", "ADHOC_MAC",
+         [](Settings &s, const std::string &t) {
+             s.adhoc_mac = t;
+             return true;
+         },
+         [](const Settings &s) { return s.adhoc_mac; }, [](Settings &s, const char *t) { s.adhoc_mac = t; }},
+        {"ui.menu_pause", "MENU_PAUSE",
+         [](Settings &s, const std::string &t) { return parse_bool(t, s.menu_pause); },
+         [](const Settings &s) { return std::string(s.menu_pause ? "1" : "0"); },
+         [](Settings &s, const char *t) { s.menu_pause = variable_flag(t); }},
+        {"ui.menu_pause_multiplayer", "MENU_PAUSE_MULTIPLAYER",
+         [](Settings &s, const std::string &t) { return parse_bool(t, s.menu_pause_multiplayer); },
+         [](const Settings &s) { return std::string(s.menu_pause_multiplayer ? "1" : "0"); },
+         [](Settings &s, const char *t) { s.menu_pause_multiplayer = variable_flag(t); }},
+        {"network.recent", nullptr,
+         [](Settings &s, const std::string &t) {
+             s.adhoc_recent.clear();
+             std::size_t start = 0;
+             while (start <= t.size()) {
+                 const std::size_t end = std::min(t.find(',', start), t.size());
+                 if (end > start) s.adhoc_recent.push_back(t.substr(start, end - start));
+                 start = end + 1u;
+             }
+             return true;
+         },
+         [](const Settings &s) {
+             std::string text;
+             for (const std::string &address : s.adhoc_recent) text += (text.empty() ? "" : ",") + address;
+             return text;
+         },
+         nullptr},
+        {"network.host_port", "ADHOC_HOST_PORT",
+         [](Settings &s, const std::string &t) { return parse_uint(t, 1024u, 65534u, s.adhoc_host_port); },
+         [](const Settings &s) { return std::to_string(s.adhoc_host_port); },
+         [](Settings &s, const char *t) {
+             std::uint32_t value = s.adhoc_host_port;
+             if (parse_uint(t, 1024u, 65534u, value)) s.adhoc_host_port = value;
+         }},
+        BOOL_FIELD("ui.menu_hint_seen", menu_hint_seen),
+        BOOL_FIELD("saves.backup_timestamp", backup_timestamp),
+        {"ui.last_folder", nullptr,
+         [](Settings &s, const std::string &t) {
+             s.last_folder = t;
+             return true;
+         },
+         [](const Settings &s) { return s.last_folder; }, nullptr},
+    };
+    return table;
+}
+
+// One key per bound action, "input.bind.triangle=Mouse Left", after the
+// fixed table.
+const std::vector<Field> &all_fields() {
+    static const std::vector<Field> table = [] {
+        // Field keys are C strings; these hold them for the program's life.
+        static std::vector<std::string> keys(input::kActions);
+        std::vector<Field> list = fields();
+        for (std::size_t i = 0; i < input::kActions; ++i) {
+            keys[i] = std::string("input.bind.") + input::info(static_cast<input::Action>(i)).key;
+            list.push_back(Field{keys[i].c_str(), nullptr,
+                                 [i](Settings &s, const std::string &t) { return input::parse(t, s.bindings[i]); },
+                                 [i](const Settings &s) { return input::format(s.bindings[i]); }, nullptr});
+        }
+        return list;
+    }();
+    return table;
+}
+
+#undef BOOL_FIELD
+
+struct State {
+    bool loaded{};
+    Settings values;
+    std::filesystem::path data_dir;
+    // What settings.ini held, so values the environment decided are written
+    // back as the file had them.
+    install::SettingsEntries file;
+    std::map<std::string, std::string> overrides;
+};
+
+State &state() {
+    static State value;
+    return value;
+}
+
+void load(State &s) {
+    s.loaded = true;
+    s.values = defaults();
+    try {
+        s.data_dir = install::user_data_directory();
+        s.file = install::read_settings_file(s.data_dir);
+    } catch (const std::exception &e) {
+        std::cerr << "[settings] cannot read settings.ini: " << e.what() << "\n";
+    }
+    for (const Field &field : all_fields()) {
+        if (const auto found = s.file.find(field.key); found != s.file.end() && !field.parse(s.values, found->second))
+            std::cerr << "[settings] ignoring " << field.key << "=" << found->second << "\n";
+        if (field.variable == nullptr) continue;
+        const char *text = portablekit::env(field.variable);
+        if (text == nullptr) continue;
+        field.parse_variable(s.values, text);
+        s.overrides[field.key] = env_name(field.variable);
+    }
+    // Bindings settings.ini did not hold are defaults, which must not take a
+    // key it gave another control.
+    std::array<bool, input::kActions> saved{};
+    bool any_saved = false;
+    for (std::size_t i = 0; i < input::kActions; ++i) {
+        saved[i] = s.file.count(std::string("input.bind.") + input::info(static_cast<input::Action>(i)).key) != 0u;
+        any_saved = any_saved || saved[i];
+    }
+    if (any_saved) input::keep_saved(s.values.bindings, saved);
+    if (portablekit::env("TRACE_PAD") != nullptr) {
+        std::cout << "[pad] keyboard:";
+        for (std::size_t i = 0; i < input::kActions; ++i)
+            std::cout << " " << input::info(static_cast<input::Action>(i)).key << "="
+                      << input::format(s.values.bindings[i]) << (saved[i] ? "" : "*");
+        std::cout << " (* the game's default); mouse " << (s.values.mouse ? "on" : "off") << std::endl;
+    }
+    // A fixed name in the environment is meant for unattended runs, which
+    // nobody is there to type in, so it also answers at once unless
+    // the OSK_MODE variable says otherwise.
+    if (s.overrides.count("input.name_entry") == 0u && portablekit::env("OSK_TEXT") != nullptr) {
+        s.values.name_entry = NameEntry::Fixed;
+        s.overrides["input.name_entry"] = env_name("OSK_TEXT");
+    }
+}
+
+} // namespace
+
+Settings &current() {
+    State &s = state();
+    if (!s.loaded) load(s);
+    return s.values;
+}
+
+std::string game_default_name() {
+    const char *name = game().default_player_name;
+    return name != nullptr ? name : "";
+}
+
+Settings defaults_for(Platform platform) {
+    Settings values{};
+    // Confirm where a console of the game's region has it: cross, the south
+    // button, outside Japan; circle, the east button, in Japan.
+    values.confirm_south = active_confirm_button() == 1u;
+    // The game's keyboard first; a phone then turns the mouse off either way.
+    if (const auto keyboard = game().keyboard_defaults) keyboard(values.bindings, values.mouse);
+    if (platform == Platform::Android) {
+        values.aspect = Aspect::Fill;
+        set_display_mode(values, DisplayMode::Fullscreen);
+        values.mouse = false;
+    }
+    return values;
+}
+
+const Settings &defaults() {
+    static const Settings value = defaults_for(kPlatform);
+    return value;
+}
+
+void save() {
+    State &s = state();
+    if (!s.loaded) load(s);
+    install::SettingsEntries entries;
+    try {
+        // Re-read, so a key the installer wrote since start-up survives.
+        entries = install::read_settings_file(s.data_dir);
+        for (const Field &field : all_fields()) {
+            if (s.overrides.count(field.key) != 0u) {
+                const auto kept = s.file.find(field.key);
+                if (kept != s.file.end()) entries[field.key] = kept->second;
+                else entries.erase(field.key);
+                continue;
+            }
+            entries[field.key] = field.format(s.values);
+        }
+        entries.erase(kRetiredTypeNameKey);
+        entries.erase(kRetiredInternalScaleKey);
+        install::write_settings_file(s.data_dir, entries);
+    } catch (const std::exception &e) {
+        std::cerr << "[settings] cannot write settings.ini: " << e.what() << "\n";
+    }
+}
+
+std::string format_resolution(Resolution resolution) {
+    if (resolution.follows_window()) return "window";
+    if (resolution.lines_only()) return std::to_string(resolution.height);
+    return std::to_string(resolution.width) + "x" + std::to_string(resolution.height);
+}
+
+// "window" (or "auto"), or a size such as "1920x1080"; each side is kept
+// within kMinResolutionSide..kMaxResolutionSide.
+bool parse_resolution(const std::string &text, Resolution &out) {
+    if (text == "window" || text == "auto") {
+        out = {};
+        return true;
+    }
+    const std::size_t x = text.find_first_of("xX");
+    if (x == std::string::npos) {
+        // "1080": lines only, the width from the picture's shape.
+        std::uint32_t lines = 0u;
+        if (!parse_uint(text, kMinResolutionSide, kMaxResolutionSide, lines)) return false;
+        out = {0u, lines};
+        return true;
+    }
+    std::uint32_t width = 0u;
+    std::uint32_t height = 0u;
+    if (!parse_uint(text.substr(0, x), kMinResolutionSide, kMaxResolutionSide, width) ||
+        !parse_uint(text.substr(x + 1u), kMinResolutionSide, kMaxResolutionSide, height))
+        return false;
+    out = {width, height};
+    return true;
+}
+
+bool parse_aspect(const std::string &text, Aspect &aspect, std::uint32_t &shape_width, std::uint32_t &shape_height) {
+    Aspect named{};
+    if (kAspects.parse(text, named)) {
+        aspect = named;
+        shape_width = shape_height = 0u;
+        return true;
+    }
+    const std::size_t colon = text.find(':');
+    if (colon == std::string::npos) return false;
+    std::uint32_t w = 0u, h = 0u;
+    if (!parse_uint(text.substr(0, colon), 1u, 1000u, w) || !parse_uint(text.substr(colon + 1u), 1u, 1000u, h)) return false;
+    if (w == 21u && h == 9u) w = 43u, h = 18u;  // "21:9" panels are 3440x1440 (43:18)
+    const double ratio = static_cast<double>(w) / h;
+    if (ratio < 0.5 || ratio > 4.0) return false;
+    aspect = Aspect::Fill;
+    shape_width = w;
+    shape_height = h;
+    return true;
+}
+
+std::string format_aspect(const Settings &s) {
+    if (s.aspect != Aspect::Fill || s.shape_width == 0u || s.shape_height == 0u) return kAspects.format(s.aspect);
+    if (s.shape_width == 43u && s.shape_height == 18u) return "21:9";
+    return std::to_string(s.shape_width) + ":" + std::to_string(s.shape_height);
+}
+
+double fill_shape(const Settings &s) {
+    if (s.aspect != Aspect::Fill || s.shape_width == 0u || s.shape_height == 0u) return 0.0;
+    return static_cast<double>(s.shape_width) / static_cast<double>(s.shape_height);
+}
+
+std::string resolution_name(Resolution resolution) {
+    for (const ResolutionPreset &preset : kResolutionPresets)
+        if (preset.size == resolution) return preset.name;
+    return format_resolution(resolution);
+}
+
+std::string overridden_by(const char *key) {
+    State &s = state();
+    if (!s.loaded) load(s);
+    const auto found = s.overrides.find(key);
+    return found != s.overrides.end() ? found->second : std::string();
+}
+
+} // namespace portablekit::settings

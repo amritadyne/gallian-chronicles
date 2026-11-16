@@ -1,0 +1,23 @@
+--- a/host/hle/hle_savedata.cpp	2026-11-11 18:32:06.224465770 +0000
++++ b/host/hle/hle_savedata.cpp	2026-11-11 18:32:16.333502952 +0000
+@@ -41,6 +41,12 @@
+ // SceUtilitySavedataParam, after the common dialog header.
+ namespace param {
+ constexpr std::uint32_t kMode = 0x30u;
++// Set by the system on a load: whether the save was made on this console
++// (1021 here: its low two bits 1 mean bound to this PSP). VC2 shows
++// "Save data creation date does not match the PSP system" (MTPA_SYS 49) and
++// turns off data-link and password content when the low two bits are not 1.
++constexpr std::uint32_t kBind = 0x34u;
++constexpr std::uint32_t kBoundHere = 1021u;
+ constexpr std::uint32_t kOverwrite = 0x38u;
+ constexpr std::uint32_t kGameName = 0x3Cu;      // char[13]
+ constexpr std::uint32_t kSaveName = 0x4Cu;      // char[20]
+@@ -256,6 +262,7 @@
+     const auto count = static_cast<std::uint32_t>(std::min<std::size_t>(data.size(), capacity));
+     memory.copy_in(buffer, std::span<const std::uint8_t>(data.data(), count));
+     memory.store32(params + param::kDataSize, count);
++    memory.store32(params + param::kBind, param::kBoundHere);  // made on this console
+     write_cstring(memory, params + param::kTitle, loaded.contents.title, 128u);
+     write_cstring(memory, params + param::kSavedataTitle, loaded.contents.savedata_title, 128u);
+     write_cstring(memory, params + param::kDetail, loaded.contents.detail, 1024u);

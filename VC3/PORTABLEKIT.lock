@@ -1,0 +1,3 @@
+repository = https://github.com/TeamGDB/PortableKit
+revision = 33800c4060c53f3233e08f8ab2cc4590a0872063
+note = vendored with this port's changes

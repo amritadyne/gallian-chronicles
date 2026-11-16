@@ -1,0 +1,12 @@
+# SDL3 development dependency record
+#
+# Source archive: official SDL GitHub release, verified before extraction.
+
+repository = https://github.com/libsdl-org/SDL
+release = 3.4.18
+archive = SDL3-devel-3.4.18-mingw.tar.gz
+url = https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-devel-3.4.18-mingw.tar.gz
+sha256 = 049b9dd711e3fb3f8d84feb998dfec54a75e17cf539c4a80ff4d058d839771cf
+license = zlib
+retrieved_utc = 2026-11-06
+purpose = SDL3 windowing, keyboard/mouse, and modern-controller input for PortableKit's Vulkan renderer
