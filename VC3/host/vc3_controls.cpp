@@ -87,6 +87,7 @@
 // player presses stops it, and it gives up after two minutes.
 #include "vc3_controls.hpp"
 #include "vc3_camera.hpp"
+#include "vc3_discord.hpp"
 #include "vc3_region.hpp"
 #include "vc3_settings.hpp"
 #include "vc3_settings_menu.hpp"
@@ -195,7 +196,9 @@ std::array<KbmButton, 14> &kbm_buttons() {
         // On the map a held right button is Triangle (the map camera) and a
         // quick click goes back (Circle; kbm_buttons_now): Base Camp and the
         // menus over it run the map's screen cursor, where it was Triangle and
-        // did not back out (owner, 2026-11-16).
+        // did not back out (owner, 2026-11-16). On the battle map (Command
+        // Mode, the same cursor) it is Triangle at once, the unit's command
+        // list, as the tutorial says (owner, 2026-11-23).
         {"right click", {0, 0}, kMouseRight, {kSquare, kCircle, kTriangle, kCircle}, nullptr},
         // After the right button: on the map its prompt stays the right click.
         {"Q", {kKeyQ, 0}, 0, {kTriangle, kTriangle, kTriangle, kTriangle}, "Q"},
@@ -267,6 +270,12 @@ std::atomic<int> &last_context() {
     return context;
 }
 
+// The right button went down on the battle map (Command Mode).
+bool &battle_click() {
+    static bool on = false;
+    return on;
+}
+
 std::uint32_t kbm_buttons_now(Context context) {
 #if defined(PORTABLEKIT_HAS_SDL)
     const bool keyboard = SDL_GetKeyboardFocus() != nullptr;
@@ -294,6 +303,17 @@ std::uint32_t kbm_buttons_now(Context context) {
         if (held && !button.held && ++presses_logged <= 5000u)
             std::cerr << "[vc3-controls] " << button.name << " in context " << static_cast<int>(context) << " -> 0x"
                       << std::hex << button.latched << std::dec << "\n";
+        // The right button on the battle map: Triangle while held (a unit's
+        // command list), no map camera.
+        if (&button == &kbm_buttons()[kRightClick] && held && !button.held) battle_click() = button.pressed_in == kOnMap && in_battle();
+        if (&button == &kbm_buttons()[kRightClick] && battle_click()) {
+            static std::uint32_t battle_logged = 0u;
+            if (held && !button.held && ++battle_logged <= 200u)
+                std::cerr << "[vc3-controls] right click on the battle map: Triangle (command list)\n";
+            button.held = held;
+            if (held) out |= kTriangle;
+            continue;
+        }
         // The right button on the map: Triangle only once held a moment (the
         // map camera); let go sooner, a short Circle (back).
         if (&button == &kbm_buttons()[kRightClick] && button.pressed_in == kOnMap && button.latched == kTriangle) {
@@ -320,7 +340,7 @@ std::uint32_t kbm_buttons_now(Context context) {
     // vehicle).
     const KbmButton &right = kbm_buttons()[kRightClick];
     const KbmButton &square = kbm_buttons()[kSquareKey];
-    const bool map_hold = right.held && right.pressed_in == kOnMap;
+    const bool map_hold = right.held && right.pressed_in == kOnMap && !battle_click();
     const bool menu_hold = square.held && square.pressed_in == kElsewhere;
     static bool was_hold = false;
     if ((map_hold || menu_hold) != was_hold) {
@@ -533,7 +553,7 @@ void remap_inner(Runtime &rt, std::uint32_t buffer, std::uint32_t count) {
         // Holding the right button on the map stops the map's cursor code (the
         // camera takes over), but it is still the map.
         const KbmButton &right = kbm_buttons()[kRightClick];
-        const bool map_held = right.held && right.pressed_in == kOnMap;
+        const bool map_held = right.held && right.pressed_in == kOnMap && !battle_click();
         const Context context = action                       ? kInAction
                                 : target_mode()              ? kInTarget
                                 : cursor_mode() || map_held  ? kOnMap

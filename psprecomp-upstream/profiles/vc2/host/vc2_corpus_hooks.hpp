@@ -38,9 +38,15 @@ struct Vc2CorpusHooks {
     std::uint32_t (*morale_step)(std::uint32_t amount, std::uint32_t position, std::uint32_t morale) noexcept;
     void (*glyph_begin)(std::uint32_t font, std::uint32_t flags, std::uint32_t code, std::uint32_t table) noexcept;
     void (*glyph_end)(std::uint32_t font) noexcept;
+    bool (*attack_hold)(std::uint32_t state) noexcept;
+    void (*attack_done)() noexcept;
+    std::uint32_t (*attack_ready)(std::uint32_t state, std::uint32_t ready) noexcept;
+    std::uint32_t (*pause_steps)(std::uint32_t object, std::uint32_t whole) noexcept;
+    bool (*manager_hold)() noexcept;
+    void (*manager_done)() noexcept;
 };
 
-inline constexpr std::uint32_t kVc2CorpusHooksVersion = 1u;
+inline constexpr std::uint32_t kVc2CorpusHooksVersion = 7u;
 
 // The corpus library's entry point that takes the table (returns the
 // library's own version, so a mismatch is reported).

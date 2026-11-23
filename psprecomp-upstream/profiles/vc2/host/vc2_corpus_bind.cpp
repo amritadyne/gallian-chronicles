@@ -40,6 +40,12 @@ void vc2_move_stick(std::uint32_t vector, std::uint32_t sp) noexcept;
 std::uint32_t vc2_morale_step(std::uint32_t amount, std::uint32_t position, std::uint32_t morale) noexcept;
 void vc2_glyph_begin(std::uint32_t font, std::uint32_t flags, std::uint32_t code, std::uint32_t table) noexcept;
 void vc2_glyph_end(std::uint32_t font) noexcept;
+bool vc2_attack_hold(std::uint32_t state) noexcept;
+void vc2_attack_done() noexcept;
+std::uint32_t vc2_attack_ready(std::uint32_t state, std::uint32_t ready) noexcept;
+std::uint32_t vc2_pause_steps(std::uint32_t object, std::uint32_t whole) noexcept;
+bool vc2_manager_hold() noexcept;
+void vc2_manager_done() noexcept;
 }
 
 namespace portablekit::vc2 {
@@ -66,6 +72,12 @@ constexpr Vc2CorpusHooks kHooks{
     &vc2_morale_step,
     &vc2_glyph_begin,
     &vc2_glyph_end,
+    &vc2_attack_hold,
+    &vc2_attack_done,
+    &vc2_attack_ready,
+    &vc2_pause_steps,
+    &vc2_manager_hold,
+    &vc2_manager_done,
 };
 
 // The library main.cpp loads for this edition (the same instance: a library

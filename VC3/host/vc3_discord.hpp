@@ -13,5 +13,9 @@ void set_discord(bool on);
 // A message the game fetched by its id (vc3_text.cpp): where the player is
 // (Base Camp's, the march map's or a battle's messages).
 void discord_note_message(std::uint32_t id);
+// The player is in a battle: Action or Target Mode, or a battle's message
+// came after any of Base Camp's or the march map's (vc3_controls.cpp: on the
+// battle map the right click opens a unit's command list).
+[[nodiscard]] bool in_battle();
 
 }  // namespace portablekit::vc3

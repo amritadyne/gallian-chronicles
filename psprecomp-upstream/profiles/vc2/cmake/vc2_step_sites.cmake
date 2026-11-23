@@ -27,7 +27,16 @@
 #             x 8.0 a frame, clamped to +-240 / +-136; the map camera pans
 #             after it (it reads the cursor at +192/+196, 0x08A5D240), so it
 #             panned 5.5x fast at 165 Hz (found 2026-11-08)
-set(_vc2_frame_add_sites 08893C48 08C5953C 08C59550 08C59584 08A4C170 08A4C178)
+#   088FDAB0  interception fire (2026-11-23): while a unit moves, each enemy
+#             that can see it adds the move state's rate to its fire timer
+#             (+0x850) once a frame and fires a shot each time the timer
+#             passes the weapon's interval (SysStateMove, 0x088FD744). Only in
+#             one versus mode does the game multiply the rate by the step
+#             (0x088FD80C); otherwise it is per frame, so at 165 Hz in combat
+#             enemies fired 5.5 times as often. vc2_patch_intercept_sites marks
+#             which way the rate was made; vc2_frame_scale scales only the
+#             per-frame one (host/vc2_tick.cpp).
+set(_vc2_frame_add_sites 08893C48 08C5953C 08C59550 08C59584 08A4C170 08A4C178 088FDAB0)
 #
 # Frame-locked counters: `n += k` (whole numbers) once per frame. Each becomes
 # n += vc2_frame_count(pc, k): the same scale, with a running remainder per
@@ -317,6 +326,8 @@ function(vc2_patch_hook generated_dir unit label first_line call declaration wha
         return()
     endif()
     file(READ "${file}" text)
+    # CMake on Windows writes the units back with CRLF line ends: match on LF.
+    string(REPLACE "\r\n" "\n" text "${text}")
     set(original "${text}")
     string(FIND "${text}" "${label}:\n    ${call}\n" done)
     if(done EQUAL -1)
@@ -335,6 +346,73 @@ function(vc2_patch_hook generated_dir unit label first_line call declaration wha
         file(WRITE "${file}" "${text}")
         message(STATUS "VC2 ${what} ${label}: patched")
     endif()
+endfunction()
+
+# Interception fire (see 088FDAB0 above): the move state makes its rate at
+# 0x088FD7DC (per frame) and multiplies it by the step at 0x088FD80C only in a
+# versus mode. Each site tells vc2_frame_scale which it was (value 0, result
+# unused), so the rate added at 088FDAB0 is scaled once, and only when the
+# game did not already scale it.
+function(vc2_patch_intercept_sites generated_dir)
+    set(declaration "extern \"C\" float vc2_frame_scale(std::uint32_t pc, float value) noexcept;")
+    vc2_patch_hook("${generated_dir}" 0062 L_088FD7DC
+        "ctx.fpr[22] = ctx.fpr[12] / ctx.fpr[22];"
+        "(void)vc2_frame_scale(0x088FD7DCu, 0.0f);  // interception rate made per frame"
+        "${declaration}"
+        "interception rate site")
+    vc2_patch_hook("${generated_dir}" 0062 L_088FD80C
+        "{ const float fs = ctx.fpr[22]; const float ft = ctx.fpr[12];"
+        "(void)vc2_frame_scale(0x088FD80Cu, 0.0f);  // interception rate times the step (versus)"
+        "${declaration}"
+        "interception step site")
+    # Interception fire's pause (2026-11-23, found in VC3 with the trace-build
+    # swap hunt; the same code here): the countdown at +0x1BB4 runs down by the
+    # frame's whole steps, at least 1 (trunc(step) at step site 0x0889DEF8,
+    # then `if <= 0: 1` at 0x0889DF08). At a high frame rate that made it 1
+    # every frame, so enemies fired almost without a pause. At the join
+    # (0x0889DF0C) the amount becomes the step site's own whole steps (f12), 0
+    # included; at the game's rate the step is 1 or 2 and nothing changes.
+    vc2_patch_hook("${generated_dir}" 0038 L_0889DF0C
+        "ctx.gpr[5] = (aot_mem.aot_load32(ctx.gpr[16] + static_cast<std::uint32_t>(7092)));"
+        "ctx.gpr[4] = std::bit_cast<std::uint32_t>(ctx.fpr[12]);  // interception pause: the whole steps, unclamped"
+        "#include <bit>"
+        "interception pause site")
+    # ... and each unit counts its own whole steps (the site's remainder is
+    # shared by every unit that calls it in a frame): vc2_pause_steps.
+    vc2_patch_hook("${generated_dir}" 0038 L_0889DF10
+        "ctx.gpr[4] = (ctx.gpr[5] - ctx.gpr[4]);"
+        "ctx.gpr[4] = vc2_pause_steps(ctx.gpr[16], ctx.gpr[4]);"
+        "extern \"C\" std::uint32_t vc2_pause_steps(std::uint32_t object, std::uint32_t whole) noexcept;"
+        "interception pause steps site")
+    # Burst fire (2026-11-23, VC3-tested): the attack state's phases and shots
+    # counted in updates (vc2_tick.cpp vc2_attack_hold / _done / _ready).
+    vc2_patch_hook("${generated_dir}" 0066 L_0890D52C
+        "ctx.gpr[29] = (ctx.gpr[29] + static_cast<std::uint32_t>(-1712));"
+        "if (vc2_attack_hold(ctx.gpr[4])) { ctx.pc = ctx.gpr[31]; return; }"
+        "extern \"C\" bool vc2_attack_hold(std::uint32_t state) noexcept;"
+        "attack phase site")
+    vc2_patch_hook("${generated_dir}" 0066 L_0890FE28
+        "ctx.fpr[20] = std::bit_cast<float>(aot_mem.aot_load32(ctx.gpr[29] + static_cast<std::uint32_t>(1664)));"
+        "vc2_attack_done();"
+        "extern \"C\" void vc2_attack_done() noexcept;"
+        "attack phase end site")
+    vc2_patch_hook("${generated_dir}" 0066 L_0890F678
+        "{ const bool branch_taken = ctx.gpr[2] == 0u;"
+        "ctx.gpr[2] = vc2_attack_ready(ctx.gpr[16], ctx.gpr[2]);"
+        "extern \"C\" std::uint32_t vc2_attack_ready(std::uint32_t state, std::uint32_t ready) noexcept;"
+        "burst fire site")
+    # The battle manager's frame (0x088D1974, one exit 0x088D1AB4): at a high
+    # frame rate once per game frame of time (vc2_manager_hold / _done).
+    vc2_patch_hook("${generated_dir}" 0051 L_088D1974
+        "ctx.gpr[29] = (ctx.gpr[29] + static_cast<std::uint32_t>(-32));"
+        "if (vc2_manager_hold()) { ctx.pc = ctx.gpr[31]; return; }"
+        "extern \"C\" bool vc2_manager_hold() noexcept;"
+        "battle manager site")
+    vc2_patch_hook("${generated_dir}" 0051 L_088D1AB4
+        "ctx.gpr[16] = (aot_mem.aot_load32(ctx.gpr[29] + static_cast<std::uint32_t>(0)));"
+        "vc2_manager_done();"
+        "extern \"C\" void vc2_manager_done() noexcept;"
+        "battle manager end site")
 endfunction()
 
 function(vc2_patch_camera_sites generated_dir)
@@ -593,4 +671,5 @@ function(vc2_patch_camera_sites generated_dir)
             message(STATUS "VC2 glyph ${site} site (EU L_${eu}): patched")
         endif()
     endforeach()
+    vc2_patch_intercept_sites("${generated_dir}")
 endfunction()

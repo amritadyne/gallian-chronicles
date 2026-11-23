@@ -34,7 +34,12 @@ set(_vc3_step_sites
 # The unit timer (VC2 0x08893C48: unit+0x8A4 += 1.0; VC3 0x08895DD4, unit
 # +0x8C4), found by hand 2026-11-16 (a grenade vanished at the top of its arc
 # at high frame rates only).
-set(_vc3_frame_add_sites 08C4CFC0 08C4CFD4 08C4D008 08895DD4)
+# 0890EA38: interception fire (VC2 088FDAB0, 2026-11-23): each enemy that can
+# see a moving unit adds the move state's per-frame rate to its fire timer
+# (+0x870) once a frame and fires each time it passes the weapon's interval,
+# so at 165 Hz enemies fired 5.5 times as often. Scaled unless the game already
+# multiplied the rate by the step (a versus mode; vc3_patch_intercept_sites).
+set(_vc3_frame_add_sites 08C4CFC0 08C4CFD4 08C4D008 08895DD4 0890EA38)
 # Frame-locked counters: `n += 1` once a frame. The main loop's frame counter
 # (VC2 0x08BD2EAC); the unit counter (VC2 0x088BFCC8 +0x830, VC3 0x088C9114
 # +0x850, in the function the unit timer calls just before it adds).
@@ -130,6 +135,8 @@ function(vc3_patch_hook generated_dir label first_line call declaration what)
         return()
     endif()
     file(READ "${file}" text)
+    # CMake on Windows writes the units back with CRLF line ends: match on LF.
+    string(REPLACE "\r\n" "\n" text "${text}")
     set(original "${text}")
     string(FIND "${text}" "${label}:\n    ${call}\n" done)
     if(done EQUAL -1)
@@ -165,6 +172,58 @@ function(vc3_patch_morale_sites generated_dir)
             "morale gauge site")
     endforeach()
     vc3_patch_flight_sites("${generated_dir}")
+    vc3_patch_intercept_sites("${generated_dir}")
+    # Interception fire's pause (2026-11-23, found with the trace-build swap
+    # hunt: owner marked 53 bursts at Game rate). The function at 0x088A1558
+    # counts the pause down at +0x6034 by the frame's whole steps, at least 1:
+    # trunc(step) (step site 0x088A1630), then `if <= 0: 1` (0x088A1640). At a
+    # high frame rate the step site gives 0 on most frames, the clamp made that
+    # 1, so the pause ran down by a whole step every frame (2.75x fast at
+    # 165 Hz in combat) and enemies fired almost without a pause. At the join
+    # (0x088A1644) the amount becomes the step site's own whole steps (f12),
+    # 0 included. At the game's rate the step is 1 or 2, so the clamp never
+    # mattered and nothing changes. VC2 has the same code (0x0889DF0C).
+    vc3_patch_hook("${generated_dir}" L_088A1644 "ctx.gpr[5] = (aot_mem.aot_load32(ctx.gpr[16] + static_cast<std::uint32_t>(24628)));"
+        "ctx.gpr[4] = std::bit_cast<std::uint32_t>(ctx.fpr[12]);  // interception pause: the whole steps, unclamped"
+        "#include <bit>"
+        "interception pause site")
+    # ... and each unit counts its own whole steps (the site's remainder is
+    # shared by every unit that calls it in a frame): vc3_pause_steps.
+    vc3_patch_hook("${generated_dir}" L_088A1648 "ctx.gpr[4] = (ctx.gpr[5] - ctx.gpr[4]);"
+        "ctx.gpr[4] = vc3_pause_steps(ctx.gpr[16], ctx.gpr[4]);"
+        "extern \"C\" std::uint32_t vc3_pause_steps(std::uint32_t object, std::uint32_t whole) noexcept;  // vc3 pause steps site"
+        "interception pause steps site")
+    # Burst fire (interception and other bursts without their own timer): the
+    # attack state asks 0x0891ED94 "fire the next shot?" once an update and it
+    # answers yes every update, so a 10-shot burst took 10 frames: ~310 ms at
+    # the game's 30 fps, ~60 ms at 165. v0 goes through vc3_attack_ready, which
+    # lets one shot through per game frame of time.
+    vc3_patch_hook("${generated_dir}" L_08923DA8 "{ const bool branch_taken = ctx.gpr[2] == 0u;"
+        "ctx.gpr[2] = vc3_attack_ready(ctx.gpr[16], ctx.gpr[2]);"
+        "extern \"C\" std::uint32_t vc3_attack_ready(std::uint32_t state, std::uint32_t ready) noexcept;  // vc3 burst fire site"
+        "burst fire site")
+    # The battle manager's frame (0x088DD190, one exit 0x088DD2D0): at a high
+    # frame rate once per game frame of time (vc3_manager_hold / _done).
+    vc3_patch_hook("${generated_dir}" L_088DD190 "ctx.gpr[29] = (ctx.gpr[29] + static_cast<std::uint32_t>(-32));"
+        "if (vc3_manager_hold()) { ctx.pc = ctx.gpr[31]; return; }"
+        "extern \"C\" bool vc3_manager_hold() noexcept;  // vc3 battle manager site"
+        "battle manager site")
+    vc3_patch_hook("${generated_dir}" L_088DD2D0 "ctx.gpr[16] = (aot_mem.aot_load32(ctx.gpr[29] + static_cast<std::uint32_t>(0)));"
+        "vc3_manager_done();"
+        "extern \"C\" void vc3_manager_done() noexcept;  // vc3 battle manager end site"
+        "battle manager end site")
+    # The attack state's phases (all but aiming, 5) last a set number of
+    # updates: at a high frame rate they run once per game frame, with the
+    # step set to that frame for the update (vc3_attack_hold at the entry,
+    # vc3_attack_done at the one exit 0x089244D4).
+    vc3_patch_hook("${generated_dir}" L_089214F8 "ctx.gpr[29] = (ctx.gpr[29] + static_cast<std::uint32_t>(-1984));"
+        "if (vc3_attack_hold(ctx.gpr[4])) { ctx.pc = ctx.gpr[31]; return; }"
+        "extern \"C\" bool vc3_attack_hold(std::uint32_t state) noexcept;  // vc3 attack phase site"
+        "attack phase site")
+    vc3_patch_hook("${generated_dir}" L_089244D4 "ctx.fpr[20] = std::bit_cast<float>(aot_mem.aot_load32(ctx.gpr[29] + static_cast<std::uint32_t>(1936)));"
+        "vc3_attack_done();"
+        "extern \"C\" void vc3_attack_done() noexcept;  // vc3 attack phase end site"
+        "attack phase end site")
     # The game's sound effect function (0x08816500; a0 the sound's id): told
     # to the Settings row, which learns the menus' cursor sound from it
     # (host/vc3_settings_menu.cpp sound_played).
@@ -184,6 +243,22 @@ endfunction()
 # routine normalises to face it along its path) was zero. vc3_flight_step gives
 # each object its own remainder (s0 = the object, a0 = its time); vc3_flight_time
 # places it by its exact time, so it moves every frame.
+# Interception fire (0890EA38 above): the move state makes its rate at
+# 0x0890E718 (per frame) and multiplies it by the step at 0x0890E748 only in a
+# versus mode. Each site tells vc3_frame_scale which it was (value 0, result
+# unused), so the rate is scaled once, and only when the game did not.
+function(vc3_patch_intercept_sites generated_dir)
+    set(declaration "extern \"C\" float vc3_frame_scale(std::uint32_t pc, float value) noexcept;")
+    vc3_patch_hook("${generated_dir}" L_0890E718 "ctx.fpr[22] = ctx.fpr[12] / ctx.fpr[22];"
+        "(void)vc3_frame_scale(0x0890E718u, 0.0f);  // interception rate made per frame"
+        "${declaration}"
+        "interception rate site")
+    vc3_patch_hook("${generated_dir}" L_0890E748 "{ const float fs = ctx.fpr[22]; const float ft = ctx.fpr[12];"
+        "(void)vc3_frame_scale(0x0890E748u, 0.0f);  // interception rate times the step (versus)"
+        "${declaration}"
+        "interception step site")
+endfunction()
+
 function(vc3_patch_flight_sites generated_dir)
     foreach(pair IN ITEMS "L_089D1634:L_089D16D8" "L_089D7D8C:L_089D7E30")
         string(REPLACE ":" ";" labels "${pair}")

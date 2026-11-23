@@ -99,3 +99,25 @@ extern "C" void vc2_glyph_begin(std::uint32_t font, std::uint32_t flags, std::ui
 extern "C" void vc2_glyph_end(std::uint32_t font) noexcept {
     if (const Vc2CorpusHooks *h = hooks()) h->glyph_end(font);
 }
+extern "C" bool vc2_attack_hold(std::uint32_t state) noexcept {
+    const Vc2CorpusHooks *h = hooks();
+    return h != nullptr && h->attack_hold(state);
+}
+extern "C" void vc2_attack_done() noexcept {
+    if (const Vc2CorpusHooks *h = hooks()) h->attack_done();
+}
+extern "C" std::uint32_t vc2_attack_ready(std::uint32_t state, std::uint32_t ready) noexcept {
+    const Vc2CorpusHooks *h = hooks();
+    return h != nullptr ? h->attack_ready(state, ready) : ready;
+}
+extern "C" std::uint32_t vc2_pause_steps(std::uint32_t object, std::uint32_t whole) noexcept {
+    const Vc2CorpusHooks *h = hooks();
+    return h != nullptr ? h->pause_steps(object, whole) : whole;
+}
+extern "C" bool vc2_manager_hold() noexcept {
+    const Vc2CorpusHooks *h = hooks();
+    return h != nullptr && h->manager_hold();
+}
+extern "C" void vc2_manager_done() noexcept {
+    if (const Vc2CorpusHooks *h = hooks()) h->manager_done();
+}

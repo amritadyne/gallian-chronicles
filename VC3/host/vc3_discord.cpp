@@ -263,6 +263,12 @@ void discord_note_message(std::uint32_t id) {
     if (p != kPlaces) place_seen(p).store(now_ms());
 }
 
+bool in_battle() {
+    if (action_mode() || target_mode()) place_seen(kBattle).store(now_ms());
+    const long long battle = place_seen(kBattle).load();
+    return battle != 0 && battle >= place_seen(kCamp).load() && battle >= place_seen(kMarch).load();
+}
+
 void set_discord(bool on) {
     if (enabled().exchange(on) != on) std::cerr << "[vc3-discord] Discord status " << (on ? "on" : "off") << "\n";
 }

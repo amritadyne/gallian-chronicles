@@ -62,10 +62,12 @@
 #include <string>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <optional>
+#include <unordered_map>
 
 namespace portablekit::vc2 {
 namespace {
@@ -219,7 +221,7 @@ struct FrameSite {
     std::uint64_t calls = 0u;
     bool skipped = false;  // VC2_TICK_SKIP_SITES: left as the game wrote it
 };
-std::array<FrameSite, 8> g_frame_sites{{
+std::array<FrameSite, 11> g_frame_sites{{
     {0x08893C48u, "unit timer"},
     // The animation player's three sites are counted but no longer scaled:
     // since the frame-rate module fix its controller speed is already per
@@ -233,6 +235,13 @@ std::array<FrameSite, 8> g_frame_sites{{
     {0x08BD2EACu, "main loop counter"},
     {0x08A4C170u, "academy map cursor x"},
     {0x08A4C178u, "academy map cursor y"},
+    // Interception fire (cmake/vc2_step_sites.cmake, 2026-11-23): the move
+    // state's per-frame rate added to each enemy's fire timer; the two marks
+    // say whether the game made the rate per frame or (a versus mode) already
+    // times the step.
+    {0x088FDAB0u, "interception fire"},
+    {0x088FD7DCu, "interception rate (per frame)"},
+    {0x088FD80Cu, "interception rate (times the step)"},
 }};
 // VC2_TICK_SKIP_SITES=<pc>,<pc>,...: more frame-locked sites to leave
 // unscaled, to test whether one is still needed.
@@ -628,6 +637,158 @@ extern "C" std::uint32_t vc2_morale_step(std::uint32_t amount, std::uint32_t pos
 // Called by the patched generated code (cmake/vc2_step_sites.cmake) in place
 // of a frame-locked `x += value`: the value per frame of the game's own rate,
 // spread over ours.
+// Burst fire (2026-11-23, found in VC3; the attack state is the same here:
+// update 0x0890D52C, exit 0x0890FE28). The attack state (+0xF0 = its phase)
+// counts its phases in updates: raise 1/2/4, ready 8, wind-down 10/13/14, and
+// one shot per update in phase 7, so at a high frame rate bursts came several
+// times faster. Aim (5) is time-based; weapons with their own shot timer
+// (+0xF4 & 0x800) are too. All units and weapons use this one state.
+//  - vc2_attack_hold (update entry): in every phase but aiming (5) the
+//    update runs once per game frame of time, and sees the step of a game
+//    frame (vc2_attack_done at the exit puts the real step back);
+//  - vc2_attack_ready (after the "fire the next shot?" check 0x0890B69C, at
+//    0x0890F678): one shot per game frame of time; a burst's first at once.
+namespace {
+std::uint32_t g_attack_step_saved = 0u;
+bool g_attack_step_set = false;
+}  // namespace
+
+extern "C" bool vc2_attack_hold(std::uint32_t state) noexcept {
+    using namespace portablekit::vc2;
+    if (!g_step_sites_active) return false;
+    const TickState &t = tick();
+    if (t.time_block == 0u) return false;
+    auto &m = portablekit::kernel().runtime().memory();
+    const std::uint32_t raw = m.load32(t.time_block + 28u);
+    const float step = std::bit_cast<float>(raw);
+    if (!std::isfinite(step) || step <= 0.0f) return false;
+    static std::unordered_map<std::uint32_t, float> banked;
+    if (banked.size() > 256u) banked.clear();
+    const std::uint32_t phase = m.load32(state + 0xF0u);
+    float &time = banked[state];
+    // Aiming (5) is time-based; every other phase, the shots (7) included,
+    // runs once per game frame (2026-11-23: phase 7 also counts updates after
+    // its last shot, 2 game frames).
+    if (phase == 5u) {
+        time = 0.0f;
+        return false;
+    }
+    const float frame = static_cast<float>(t.game_interval);
+    time = std::min(time + step, 2.0f * frame);
+    if (time + 1e-4f < frame) return true;
+    time -= frame;
+    if (!g_attack_step_set) {
+        g_attack_step_saved = raw;
+        g_attack_step_set = true;
+        m.store32(t.time_block + 28u, std::bit_cast<std::uint32_t>(frame));
+    }
+    return false;
+}
+
+// The pause before a unit's next burst (2026-11-23): the countdown at
+// +0x1BB4 of each unit (0x0889DE28) runs down by the whole steps of step site
+// 0x0889DEF8. vc2_step_trunc keeps one remainder per site, and every unit
+// counting down calls that site each frame, so the remainder filled once per
+// unit a frame and each unit got whole steps several times too often (bursts
+// ~80 ms early uncapped). Here each unit (`object`) keeps its own remainder of
+// the real step. `whole` is the site's own answer, used at the game's rate.
+extern "C" std::uint32_t vc2_pause_steps(std::uint32_t object, std::uint32_t whole) noexcept {
+    using namespace portablekit::vc2;
+    if (!g_step_sites_active) return whole;
+    const TickState &t = tick();
+    if (t.time_block == 0u) return whole;
+    const float step = std::bit_cast<float>(g_attack_step_set ? g_attack_step_saved
+                                                              : portablekit::kernel().runtime().memory().load32(t.time_block + 28u));
+    if (!std::isfinite(step) || step <= 0.0f) return whole;
+    static std::unordered_map<std::uint32_t, double> remainders;
+    if (remainders.size() > 256u) remainders.clear();
+    double &remainder = remainders[object];
+    const double total = remainder + static_cast<double>(step);
+    const double steps = std::floor(total + 1e-6);
+    remainder = std::max(0.0, total - steps);
+    return static_cast<std::uint32_t>(steps);
+}
+
+// The battle manager's frame (2026-11-23; 0x088D1974, one exit 0x088D1AB4):
+// AI decisions, attack requests and the hand-offs between a unit's states run
+// here once a frame. At the game's rate each hand-off waits a 33 ms frame;
+// uncapped ~3 ms, so enemies refired ~80 ms early. At a high frame rate it now
+// runs once per game frame of time and sees a game frame's step for that run
+// (vc2_manager_done at its exit puts the real step back).
+namespace {
+std::uint32_t g_manager_step_saved = 0u;
+bool g_manager_step_set = false;
+}  // namespace
+
+extern "C" bool vc2_manager_hold() noexcept {
+    using namespace portablekit::vc2;
+    if (!g_step_sites_active || g_manager_step_set) return false;
+    const TickState &t = tick();
+    if (t.time_block == 0u) return false;
+    auto &m = portablekit::kernel().runtime().memory();
+    const std::uint32_t raw = m.load32(t.time_block + 28u);
+    const float step = std::bit_cast<float>(raw);
+    if (!std::isfinite(step) || step <= 0.0f) return false;
+    static float banked = 0.0f;
+    const float frame = static_cast<float>(t.game_interval);
+    banked = std::min(banked + step, 2.0f * frame);
+    if (banked + 1e-4f < frame) return true;
+    banked -= frame;
+    g_manager_step_saved = raw;
+    g_manager_step_set = true;
+    m.store32(t.time_block + 28u, std::bit_cast<std::uint32_t>(frame));
+    return false;
+}
+
+extern "C" void vc2_manager_done() noexcept {
+    using namespace portablekit::vc2;
+    if (!g_manager_step_set) return;
+    g_manager_step_set = false;
+    portablekit::kernel().runtime().memory().store32(tick().time_block + 28u, g_manager_step_saved);
+}
+
+extern "C" void vc2_attack_done() noexcept {
+    using namespace portablekit::vc2;
+    if (!g_attack_step_set) return;
+    g_attack_step_set = false;
+    portablekit::kernel().runtime().memory().store32(tick().time_block + 28u, g_attack_step_saved);
+}
+
+extern "C" std::uint32_t vc2_attack_ready(std::uint32_t state, std::uint32_t ready) noexcept {
+    using namespace portablekit::vc2;
+    if (!g_step_sites_active || ready == 0u) return ready;
+    // In an update vc2_attack_hold let through (once per game frame), the shot
+    // goes as at the game's rate; the gate is for checks made from phase 5.
+    if (g_attack_step_set) return ready;
+    auto &m = portablekit::kernel().runtime().memory();
+    if ((m.load32(state + 0xF4u) & 0x800u) != 0u) return ready;
+    const TickState &t = tick();
+    if (t.time_block == 0u) return ready;
+    const float step = std::bit_cast<float>(g_attack_step_set ? g_attack_step_saved : m.load32(t.time_block + 28u));
+    if (!std::isfinite(step) || step <= 0.0f) return ready;
+    struct Gate {
+        std::uint32_t shots = 0u;
+        float banked = 0.0f;
+    };
+    static std::unordered_map<std::uint32_t, Gate> gates;
+    if (gates.size() > 256u) gates.clear();
+    const float frame = static_cast<float>(t.game_interval);
+    const std::uint32_t shots = m.load32(state + 0xFCu) & 0xFFFFu;
+    auto found = gates.find(state);
+    if (found == gates.end() || shots == 0u || shots < found->second.shots) {
+        Gate &gate = gates[state];
+        gate.shots = shots;
+        gate.banked = 0.0f;
+        return ready;
+    }
+    Gate &gate = found->second;
+    gate.shots = shots;
+    gate.banked = std::min(gate.banked + step, 2.0f * frame);
+    if (gate.banked + 1e-4f < frame) return 0u;
+    gate.banked -= frame;
+    return ready;
+}
+
 extern "C" float vc2_frame_scale(std::uint32_t pc, float value) noexcept {
     using namespace portablekit::vc2;
     if (!g_step_sites_active) return value;
@@ -635,6 +796,14 @@ extern "C" float vc2_frame_scale(std::uint32_t pc, float value) noexcept {
         ++site->calls;
         if (site->skipped) return value;
     }
+    // Interception fire: the marks note how the move state made its rate this
+    // call; a rate the game already multiplied by the step is left alone.
+    static bool intercept_stepped = false;
+    if (pc == 0x088FD7DCu || pc == 0x088FD80Cu) {
+        intercept_stepped = pc == 0x088FD80Cu;
+        return value;
+    }
+    if (pc == 0x088FDAB0u && intercept_stepped) return value;
     const TickState &t = tick();
     // Meant per (interval / 59.94) s; a frame of ours is (step_base / 59.94) s:
     // value x step_base / interval (x 0.363 at 165 Hz, x 0.18 in combat).
