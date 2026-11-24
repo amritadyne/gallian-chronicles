@@ -8,6 +8,7 @@
 | FFmpeg 7.1 (shared, LGPL build) | LGPL 2.1+ | beside the built games | Downloaded by the build; see `dependencies/ffmpeg.lock` (the games ship `FFmpeg-LICENSE.txt` and `FFmpeg-SOURCE.txt`) |
 | libsodium 1.0.22 | ISC | `psprecomp-upstream/third_party/libsodium-1.0.22-mingw/` | Downloaded by VC2's build; see `dependencies/libsodium.lock` |
 | Dear ImGui | MIT | inside PortableKit | With PortableKit |
+| Kenney RPG Audio (the launcher's page-turn and tap sounds) | CC0 1.0 (public domain; credit optional, given here) | built into `Gallian Chronicles.exe` | From kenney.nl/assets/rpg-audio, converted to mono WAV |
 | Vulkan SDK 1.4.363.1 | Apache 2.0 / various | `work/vulkan-sdk/` | Installed by the developer, not redistributed |
 | GCC runtime (libgcc, libstdc++, winpthread) | GPL with the GCC Runtime Library Exception | beside the built executables | Copied from the WinLibs MinGW used to build |
 
