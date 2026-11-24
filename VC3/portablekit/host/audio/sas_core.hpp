@@ -45,6 +45,11 @@ struct SasVoice {
     std::int32_t history1{};
     std::int32_t history2{};
     std::array<std::int16_t, 28> decoded{};
+    // The last four source samples, oldest first: the resampler draws a
+    // curve through them and plays the stretch between `older` and
+    // `previous` (one source sample behind `current`).
+    std::int16_t oldest{};
+    std::int16_t older{};
     std::int16_t previous{};
     std::int16_t current{};
     bool source_ended{};
@@ -112,6 +117,8 @@ public:
 
     // Renders `frames` stereo frames into `output`, overwriting it.
     void render(const psprecomp::GuestMemory &memory, std::int16_t *output, std::size_t frames);
+    // The last render before it was clipped to 16 bits: frames x 2 values.
+    [[nodiscard]] const std::vector<std::int32_t> &last_mix() const noexcept { return mix_; }
 
 private:
     void advance_source(const psprecomp::GuestMemory &memory, SasVoice &voice);

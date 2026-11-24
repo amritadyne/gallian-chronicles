@@ -1,0 +1,316 @@
+Audio without clipping: the sink mixes at 32 bits and a look-ahead limiter
+holds the output under full scale smoothly; the sound-effect mixer's 32-bit
+result plays when the game passes its buffer on unchanged. <prefix>_AUDIO_HARD_CLIP
+restores the old clipping. (2026-11-24)
+
+--- a/host/audio/audio_sink.cpp
++++ b/host/audio/audio_sink.cpp
+@@ -27,8 +27,37 @@
+ // The device is kept two guest buffers ahead of the write cursor.
+ constexpr std::size_t kPrebufferFrames = 2048u;
+ 
+-[[nodiscard]] std::int16_t saturate(std::int32_t value) noexcept {
+-    return static_cast<std::int16_t>(std::clamp(value, -32768, 32767));
++// The mix is kept at 32 bits, so sounds that add up past full scale are not
++// cut off as they are added; the limiter below brings the sum back under
++// full scale smoothly as it leaves the ring (2026-11-24: the hard clip at
++// each add was the worst fault in both games' sound).
++// <prefix>_AUDIO_HARD_CLIP restores the old behaviour (clip at each add and
++// at the output, no limiter).
++[[nodiscard]] bool hard_clip() {
++    static const bool enabled = portablekit::env("AUDIO_HARD_CLIP") != nullptr;
++    return enabled;
++}
++
++// The limiter: full scale is 32767; it holds the output under kCeiling. The
++// gain follows the loudest frame of the next kLookahead frames, so it is
++// already down when a peak arrives: attack over about kAttackFrames, release
++// over about kReleaseSeconds. A last gentle curve above kKnee catches what
++// the gain could not.
++constexpr double kCeiling = 31130.0;     // about -0.45 dB
++constexpr double kKnee = 29500.0;
++constexpr std::size_t kLookahead = 64u;  // ~1.5 ms
++constexpr double kAttackFrames = 16.0;
++constexpr double kReleaseSeconds = 0.15;
++
++[[nodiscard]] std::int16_t soft_output(double value) noexcept {
++    const double magnitude = std::abs(value);
++    if (magnitude > kKnee) {
++        const double room = 32767.0 - kKnee;
++        const double over = magnitude - kKnee;
++        const double shaped = kKnee + room * std::tanh(over / room);
++        value = value < 0.0 ? -shaped : shaped;
++    }
++    return static_cast<std::int16_t>(std::clamp(std::lround(value), -32768L, 32767L));
+ }
+ 
+ // Minimal 16-bit PCM WAV writer. The sizes are patched on close, so a run that
+@@ -94,7 +123,8 @@
+ 
+ struct AudioSink::Impl {
+     std::mutex lock;
+-    std::vector<std::int16_t> ring = std::vector<std::int16_t>(kRingFrames * kChannels, 0);
++    std::vector<std::int32_t> ring = std::vector<std::int32_t>(kRingFrames * kChannels, 0);
++    double limiter_gain{1.0};
+     std::uint64_t read_position{};   // frames handed to the device
+     std::uint64_t write_end{};       // frames any producer has written up to
+     bool started{};
+@@ -109,6 +139,8 @@
+     std::uint64_t window_frames{};
+     std::uint64_t window_silent{};
+     std::uint64_t window_dropped{};
++    std::uint64_t window_limited{};   // frames the limiter turned down
++    std::uint64_t window_over{};      // frames that were past full scale before it
+     std::int32_t window_peak{};
+     double window_energy{};
+     std::uint64_t total_frames{};
+@@ -127,10 +159,36 @@
+     void retire(std::size_t count, std::int16_t *out, bool played) {
+         const std::uint64_t available = write_end > read_position ? write_end - read_position : 0u;
+         const std::uint64_t silent = count > available ? count - available : 0u;
++        const auto slot_of = [this](std::uint64_t position) {
++            return static_cast<std::size_t>(position % kRingFrames) * kChannels;
++        };
++        const auto peak_at = [this](std::size_t slot) {
++            return std::max(std::abs(static_cast<double>(ring[slot])), std::abs(static_cast<double>(ring[slot + 1u])));
++        };
++        const double attack = std::exp(-1.0 / kAttackFrames);
++        const double release = std::exp(-1.0 / (kReleaseSeconds * static_cast<double>(kSampleRate)));
+         for (std::size_t frame = 0; frame < count; ++frame) {
+-            const std::size_t slot = static_cast<std::size_t>((read_position + frame) % kRingFrames) * kChannels;
+-            const std::int16_t left = ring[slot];
+-            const std::int16_t right = ring[slot + 1u];
++            const std::size_t slot = slot_of(read_position + frame);
++            std::int16_t left = 0;
++            std::int16_t right = 0;
++            if (hard_clip()) {
++                left = static_cast<std::int16_t>(std::clamp(ring[slot], -32768, 32767));
++                right = static_cast<std::int16_t>(std::clamp(ring[slot + 1u], -32768, 32767));
++            } else {
++                // The loudest frame from here to kLookahead ahead (frames not
++                // written yet read as what is there, usually silence).
++                double ahead = 0.0;
++                for (std::size_t look = 0; look < kLookahead; ++look)
++                    ahead = std::max(ahead, peak_at(slot_of(read_position + frame + look)));
++                const double target = ahead > kCeiling ? kCeiling / ahead : 1.0;
++                limiter_gain = target < limiter_gain ? target + (limiter_gain - target) * attack
++                                                     : target + (limiter_gain - target) * release;
++                const double now = peak_at(slot);
++                if (now > 32767.0) ++window_over;
++                if (limiter_gain < 0.999) ++window_limited;
++                left = soft_output(static_cast<double>(ring[slot]) * limiter_gain);
++                right = soft_output(static_cast<double>(ring[slot + 1u]) * limiter_gain);
++            }
+             ring[slot] = 0;
+             ring[slot + 1u] = 0;
+             if (out != nullptr) {
+@@ -160,16 +218,20 @@
+         ++seconds;
+         if (dump.active()) dump.flush();
+         if (trace) {
+-            std::printf("[audio] %llus frames=%llu peak=%d rms=%.1f silent=%llu dropped=%llu\n",
++            std::printf("[audio] %llus frames=%llu peak=%d rms=%.1f silent=%llu dropped=%llu over=%llu limited=%llu\n",
+                         static_cast<unsigned long long>(seconds),
+                         static_cast<unsigned long long>(window_frames), window_peak, rms,
+                         static_cast<unsigned long long>(window_silent),
+-                        static_cast<unsigned long long>(window_dropped));
++                        static_cast<unsigned long long>(window_dropped),
++                        static_cast<unsigned long long>(window_over),
++                        static_cast<unsigned long long>(window_limited));
+             std::fflush(stdout);
+         }
+         window_frames = 0u;
+         window_silent = 0u;
+         window_dropped = 0u;
++        window_over = 0u;
++        window_limited = 0u;
+         window_peak = 0;
+         window_energy = 0.0;
+     }
+@@ -293,10 +355,27 @@
+ #endif
+ }
+ 
++namespace {
++template <typename Sample>
++void mix_into(AudioSink::Impl &impl, std::uint64_t &cursor, const Sample *frames, std::size_t count,
++              std::uint32_t left_volume, std::uint32_t right_volume);
++} // namespace
++
+ void AudioSink::mix(std::uint64_t &cursor, const std::int16_t *frames, std::size_t count,
+                     std::uint32_t left_volume, std::uint32_t right_volume) {
++    mix_into(*impl_, cursor, frames, count, left_volume, right_volume);
++}
++
++void AudioSink::mix_precise(std::uint64_t &cursor, const std::int32_t *frames, std::size_t count,
++                            std::uint32_t left_volume, std::uint32_t right_volume) {
++    mix_into(*impl_, cursor, frames, count, left_volume, right_volume);
++}
++
++namespace {
++template <typename Sample>
++void mix_into(AudioSink::Impl &impl, std::uint64_t &cursor, const Sample *frames, std::size_t count,
++              std::uint32_t left_volume, std::uint32_t right_volume) {
+     if (count == 0u) return;
+-    Impl &impl = *impl_;
+     std::lock_guard<std::mutex> guard(impl.lock);
+ 
+     // A buffer larger than the whole ring would overwrite its own start; only
+@@ -322,14 +401,17 @@
+         impl.retire(excess, impl.scratch.data(), false);
+     }
+ 
+-    const std::int32_t left_gain = static_cast<std::int32_t>(std::min<std::uint32_t>(left_volume, 0x8000u));
+-    const std::int32_t right_gain = static_cast<std::int32_t>(std::min<std::uint32_t>(right_volume, 0x8000u));
++    const std::int64_t left_gain = static_cast<std::int64_t>(std::min<std::uint32_t>(left_volume, 0x8000u));
++    const std::int64_t right_gain = static_cast<std::int64_t>(std::min<std::uint32_t>(right_volume, 0x8000u));
++    const bool clip = hard_clip();
+     for (std::size_t frame = 0; frame < count; ++frame) {
+         const std::size_t slot = static_cast<std::size_t>((cursor + frame) % kRingFrames) * kChannels;
+-        const std::int32_t left = (static_cast<std::int32_t>(frames[frame * kChannels]) * left_gain) >> 15;
+-        const std::int32_t right = (static_cast<std::int32_t>(frames[frame * kChannels + 1u]) * right_gain) >> 15;
+-        impl.ring[slot] = saturate(impl.ring[slot] + left);
+-        impl.ring[slot + 1u] = saturate(impl.ring[slot + 1u] + right);
++        const auto left = static_cast<std::int32_t>((static_cast<std::int64_t>(frames[frame * kChannels]) * left_gain) >> 15);
++        const auto right = static_cast<std::int32_t>((static_cast<std::int64_t>(frames[frame * kChannels + 1u]) * right_gain) >> 15);
++        std::int32_t &out_left = impl.ring[slot];
++        std::int32_t &out_right = impl.ring[slot + 1u];
++        out_left = clip ? std::clamp(out_left + left, -32768, 32767) : out_left + left;
++        out_right = clip ? std::clamp(out_right + right, -32768, 32767) : out_right + right;
+     }
+     cursor += count;
+     impl.write_end = std::max(impl.write_end, cursor);
+@@ -346,5 +428,6 @@
+         impl.retire(ready, impl.scratch.data(), true);
+     }
+ }
++} // namespace
+ 
+ } // namespace portablekit::audio
+--- a/host/audio/audio_sink.hpp
++++ b/host/audio/audio_sink.hpp
+@@ -34,6 +34,11 @@
+     // has fallen behind the device is snapped forward to the write target.
+     void mix(std::uint64_t &cursor, const std::int16_t *frames, std::size_t count,
+              std::uint32_t left_volume, std::uint32_t right_volume);
++    // The same for frames kept at 32 bits (values may pass full scale): the
++    // sound-effect mixer's own result, before the 16-bit copy the game sees
++    // was clipped. The sink adds at 32 bits and limits once, at the output.
++    void mix_precise(std::uint64_t &cursor, const std::int32_t *frames, std::size_t count,
++                     std::uint32_t left_volume, std::uint32_t right_volume);
+ 
+     // Output gain in 0..1, from the volume and mute settings. Only the device
+     // output is scaled; <prefix>_AUDIO_DUMP keeps the game's own levels.
+--- a/host/audio/sas_core.hpp
++++ b/host/audio/sas_core.hpp
+@@ -112,6 +112,8 @@
+ 
+     // Renders `frames` stereo frames into `output`, overwriting it.
+     void render(const psprecomp::GuestMemory &memory, std::int16_t *output, std::size_t frames);
++    // The last render before it was clipped to 16 bits: frames x 2 values.
++    [[nodiscard]] const std::vector<std::int32_t> &last_mix() const noexcept { return mix_; }
+ 
+ private:
+     void advance_source(const psprecomp::GuestMemory &memory, SasVoice &voice);
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -27,6 +27,7 @@
+ #include "ui/ui.hpp"
+ #endif
+ 
++#include <unordered_map>
+ #include <algorithm>
+ #include <cmath>
+ #include <cstring>
+@@ -794,6 +795,25 @@
+     hle.add("sceGe_user", "sceGeContinue", [](Runtime &, AllegrexContext &ctx) { kernel().finish(ctx, 0u); });
+ }
+ 
++// The sound-effect mixer's last blocks, kept at 32 bits (2026-11-24). The
++// game must be given 16 bits, so __sceSasCore clips its sum there; when the
++// game then hands that same buffer, unchanged, to a sceAudio channel, the
++// channel plays the 32-bit block instead and the sink limits the whole mix
++// once, smoothly, rather than every sound being cut off at full scale.
++// A buffer the game changed in between plays as the game left it.
++struct SasBlock {
++    std::vector<std::int32_t> precise;  // frames x 2
++    std::vector<std::uint8_t> written;  // the 16-bit bytes the guest got
++};
++std::unordered_map<std::uint32_t, SasBlock> &sas_blocks() {
++    static std::unordered_map<std::uint32_t, SasBlock> blocks;
++    return blocks;
++}
++bool sas_full_precision() {
++    static const bool enabled = portablekit::env("AUDIO_HARD_CLIP") == nullptr;
++    return enabled;
++}
++
+ // sceAudioOutput*Blocking returns once the previously submitted buffer has
+ // drained, which is what paces the guest's audio thread: the channel's queue
+ // is tracked in virtual time and the thread waits on the kernel clock, never
+@@ -838,8 +858,25 @@
+             // played, it would pile up faster than the device plays it. The
+             // channel's cursor stays where it was and catches up with the
+             // device when sound comes back.
+-            if (!fast_loading::note_audio(peak))
+-                audio::AudioSink::instance().mix(state.cursor, staging.data(), frames, left, right);
++            // The sound-effect mixer's block, played at 32 bits when the game
++            // passed it on unchanged.
++            const SasBlock *sas = nullptr;
++            if (!mono && sas_full_precision()) {
++                const auto found = sas_blocks().find(buffer);
++                if (found != sas_blocks().end() && found->second.precise.size() == frames * 2u &&
++                    found->second.written.size() == frames * 4u &&
++                    std::memcmp(source, found->second.written.data(), frames * 4u) == 0)
++                    sas = &found->second;
++                if (sas != nullptr) log_once("audio-sas-precise", "[audio] the sound-effect mixer's output plays at full precision");
++                else if (found != sas_blocks().end())
++                    log_once("audio-sas-changed", "[audio] the game changed the sound-effect mixer's output before playing it: 16-bit");
++            }
++            if (!fast_loading::note_audio(peak)) {
++                if (sas != nullptr)
++                    audio::AudioSink::instance().mix_precise(state.cursor, sas->precise.data(), frames, left, right);
++                else
++                    audio::AudioSink::instance().mix(state.cursor, staging.data(), frames, left, right);
++            }
+         } else {
+             log_once("audio-buffer", "[audio] output buffer is not a single mapped range; dropping it");
+         }
+@@ -870,18 +907,35 @@
+         log_once("sas-output", "[sas] output buffer is not a single mapped range; dropping the grain");
+         return;
+     }
++    const std::vector<std::int32_t> &full = sas.last_mix();
++    const bool keep = sas_full_precision() && full.size() >= frames * 2u;
++    SasBlock *block = nullptr;
++    if (keep) {
++        if (sas_blocks().size() > 16u) sas_blocks().clear();
++        block = &sas_blocks()[output];
++        block->precise.resize(frames * 2u);
++        block->written.resize(frames * 4u);
++    }
+     for (std::size_t frame = 0; frame < frames; ++frame) {
+         for (std::size_t side = 0; side < 2u; ++side) {
+             const std::size_t index = frame * 2u + side;
+             std::int32_t value = staging[index];
++            std::int32_t precise = keep ? full[index] : value;
+             if (mix) {
+                 const std::uint32_t gain = side == 0u ? left_volume : right_volume;
+-                value = (value * static_cast<std::int32_t>(std::min(gain, 0x1000u))) >> 12;
+-                value += static_cast<std::int16_t>(destination[index * 2u] | (destination[index * 2u + 1u] << 8));
++                const auto scale = static_cast<std::int64_t>(std::min(gain, 0x1000u));
++                const auto existing = static_cast<std::int16_t>(destination[index * 2u] | (destination[index * 2u + 1u] << 8));
++                value = static_cast<std::int32_t>((static_cast<std::int64_t>(value) * scale) >> 12) + existing;
+                 value = std::clamp(value, -32768, 32767);
++                precise = static_cast<std::int32_t>((static_cast<std::int64_t>(precise) * scale) >> 12) + existing;
+             }
+             destination[index * 2u] = static_cast<std::uint8_t>(value);
+             destination[index * 2u + 1u] = static_cast<std::uint8_t>(static_cast<std::uint32_t>(value) >> 8u);
++            if (block != nullptr) {
++                block->precise[index] = precise;
++                block->written[index * 2u] = destination[index * 2u];
++                block->written[index * 2u + 1u] = destination[index * 2u + 1u];
++            }
+         }
+     }
+ }

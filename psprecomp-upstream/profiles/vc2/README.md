@@ -28,7 +28,7 @@ hashes before anything is set up.
 - `scripts/generate_aot.ps1` - generates `generated/` from your prepared ELF.
 - `tools/vc2_online_code.cpp` - the friend-code tool for online play.
 - `research/` - the engine map and the differences between releases.
-- `NATIVE_RENDERING_PLAN.md`, `SYSTEM_REQUIREMENTS.md`.
+- `SYSTEM_REQUIREMENTS.md` - what a PC needs to run it.
 
 `generated/`, `generated-variants/`, `game/` and everything else made from the
 game stay on your PC (see the repository's `docs/GAME_FILES.md`). Building:

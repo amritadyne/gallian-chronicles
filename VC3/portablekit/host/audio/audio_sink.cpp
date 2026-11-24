@@ -27,8 +27,37 @@ constexpr std::size_t kRingFrames = 8192u;
 // The device is kept two guest buffers ahead of the write cursor.
 constexpr std::size_t kPrebufferFrames = 2048u;
 
-[[nodiscard]] std::int16_t saturate(std::int32_t value) noexcept {
-    return static_cast<std::int16_t>(std::clamp(value, -32768, 32767));
+// The mix is kept at 32 bits, so sounds that add up past full scale are not
+// cut off as they are added; the limiter below brings the sum back under
+// full scale smoothly as it leaves the ring (2026-11-24: the hard clip at
+// each add was the worst fault in both games' sound).
+// <prefix>_AUDIO_HARD_CLIP restores the old behaviour (clip at each add and
+// at the output, no limiter).
+[[nodiscard]] bool hard_clip() {
+    static const bool enabled = portablekit::env("AUDIO_HARD_CLIP") != nullptr;
+    return enabled;
+}
+
+// The limiter: full scale is 32767; it holds the output under kCeiling. The
+// gain follows the loudest frame of the next kLookahead frames, so it is
+// already down when a peak arrives: attack over about kAttackFrames, release
+// over about kReleaseSeconds. A last gentle curve above kKnee catches what
+// the gain could not.
+constexpr double kCeiling = 31130.0;     // about -0.45 dB
+constexpr double kKnee = 29500.0;
+constexpr std::size_t kLookahead = 64u;  // ~1.5 ms
+constexpr double kAttackFrames = 16.0;
+constexpr double kReleaseSeconds = 0.15;
+
+[[nodiscard]] std::int16_t soft_output(double value) noexcept {
+    const double magnitude = std::abs(value);
+    if (magnitude > kKnee) {
+        const double room = 32767.0 - kKnee;
+        const double over = magnitude - kKnee;
+        const double shaped = kKnee + room * std::tanh(over / room);
+        value = value < 0.0 ? -shaped : shaped;
+    }
+    return static_cast<std::int16_t>(std::clamp(std::lround(value), -32768L, 32767L));
 }
 
 // Minimal 16-bit PCM WAV writer. The sizes are patched on close, so a run that
@@ -94,7 +123,8 @@ private:
 
 struct AudioSink::Impl {
     std::mutex lock;
-    std::vector<std::int16_t> ring = std::vector<std::int16_t>(kRingFrames * kChannels, 0);
+    std::vector<std::int32_t> ring = std::vector<std::int32_t>(kRingFrames * kChannels, 0);
+    double limiter_gain{1.0};
     std::uint64_t read_position{};   // frames handed to the device
     std::uint64_t write_end{};       // frames any producer has written up to
     bool started{};
@@ -109,6 +139,8 @@ struct AudioSink::Impl {
     std::uint64_t window_frames{};
     std::uint64_t window_silent{};
     std::uint64_t window_dropped{};
+    std::uint64_t window_limited{};   // frames the limiter turned down
+    std::uint64_t window_over{};      // frames that were past full scale before it
     std::int32_t window_peak{};
     double window_energy{};
     std::uint64_t total_frames{};
@@ -127,10 +159,36 @@ struct AudioSink::Impl {
     void retire(std::size_t count, std::int16_t *out, bool played) {
         const std::uint64_t available = write_end > read_position ? write_end - read_position : 0u;
         const std::uint64_t silent = count > available ? count - available : 0u;
+        const auto slot_of = [this](std::uint64_t position) {
+            return static_cast<std::size_t>(position % kRingFrames) * kChannels;
+        };
+        const auto peak_at = [this](std::size_t slot) {
+            return std::max(std::abs(static_cast<double>(ring[slot])), std::abs(static_cast<double>(ring[slot + 1u])));
+        };
+        const double attack = std::exp(-1.0 / kAttackFrames);
+        const double release = std::exp(-1.0 / (kReleaseSeconds * static_cast<double>(kSampleRate)));
         for (std::size_t frame = 0; frame < count; ++frame) {
-            const std::size_t slot = static_cast<std::size_t>((read_position + frame) % kRingFrames) * kChannels;
-            const std::int16_t left = ring[slot];
-            const std::int16_t right = ring[slot + 1u];
+            const std::size_t slot = slot_of(read_position + frame);
+            std::int16_t left = 0;
+            std::int16_t right = 0;
+            if (hard_clip()) {
+                left = static_cast<std::int16_t>(std::clamp(ring[slot], -32768, 32767));
+                right = static_cast<std::int16_t>(std::clamp(ring[slot + 1u], -32768, 32767));
+            } else {
+                // The loudest frame from here to kLookahead ahead (frames not
+                // written yet read as what is there, usually silence).
+                double ahead = 0.0;
+                for (std::size_t look = 0; look < kLookahead; ++look)
+                    ahead = std::max(ahead, peak_at(slot_of(read_position + frame + look)));
+                const double target = ahead > kCeiling ? kCeiling / ahead : 1.0;
+                limiter_gain = target < limiter_gain ? target + (limiter_gain - target) * attack
+                                                     : target + (limiter_gain - target) * release;
+                const double now = peak_at(slot);
+                if (now > 32767.0) ++window_over;
+                if (limiter_gain < 0.999) ++window_limited;
+                left = soft_output(static_cast<double>(ring[slot]) * limiter_gain);
+                right = soft_output(static_cast<double>(ring[slot + 1u]) * limiter_gain);
+            }
             ring[slot] = 0;
             ring[slot + 1u] = 0;
             if (out != nullptr) {
@@ -160,16 +218,20 @@ struct AudioSink::Impl {
         ++seconds;
         if (dump.active()) dump.flush();
         if (trace) {
-            std::printf("[audio] %llus frames=%llu peak=%d rms=%.1f silent=%llu dropped=%llu\n",
+            std::printf("[audio] %llus frames=%llu peak=%d rms=%.1f silent=%llu dropped=%llu over=%llu limited=%llu\n",
                         static_cast<unsigned long long>(seconds),
                         static_cast<unsigned long long>(window_frames), window_peak, rms,
                         static_cast<unsigned long long>(window_silent),
-                        static_cast<unsigned long long>(window_dropped));
+                        static_cast<unsigned long long>(window_dropped),
+                        static_cast<unsigned long long>(window_over),
+                        static_cast<unsigned long long>(window_limited));
             std::fflush(stdout);
         }
         window_frames = 0u;
         window_silent = 0u;
         window_dropped = 0u;
+        window_over = 0u;
+        window_limited = 0u;
         window_peak = 0;
         window_energy = 0.0;
     }
@@ -293,10 +355,27 @@ void AudioSink::set_paused(bool paused) {
 #endif
 }
 
+namespace {
+template <typename Sample>
+void mix_into(AudioSink::Impl &impl, std::uint64_t &cursor, const Sample *frames, std::size_t count,
+              std::uint32_t left_volume, std::uint32_t right_volume);
+} // namespace
+
 void AudioSink::mix(std::uint64_t &cursor, const std::int16_t *frames, std::size_t count,
                     std::uint32_t left_volume, std::uint32_t right_volume) {
+    mix_into(*impl_, cursor, frames, count, left_volume, right_volume);
+}
+
+void AudioSink::mix_precise(std::uint64_t &cursor, const std::int32_t *frames, std::size_t count,
+                            std::uint32_t left_volume, std::uint32_t right_volume) {
+    mix_into(*impl_, cursor, frames, count, left_volume, right_volume);
+}
+
+namespace {
+template <typename Sample>
+void mix_into(AudioSink::Impl &impl, std::uint64_t &cursor, const Sample *frames, std::size_t count,
+              std::uint32_t left_volume, std::uint32_t right_volume) {
     if (count == 0u) return;
-    Impl &impl = *impl_;
     std::lock_guard<std::mutex> guard(impl.lock);
 
     // A buffer larger than the whole ring would overwrite its own start; only
@@ -322,14 +401,17 @@ void AudioSink::mix(std::uint64_t &cursor, const std::int16_t *frames, std::size
         impl.retire(excess, impl.scratch.data(), false);
     }
 
-    const std::int32_t left_gain = static_cast<std::int32_t>(std::min<std::uint32_t>(left_volume, 0x8000u));
-    const std::int32_t right_gain = static_cast<std::int32_t>(std::min<std::uint32_t>(right_volume, 0x8000u));
+    const std::int64_t left_gain = static_cast<std::int64_t>(std::min<std::uint32_t>(left_volume, 0x8000u));
+    const std::int64_t right_gain = static_cast<std::int64_t>(std::min<std::uint32_t>(right_volume, 0x8000u));
+    const bool clip = hard_clip();
     for (std::size_t frame = 0; frame < count; ++frame) {
         const std::size_t slot = static_cast<std::size_t>((cursor + frame) % kRingFrames) * kChannels;
-        const std::int32_t left = (static_cast<std::int32_t>(frames[frame * kChannels]) * left_gain) >> 15;
-        const std::int32_t right = (static_cast<std::int32_t>(frames[frame * kChannels + 1u]) * right_gain) >> 15;
-        impl.ring[slot] = saturate(impl.ring[slot] + left);
-        impl.ring[slot + 1u] = saturate(impl.ring[slot + 1u] + right);
+        const auto left = static_cast<std::int32_t>((static_cast<std::int64_t>(frames[frame * kChannels]) * left_gain) >> 15);
+        const auto right = static_cast<std::int32_t>((static_cast<std::int64_t>(frames[frame * kChannels + 1u]) * right_gain) >> 15);
+        std::int32_t &out_left = impl.ring[slot];
+        std::int32_t &out_right = impl.ring[slot + 1u];
+        out_left = clip ? std::clamp(out_left + left, -32768, 32767) : out_left + left;
+        out_right = clip ? std::clamp(out_right + right, -32768, 32767) : out_right + right;
     }
     cursor += count;
     impl.write_end = std::max(impl.write_end, cursor);
@@ -346,5 +428,6 @@ void AudioSink::mix(std::uint64_t &cursor, const std::int16_t *frames, std::size
         impl.retire(ready, impl.scratch.data(), true);
     }
 }
+} // namespace
 
 } // namespace portablekit::audio

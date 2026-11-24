@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -278,6 +279,8 @@ void SasCore::key_on(std::uint32_t voice) {
     v.phase = 0u;
     v.history1 = 0;
     v.history2 = 0;
+    v.oldest = 0;
+    v.older = 0;
     v.previous = 0;
     v.current = 0;
     v.source_ended = !v.noise && (v.address == 0u || v.size < (v.pcm ? 2u : 16u));
@@ -380,6 +383,8 @@ void SasCore::decode_block(const psprecomp::GuestMemory &memory, SasVoice &voice
 }
 
 void SasCore::advance_source(const psprecomp::GuestMemory &memory, SasVoice &voice) {
+    voice.oldest = voice.older;
+    voice.older = voice.previous;
     voice.previous = voice.current;
     if (voice.pcm) {
         const std::uint32_t offset = voice.block;
@@ -530,6 +535,29 @@ void SasCore::step_envelope(SasVoice &voice) {
     }
 }
 
+namespace {
+// Resampling (2026-11-24): a 4-point curve (Catmull-Rom) through the last
+// four source samples instead of a straight line between two. A sound played
+// at another pitch keeps its shape: less of the harsh, metallic edge a
+// straight line adds to high and pitch-shifted sounds. The curve plays one
+// source sample behind (about 0.02 ms at 44.1 kHz). <prefix>_SAS_LINEAR
+// brings back the straight line.
+bool linear_resampling() {
+    static const bool enabled = portablekit::env("SAS_LINEAR") != nullptr;
+    return enabled;
+}
+
+std::int32_t cubic_sample(const SasVoice &voice) {
+    const float t = static_cast<float>(voice.phase) * (1.0f / 4096.0f);
+    const float a = voice.oldest;
+    const float b = voice.older;
+    const float c = voice.previous;
+    const float d = voice.current;
+    const float value = b + 0.5f * t * (c - a + t * (2.0f * a - 5.0f * b + 4.0f * c - d + t * (3.0f * (b - c) + d - a)));
+    return std::clamp(static_cast<std::int32_t>(std::lround(value)), -32768, 32767);
+}
+} // namespace
+
 void SasCore::render(const psprecomp::GuestMemory &memory, std::int16_t *output, std::size_t frames) {
     // The voices add up at full precision and the sum is clamped once, at the
     // end. Clamping after each voice made the result depend on the order of
@@ -546,21 +574,25 @@ void SasCore::render(const psprecomp::GuestMemory &memory, std::int16_t *output,
         SasVoice &voice = voices_[index];
         if (!voice.playing || voice.paused) continue;
 
-        // Keying on leaves the decoder empty, so the first two source samples
-        // that the interpolator needs are fetched here.
+        // Keying on leaves the decoder empty, so the source samples the
+        // interpolator needs (two for the straight line, three for the curve,
+        // whose fourth starts at silence) are fetched here.
         if (!voice.primed && !voice.noise) {
             voice.primed = true;
             advance_source(memory, voice);
             advance_source(memory, voice);
+            if (!linear_resampling()) advance_source(memory, voice);
         }
 
         for (std::size_t frame = 0; frame < frames; ++frame) {
             std::int32_t sample = 0;
             if (voice.noise) {
                 sample = noise_sample(voice);
-            } else {
+            } else if (linear_resampling()) {
                 const std::int32_t span = voice.current - voice.previous;
                 sample = voice.previous + ((span * static_cast<std::int32_t>(voice.phase)) >> 12);
+            } else {
+                sample = cubic_sample(voice);
             }
             step_envelope(voice);
             const std::int32_t scaled = (sample * voice.envelope) >> 15;

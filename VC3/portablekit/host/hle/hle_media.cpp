@@ -27,6 +27,7 @@
 #include "ui/ui.hpp"
 #endif
 
+#include <unordered_map>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -794,6 +795,25 @@ void register_ge(HleRegistrar &hle) {
     hle.add("sceGe_user", "sceGeContinue", [](Runtime &, AllegrexContext &ctx) { kernel().finish(ctx, 0u); });
 }
 
+// The sound-effect mixer's last blocks, kept at 32 bits (2026-11-24). The
+// game must be given 16 bits, so __sceSasCore clips its sum there; when the
+// game then hands that same buffer, unchanged, to a sceAudio channel, the
+// channel plays the 32-bit block instead and the sink limits the whole mix
+// once, smoothly, rather than every sound being cut off at full scale.
+// A buffer the game changed in between plays as the game left it.
+struct SasBlock {
+    std::vector<std::int32_t> precise;  // frames x 2
+    std::vector<std::uint8_t> written;  // the 16-bit bytes the guest got
+};
+std::unordered_map<std::uint32_t, SasBlock> &sas_blocks() {
+    static std::unordered_map<std::uint32_t, SasBlock> blocks;
+    return blocks;
+}
+bool sas_full_precision() {
+    static const bool enabled = portablekit::env("AUDIO_HARD_CLIP") == nullptr;
+    return enabled;
+}
+
 // sceAudioOutput*Blocking returns once the previously submitted buffer has
 // drained, which is what paces the guest's audio thread: the channel's queue
 // is tracked in virtual time and the thread waits on the kernel clock, never
@@ -838,8 +858,25 @@ void audio_output(Runtime &rt, AllegrexContext &ctx) {
             // played, it would pile up faster than the device plays it. The
             // channel's cursor stays where it was and catches up with the
             // device when sound comes back.
-            if (!fast_loading::note_audio(peak))
-                audio::AudioSink::instance().mix(state.cursor, staging.data(), frames, left, right);
+            // The sound-effect mixer's block, played at 32 bits when the game
+            // passed it on unchanged.
+            const SasBlock *sas = nullptr;
+            if (!mono && sas_full_precision()) {
+                const auto found = sas_blocks().find(buffer);
+                if (found != sas_blocks().end() && found->second.precise.size() == frames * 2u &&
+                    found->second.written.size() == frames * 4u &&
+                    std::memcmp(source, found->second.written.data(), frames * 4u) == 0)
+                    sas = &found->second;
+                if (sas != nullptr) log_once("audio-sas-precise", "[audio] the sound-effect mixer's output plays at full precision");
+                else if (found != sas_blocks().end())
+                    log_once("audio-sas-changed", "[audio] the game changed the sound-effect mixer's output before playing it: 16-bit");
+            }
+            if (!fast_loading::note_audio(peak)) {
+                if (sas != nullptr)
+                    audio::AudioSink::instance().mix_precise(state.cursor, sas->precise.data(), frames, left, right);
+                else
+                    audio::AudioSink::instance().mix(state.cursor, staging.data(), frames, left, right);
+            }
         } else {
             log_once("audio-buffer", "[audio] output buffer is not a single mapped range; dropping it");
         }
@@ -870,18 +907,35 @@ void sas_render(Runtime &rt, std::uint32_t core, std::uint32_t output, bool mix,
         log_once("sas-output", "[sas] output buffer is not a single mapped range; dropping the grain");
         return;
     }
+    const std::vector<std::int32_t> &full = sas.last_mix();
+    const bool keep = sas_full_precision() && full.size() >= frames * 2u;
+    SasBlock *block = nullptr;
+    if (keep) {
+        if (sas_blocks().size() > 16u) sas_blocks().clear();
+        block = &sas_blocks()[output];
+        block->precise.resize(frames * 2u);
+        block->written.resize(frames * 4u);
+    }
     for (std::size_t frame = 0; frame < frames; ++frame) {
         for (std::size_t side = 0; side < 2u; ++side) {
             const std::size_t index = frame * 2u + side;
             std::int32_t value = staging[index];
+            std::int32_t precise = keep ? full[index] : value;
             if (mix) {
                 const std::uint32_t gain = side == 0u ? left_volume : right_volume;
-                value = (value * static_cast<std::int32_t>(std::min(gain, 0x1000u))) >> 12;
-                value += static_cast<std::int16_t>(destination[index * 2u] | (destination[index * 2u + 1u] << 8));
+                const auto scale = static_cast<std::int64_t>(std::min(gain, 0x1000u));
+                const auto existing = static_cast<std::int16_t>(destination[index * 2u] | (destination[index * 2u + 1u] << 8));
+                value = static_cast<std::int32_t>((static_cast<std::int64_t>(value) * scale) >> 12) + existing;
                 value = std::clamp(value, -32768, 32767);
+                precise = static_cast<std::int32_t>((static_cast<std::int64_t>(precise) * scale) >> 12) + existing;
             }
             destination[index * 2u] = static_cast<std::uint8_t>(value);
             destination[index * 2u + 1u] = static_cast<std::uint8_t>(static_cast<std::uint32_t>(value) >> 8u);
+            if (block != nullptr) {
+                block->precise[index] = precise;
+                block->written[index * 2u] = destination[index * 2u];
+                block->written[index * 2u + 1u] = destination[index * 2u + 1u];
+            }
         }
     }
 }

@@ -34,6 +34,11 @@ public:
     // has fallen behind the device is snapped forward to the write target.
     void mix(std::uint64_t &cursor, const std::int16_t *frames, std::size_t count,
              std::uint32_t left_volume, std::uint32_t right_volume);
+    // The same for frames kept at 32 bits (values may pass full scale): the
+    // sound-effect mixer's own result, before the 16-bit copy the game sees
+    // was clipped. The sink adds at 32 bits and limits once, at the output.
+    void mix_precise(std::uint64_t &cursor, const std::int32_t *frames, std::size_t count,
+                     std::uint32_t left_volume, std::uint32_t right_volume);
 
     // Output gain in 0..1, from the volume and mute settings. Only the device
     // output is scaled; <prefix>_AUDIO_DUMP keeps the game's own levels.
