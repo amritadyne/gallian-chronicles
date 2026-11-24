@@ -359,6 +359,15 @@ void on_tick() {
     }
 }
 
+// The vsync block's interval word. The block is translated, then the offset
+// added: the Japanese address table holds the block, not its fields, so
+// at(block + 12) was 0 there and the first write crashed the Japanese release
+// at a high frame rate (2026-11-24).
+std::uint32_t vsync_interval() {
+    const std::uint32_t block = at(kEuVsyncBlock);
+    return block == 0u ? 0u : block + kIntervalOffset;
+}
+
 // The frame-rate module's interval setter (EU 0x08BD31F4, a0 = vblanks per
 // frame): as the game's, with 1 for whatever it asks; what it asked for is kept
 // for vc2_frame_scale.
@@ -371,7 +380,7 @@ void set_interval(psprecomp::CorpusRuntime &corpus, AllegrexContext &ctx) {
         // the vsync block's interval (0x08BEBC9C), then the module's interval
         // as an int (+4) and a float (+8).
         t.game_interval = asked >= 1u && asked <= 8u ? asked : 1u;
-        memory.store32(at(kEuVsyncBlock + kIntervalOffset), asked);
+        memory.store32(vsync_interval(), asked);
         const std::uint32_t module = at(kEuRateModule);
         memory.store32(module + 4u, asked);
         memory.store32(module + 8u, std::bit_cast<std::uint32_t>(static_cast<float>(static_cast<std::int32_t>(asked))));
@@ -381,7 +390,7 @@ void set_interval(psprecomp::CorpusRuntime &corpus, AllegrexContext &ctx) {
     if (asked != t.game_interval)
         std::cerr << "[vc2-tick] the game asks for a frame every " << asked << " vblank(s); 1 at " << t.rate << " Hz\n";
     t.game_interval = asked >= 1u && asked <= 8u ? asked : 1u;
-    memory.store32(at(kEuVsyncBlock + kIntervalOffset), 1u);
+    memory.store32(vsync_interval(), 1u);
     if (t.rate_module != 0u) {
         memory.store32(t.rate_module + 4u, 1u);
         memory.store32(t.rate_module + 8u, std::bit_cast<std::uint32_t>(t.step_base));
@@ -478,7 +487,7 @@ bool set_frame_rate(const std::string &value) {
         // at 59.94 Hz: step = interval x scale).
         const std::uint32_t interval = t.game_interval;
         const float base = static_cast<float>(interval);
-        memory.store32(at(kEuVsyncBlock + kIntervalOffset), interval);
+        memory.store32(vsync_interval(), interval);
         const std::uint32_t module = at(kEuRateModule);
         memory.store32(module + 0u, std::bit_cast<std::uint32_t>(kPspRefresh));
         memory.store32(module + 4u, interval);
@@ -544,7 +553,7 @@ void install_tick(Runtime &rt) {
     t.installed = true;
     t.saved_frame_rate = settings::current().frame_rate;
     t.frame_wait_return = at(kEuFrameWaitReturn);
-    t.interval_address = at(kEuVsyncBlock + kIntervalOffset);
+    t.interval_address = vsync_interval();
     rt.register_function(at(kEuSetInterval), &set_interval, "vc2_set_frame_interval");
     if (env("TICK_NO_STEP") == nullptr) {
         t.rate_module = at(kEuRateModule);

@@ -3,6 +3,7 @@
 #include "profile.hpp"
 #include "install/user_data.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -42,6 +43,9 @@ constexpr std::array<Field, kCount> kFields{{
     {"vc2.online_friend1", "ONLINE_FRIEND1", ""},
     {"vc2.online_friend2", "ONLINE_FRIEND2", ""},
     {"vc2.online_friend3", "ONLINE_FRIEND3", ""},
+    // Voices from another release's disc image (vc2_voice.cpp).
+    {"vc2.voice_disc", "VOICE_DISC", ""},
+    {"vc2.voice_replace", "VOICE_REPLACE", "off"},
 }};
 
 struct State {
@@ -90,7 +94,12 @@ bool valid(Key key, std::string_view value) {
         return !value.empty() && value.find_first_not_of("0123456789") == std::string_view::npos &&
                number_in(value, 1024, 65000);
     case Key::OnlineRouter:
-    case Key::OnlineStun: return value == "on" || value == "off";
+    case Key::OnlineStun:
+    case Key::VoiceReplace: return value == "on" || value == "off";
+    case Key::VoiceDisc:
+        return value.size() <= 1024u &&
+               std::find_if(value.begin(), value.end(), [](char c) { return static_cast<unsigned char>(c) < 0x20u; }) ==
+                   value.end();
     default: return false;
     }
 }

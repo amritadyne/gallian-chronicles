@@ -50,7 +50,7 @@ portablekit_add_game(VC2Native
         host/vc2_tick.cpp host/vc2_census.cpp
         host/vc2_lod.cpp host/vc2_settings.cpp host/vc2_settings_menu.cpp
         host/vc2_camera.cpp host/vc2_controls.cpp host/vc2_glyphs.cpp host/vc2_defaults.cpp host/vc2_discord.cpp host/vc2_text.cpp host/vc2_extras.cpp
-        host/vc2_audio.cpp
+        host/vc2_audio.cpp host/vc2_voice.cpp
         host/vc2_online.cpp host/online/online_crypto.cpp host/online/online_invite.cpp
         host/online/online_session.cpp host/online/online_nat.cpp
         host/vc2_cheats.cpp

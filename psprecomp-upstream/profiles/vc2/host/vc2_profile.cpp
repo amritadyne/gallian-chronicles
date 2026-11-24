@@ -19,6 +19,7 @@
 #include "vc2_text.hpp"
 #include "vc2_cheats.hpp"
 #include "vc2_extras.hpp"
+#include "vc2_voice.hpp"
 #include "adhoc/session.hpp"
 #include "gpu/ge_state.hpp"
 #include "settings/settings.hpp"
@@ -811,6 +812,7 @@ void register_extra_hle(HleRegistrar &hle) {
     vc2::options::load();
     vc2::start_discord();
     vc2::install_audio(hle);
+    vc2::install_voice();
     vc2::install_online();
     // A PC has no wireless switch: it is always on, and the game's ad hoc menus
     // never stop at "The WLAN/WIRELESS switch is off" (2026-11-14).

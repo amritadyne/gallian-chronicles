@@ -1,0 +1,101 @@
+Replacement contents for disc files: hle_extension::set_disc_file_source. A port
+gives a source that is asked at every open of a disc file (path on the disc,
+size, a reader of its own bytes); a filter it returns is what the game reads.
+Used by the VC2 voice disc option (profiles/vc2/host/vc2_voice.cpp). (2026-11-24)
+
+--- a/include/portablekit/hle_extension.hpp
++++ b/include/portablekit/hle_extension.hpp
+@@ -260,6 +260,18 @@
+ // sectors).
+ bool set_file_filter(std::uint32_t fd, std::shared_ptr<FileFilter> filter);
+ 
++// A source of replacement contents for files on the disc (Gallian Chronicles
++// patch 0037). At every open of a disc file (not a directory or the raw
++// device) the source is asked with the file's path on the disc, as the disc
++// spells it relative to its root (e.g. "PSP_GAME/USRDIR/STREAM/OD_VOICE.AFS"),
++// its size and a reader of its own bytes; a filter it returns is what the game
++// reads instead, as with set_file_filter. Null: the file's own bytes. Called on
++// the emulation thread. An empty source removes it.
++using DiscFileReader = std::function<std::size_t(std::uint64_t offset, std::uint8_t *destination, std::size_t length)>;
++using DiscFileSource =
++    std::function<std::shared_ptr<FileFilter>(const std::string &path, std::uint64_t size, DiscFileReader original)>;
++void set_disc_file_source(DiscFileSource source);
++
+ } // namespace portablekit::hle_extension
+ 
+ // Defines a module's entry function. `name` is the module's name as its
+--- a/host/hle/hle_common.hpp
++++ b/host/hle/hle_common.hpp
+@@ -66,6 +66,12 @@
+ // hle_extension::set_file_filter); null restores them. False when `fd` is not
+ // a readable file of bytes.
+ bool set_open_file_filter(std::uint32_t fd, std::shared_ptr<hle_extension::FileFilter> filter);
++// Replacement contents for disc files, asked at each open (see
++// hle_extension::set_disc_file_source).
++void set_disc_file_source(
++    std::function<std::shared_ptr<hle_extension::FileFilter>(
++        const std::string &, std::uint64_t,
++        std::function<std::size_t(std::uint64_t, std::uint8_t *, std::size_t)>)> source);
+ // Opens a guest path for reading, reads from it and closes it again, without
+ // the game seeing a descriptor. Returns the number of bytes read, or the
+ // negative error sceIoOpen would have returned.
+--- a/host/hle/hle_extension_host.cpp
++++ b/host/hle/hle_extension_host.cpp
+@@ -109,6 +109,8 @@
+     return set_open_file_filter(fd, std::move(filter));
+ }
+ 
++void set_disc_file_source(DiscFileSource source) { ::portablekit::set_disc_file_source(std::move(source)); }
++
+ } // namespace hle_extension
+ 
+ HleExtensionReport install_linked_hle_extensions(Runtime &runtime, HleRegistrar &hle) {
+--- a/host/hle/hle_io.cpp
++++ b/host/hle/hle_io.cpp
+@@ -130,6 +130,12 @@
+     std::string current_directory;
+ };
+ 
++// Replacement contents for disc files (hle_extension::set_disc_file_source).
++hle_extension::DiscFileSource &disc_file_source() {
++    static hle_extension::DiscFileSource source;
++    return source;
++}
++
+ IoState &io() {
+     static IoState state;
+     return state;
+@@ -248,6 +254,24 @@
+             file.kind = entry->directory ? OpenFile::Kind::Directory : OpenFile::Kind::Disc;
+             file.disc_offset = static_cast<std::uint64_t>(entry->lba) * IsoImage::kSectorSize;
+             file.size = entry->size;
++            // Replacement contents from the port, if it has any for this file
++            // (patch 0037): the filter is in place before the game's first read.
++            if (!entry->directory && disc_file_source()) {
++                const std::uint64_t start = file.disc_offset;
++                const std::uint64_t size = file.size;
++                hle_extension::DiscFileReader original = [start, size](std::uint64_t offset, std::uint8_t *destination,
++                                                                       std::size_t length) -> std::size_t {
++                    if (!io().disc || offset >= size) return 0u;
++                    const std::size_t count = static_cast<std::size_t>(std::min<std::uint64_t>(length, size - offset));
++                    return io().disc->read(start + offset, std::span<std::uint8_t>(destination, count));
++                };
++                if (auto filter = disc_file_source()(split.path, size, std::move(original))) {
++                    file.unfiltered_size = file.size;
++                    file.filter = std::move(filter);
++                    file.size = file.filter->size();
++                    if (trace_io()) std::cerr << "[io] replaced " << full_path << ", size " << file.size << "\n";
++                }
++            }
+         } else {
+             return static_cast<std::int32_t>(io_error::kFileNotFound);
+         }
+@@ -307,6 +331,8 @@
+ 
+ } // namespace
+ 
++void set_disc_file_source(hle_extension::DiscFileSource source) { disc_file_source() = std::move(source); }
++
+ std::size_t read_open_file(std::uint32_t fd, std::uint64_t offset, std::uint8_t *output, std::size_t size) {
+     const auto found = io().files.find(fd);
+     if (found == io().files.end()) return 0u;

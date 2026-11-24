@@ -15,6 +15,9 @@ enum class Key {
     // launcher, Network page).
     Online, OnlineCode, OnlinePort, OnlineRouter, OnlineStun,
     OnlineKey, OnlineMyCode, OnlineFriend1, OnlineFriend2, OnlineFriend3,
+    // Voices from another release's disc (vc2_voice.cpp): that disc image's
+    // path, and "on"/"off" (launcher, Audio page).
+    VoiceDisc, VoiceReplace,
     Count
 };
 
