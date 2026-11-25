@@ -1,0 +1,194 @@
+Keep disc images in memory: IsoImage::preload copies a byte range of the image into
+memory on a background thread; reads of that range come from memory once the copy has
+passed them. Setting system.disc_in_memory (DISC_IN_MEMORY) preloads the whole disc
+image at start (hle_io register_io). For slow drives. (2026-11-24)
+
+--- a/host/kernel/iso_image.hpp
++++ b/host/kernel/iso_image.hpp
+@@ -1,12 +1,15 @@
+ #pragma once
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <filesystem>
+ #include <fstream>
+ #include <map>
++#include <memory>
+ #include <optional>
+ #include <span>
+ #include <string>
++#include <thread>
+ #include <vector>
+ 
+ namespace portablekit {
+@@ -28,6 +31,16 @@
+     };
+ 
+     explicit IsoImage(const std::filesystem::path &path);
++    ~IsoImage();
++    IsoImage(const IsoImage &) = delete;
++    IsoImage &operator=(const IsoImage &) = delete;
++
++    // Copies bytes [start, start + size) of the image into memory on a
++    // background thread (Gallian Chronicles patch 0038, "Keep disc images in
++    // memory"): reads of that range come from memory once the copy has passed
++    // them, and from the drive until then. False when the memory can't be had
++    // (the drive is used). Call before reads from other threads start.
++    bool preload(std::uint64_t start, std::uint64_t size, const std::string &label);
+ 
+     [[nodiscard]] std::optional<Entry> find(std::string path) const;
+     [[nodiscard]] std::uint64_t size_bytes() const noexcept { return size_bytes_; }
+@@ -39,8 +52,19 @@
+     void scan_directory(std::uint32_t lba, std::uint32_t size, const std::string &prefix, int depth);
+     [[nodiscard]] static std::string normalize(std::string path);
+ 
++    struct Preload {
++        std::uint64_t start{};
++        std::uint64_t size{};
++        std::unique_ptr<std::uint8_t[]> data;
++        std::atomic<std::uint64_t> loaded{0u};  // bytes from `start` copied so far
++        std::thread thread;
++    };
++
++    std::filesystem::path path_;
+     std::ifstream file_;
+     std::uint64_t size_bytes_{};
++    std::vector<std::unique_ptr<Preload>> preloads_;
++    std::atomic<bool> stopping_{false};
+     std::map<std::string, Entry> entries_;
+ };
+ 
+--- a/host/kernel/iso_image.cpp
++++ b/host/kernel/iso_image.cpp
+@@ -4,6 +4,10 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <chrono>
++#include <cstring>
++#include <iostream>
++#include <new>
+ 
+ namespace portablekit {
+ namespace {
+@@ -15,7 +19,7 @@
+ 
+ } // namespace
+ 
+-IsoImage::IsoImage(const std::filesystem::path &path) : file_(path, std::ios::binary) {
++IsoImage::IsoImage(const std::filesystem::path &path) : path_(path), file_(path, std::ios::binary) {
+     if (!file_) throw psprecomp::Error("Cannot open disc image: " + path.string());
+     size_bytes_ = std::filesystem::file_size(path);
+     std::vector<std::uint8_t> primary(kSectorSize);
+@@ -28,6 +32,51 @@
+     scan_directory(root_lba, root_size, "", 0);
+ }
+ 
++IsoImage::~IsoImage() {
++    stopping_.store(true, std::memory_order_relaxed);
++    for (const auto &region : preloads_)
++        if (region->thread.joinable()) region->thread.join();
++}
++
++bool IsoImage::preload(std::uint64_t start, std::uint64_t size, const std::string &label) {
++    if (start >= size_bytes_ || size == 0u) return false;
++    size = std::min(size, size_bytes_ - start);
++    auto region = std::make_unique<Preload>();
++    region->start = start;
++    region->size = size;
++    region->data.reset(new (std::nothrow) std::uint8_t[static_cast<std::size_t>(size)]);
++    if (!region->data) {
++        std::cerr << "[disc] not enough memory to keep " << label << " in memory (" << (size >> 20u)
++                  << " MB): it is read from the drive\n";
++        return false;
++    }
++    Preload *target = region.get();
++    target->thread = std::thread([this, target, label] {
++        const auto begin = std::chrono::steady_clock::now();
++        std::ifstream file(path_, std::ios::binary);
++        if (file) file.seekg(static_cast<std::streamoff>(target->start));
++        constexpr std::uint64_t kChunk = 8u << 20u;
++        std::uint64_t done = 0u;
++        while (file && done < target->size && !stopping_.load(std::memory_order_relaxed)) {
++            const std::uint64_t want = std::min(kChunk, target->size - done);
++            file.read(reinterpret_cast<char *>(target->data.get() + done), static_cast<std::streamsize>(want));
++            const auto got = file.gcount();
++            if (got <= 0) break;
++            done += static_cast<std::uint64_t>(got);
++            target->loaded.store(done, std::memory_order_release);
++        }
++        if (stopping_.load(std::memory_order_relaxed)) return;
++        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
++        if (done == target->size)
++            std::cerr << "[disc] " << label << " in memory: " << (done >> 20u) << " MB in " << seconds << " s\n";
++        else
++            std::cerr << "[disc] " << label << ": the copy stopped after " << (done >> 20u)
++                      << " MB; the rest is read from the drive\n";
++    });
++    preloads_.push_back(std::move(region));
++    return true;
++}
++
+ std::string IsoImage::normalize(std::string path) {
+     std::replace(path.begin(), path.end(), '\\', '/');
+     std::string result;
+@@ -74,6 +123,14 @@
+ std::size_t IsoImage::read(std::uint64_t offset, std::span<std::uint8_t> output) {
+     if (offset >= size_bytes_) return 0u;
+     const std::size_t count = static_cast<std::size_t>(std::min<std::uint64_t>(output.size(), size_bytes_ - offset));
++    // From memory when a preload has already copied the whole range.
++    for (const auto &region : preloads_) {
++        if (offset >= region->start &&
++            offset + count <= region->start + region->loaded.load(std::memory_order_acquire)) {
++            std::memcpy(output.data(), region->data.get() + (offset - region->start), count);
++            return count;
++        }
++    }
+     file_.clear();
+     file_.seekg(static_cast<std::streamoff>(offset));
+     file_.read(reinterpret_cast<char *>(output.data()), static_cast<std::streamsize>(count));
+--- a/host/settings/settings.hpp
++++ b/host/settings/settings.hpp
+@@ -118,6 +118,7 @@
+     std::string texture_pack_folder;   // a pack used where it is instead of textures/<disc id>; empty: none
+     bool unthrottled{};                // let emulated time run ahead of real time
+     bool fast_loading{true};           // ...but only while the game loads (kernel/fast_loading.hpp)
++    bool disc_in_memory{};             // copy the disc image into memory at start (patch 0038)
+     FrameRate frame_rate{FrameRate::Fps30};
+     bool frame_rate_auto{true};        // lower the frame rate rather than slow the game
+     PerfDisplay perf{PerfDisplay::Off};
+--- a/host/settings/settings.cpp
++++ b/host/settings/settings.cpp
+@@ -250,6 +250,11 @@
+          [](Settings &s, const std::string &t) { return parse_bool(t, s.fast_loading); },
+          [](const Settings &s) { return std::string(s.fast_loading ? "1" : "0"); },
+          [](Settings &s, const char *t) { s.fast_loading = variable_flag(t); }},
++        // Patch 0038: the disc image copied into memory at start (IsoImage::preload).
++        {"system.disc_in_memory", "DISC_IN_MEMORY",
++         [](Settings &s, const std::string &t) { return parse_bool(t, s.disc_in_memory); },
++         [](const Settings &s) { return std::string(s.disc_in_memory ? "1" : "0"); },
++         [](Settings &s, const char *t) { s.disc_in_memory = variable_flag(t); }},
+         {"video.frame_rate", "FRAME_RATE",
+          [](Settings &s, const std::string &t) { return kFrameRates.parse(t, s.frame_rate); },
+          [](const Settings &s) { return kFrameRates.format(s.frame_rate); },
+--- a/host/hle/hle_io.cpp
++++ b/host/hle/hle_io.cpp
+@@ -8,6 +8,7 @@
+ #include "kernel/fast_loading.hpp"
+ #include "kernel/load_trace.hpp"
+ #include "kernel/iso_image.hpp"
++#include "settings/settings.hpp"
+ 
+ #include "psprecomp/common.hpp"
+ #include "portablekit/hle_extension.hpp"
+@@ -767,6 +768,10 @@
+ 
+ void register_io(HleRegistrar &hle, const std::filesystem::path &disc_image, const std::filesystem::path &memory_stick) {
+     if (!disc_image.empty()) io().disc = std::make_unique<IsoImage>(disc_image);
++    // "Keep disc images in memory" (patch 0038): the whole image, copied in
++    // the background; reads come from memory as the copy passes them.
++    if (io().disc && settings::current().disc_in_memory)
++        (void)io().disc->preload(0u, io().disc->size_bytes(), disc_image.filename().string());
+     io().memory_stick = memory_stick;
+ 
+     hle.add("IoFileMgrForUser", "sceIoOpen", [](Runtime &rt, AllegrexContext &ctx) {

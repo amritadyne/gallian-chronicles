@@ -1,0 +1,47 @@
+Audio headroom: the mix is lowered by about 3 dB before the limiter, so it only
+catches rare spikes (it was turning loud battles down 15% of the time), and the
+limiter lets go over 0.35 s instead of 0.15 s, so it pumps less.
+<prefix>_AUDIO_FULL_LEVEL keeps the old level. (2026-11-24)
+
+--- a/host/audio/audio_sink.cpp
++++ b/host/audio/audio_sink.cpp
+@@ -47,7 +47,17 @@
+ constexpr double kKnee = 29500.0;
+ constexpr std::size_t kLookahead = 64u;  // ~1.5 ms
+ constexpr double kAttackFrames = 16.0;
+-constexpr double kReleaseSeconds = 0.15;
++constexpr double kReleaseSeconds = 0.35;  // 0.15 until 2026-11-24: let go slower, less pumping
++
++// Headroom (2026-11-24, owner on good headphones): the whole mix is lowered by
++// about 3 dB before the limiter, so it only catches the rare spike. Before,
++// loud VC2 battles had the limiter turning sound down in 39 of 143 seconds
++// (15% of all frames), which squashes and pumps. <prefix>_AUDIO_FULL_LEVEL
++// keeps the old level.
++[[nodiscard]] double headroom() {
++    static const double gain = portablekit::env("AUDIO_FULL_LEVEL") != nullptr ? 1.0 : 0.70795;  // -3 dB
++    return gain;
++}
+ 
+ [[nodiscard]] std::int16_t soft_output(double value) noexcept {
+     const double magnitude = std::abs(value);
+@@ -163,7 +173,8 @@
+             return static_cast<std::size_t>(position % kRingFrames) * kChannels;
+         };
+         const auto peak_at = [this](std::size_t slot) {
+-            return std::max(std::abs(static_cast<double>(ring[slot])), std::abs(static_cast<double>(ring[slot + 1u])));
++            return std::max(std::abs(static_cast<double>(ring[slot])), std::abs(static_cast<double>(ring[slot + 1u]))) *
++                   headroom();
+         };
+         const double attack = std::exp(-1.0 / kAttackFrames);
+         const double release = std::exp(-1.0 / (kReleaseSeconds * static_cast<double>(kSampleRate)));
+@@ -186,8 +197,8 @@
+                 const double now = peak_at(slot);
+                 if (now > 32767.0) ++window_over;
+                 if (limiter_gain < 0.999) ++window_limited;
+-                left = soft_output(static_cast<double>(ring[slot]) * limiter_gain);
+-                right = soft_output(static_cast<double>(ring[slot + 1u]) * limiter_gain);
++                left = soft_output(static_cast<double>(ring[slot]) * headroom() * limiter_gain);
++                right = soft_output(static_cast<double>(ring[slot + 1u]) * headroom() * limiter_gain);
+             }
+             ring[slot] = 0;
+             ring[slot + 1u] = 0;

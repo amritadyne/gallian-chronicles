@@ -118,6 +118,7 @@ struct Settings {
     std::string texture_pack_folder;   // a pack used where it is instead of textures/<disc id>; empty: none
     bool unthrottled{};                // let emulated time run ahead of real time
     bool fast_loading{true};           // ...but only while the game loads (kernel/fast_loading.hpp)
+    bool disc_in_memory{};             // copy the disc image into memory at start (patch 0038)
     FrameRate frame_rate{FrameRate::Fps30};
     bool frame_rate_auto{true};        // lower the frame rate rather than slow the game
     PerfDisplay perf{PerfDisplay::Off};
@@ -129,6 +130,7 @@ struct Settings {
     // Audio
     std::uint32_t volume{100u};        // percent
     bool mute{};
+    bool soundtrack{true};             // play an imported soundtrack's versions of the music (audio/soundtrack_import_run.hpp)
 
     // Controls
     // The game's confirm button on the south face button rather than the

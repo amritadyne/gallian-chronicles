@@ -8,6 +8,7 @@
 #include "kernel/fast_loading.hpp"
 #include "kernel/load_trace.hpp"
 #include "kernel/iso_image.hpp"
+#include "settings/settings.hpp"
 
 #include "psprecomp/common.hpp"
 #include "portablekit/hle_extension.hpp"
@@ -773,6 +774,10 @@ void register_async_io(HleRegistrar &hle) {
 
 void register_io(HleRegistrar &hle, const std::filesystem::path &disc_image, const std::filesystem::path &memory_stick) {
     if (!disc_image.empty()) io().disc = std::make_unique<IsoImage>(disc_image);
+    // "Keep disc images in memory" (patch 0038): the whole image, copied in
+    // the background; reads come from memory as the copy passes them.
+    if (io().disc && settings::current().disc_in_memory)
+        (void)io().disc->preload(0u, io().disc->size_bytes(), disc_image.filename().string());
     io().memory_stick = memory_stick;
 
     hle.add("IoFileMgrForUser", "sceIoOpen", [](Runtime &rt, AllegrexContext &ctx) {

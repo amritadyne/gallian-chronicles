@@ -20,6 +20,8 @@
 #include "vc2_cheats.hpp"
 #include "vc2_extras.hpp"
 #include "vc2_voice.hpp"
+#include "vc2_music_reader.hpp"
+#include "vc2_soundtrack_table.hpp"
 #include "adhoc/session.hpp"
 #include "gpu/ge_state.hpp"
 #include "settings/settings.hpp"
@@ -1006,6 +1008,8 @@ const GameProfile &game() {
         .fast_loading_allowed = &fast_loading_allowed,
         .system_language = 1u,
         .confirm_button = 1u,
+        .soundtrack_music = &::vc2::soundtrack_music,
+        .soundtrack_table = &::vc2::soundtrack_table,
     };
     return profile;
 }

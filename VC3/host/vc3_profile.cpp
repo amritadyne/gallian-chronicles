@@ -20,6 +20,7 @@
 #include "vc3_region.hpp"
 #include "vc3_settings.hpp"
 #include "vc3_text.hpp"
+#include "vc3_soundtrack_table.hpp"
 #include "gpu/ge_state.hpp"
 #include "settings/settings.hpp"
 
@@ -971,6 +972,10 @@ const GameProfile &game() {
         // edition; the English one confirms with Cross, kVariants).
         .system_language = 0u,
         .confirm_button = 0u,
+        // Audio > Soundtrack (--import-soundtrack): VC3's tracks are built
+        // from the album alone (vc3_soundtrack_table.hpp).
+        .soundtrack_music = &::vc3::soundtrack_music,
+        .soundtrack_table = &::vc3::soundtrack_table,
     };
     return profile;
 }

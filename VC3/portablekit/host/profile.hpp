@@ -15,9 +15,11 @@
 
 #include <array>
 #include <cstdint>
+#include <filesystem>
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace psprecomp {
 class Elf32Image;
@@ -25,6 +27,11 @@ class Runtime;
 } // namespace psprecomp
 
 namespace portablekit {
+
+namespace audio::soundtrack {
+struct Entry;
+struct GameTrack;
+} // namespace audio::soundtrack
 
 class HleRegistrar;
 namespace gpu::interpolation {
@@ -305,6 +312,15 @@ struct GameProfile {
     // the game expects; the defaults are a Japanese one.
     std::uint32_t system_language = 0u;
     std::uint32_t confirm_button = 0u;
+
+    // --- Soundtrack import (host/audio/soundtrack_import_run.hpp) ----------
+    // `--import-soundtrack <folder>` builds the game's music from the player's
+    // own copy of the soundtrack. The game's music tracks, read from its disc
+    // image (false with `error` set when they can't be), and the table of
+    // which album track each one is. Null: the game has no soundtrack import.
+    bool (*soundtrack_music)(const std::filesystem::path &image, std::vector<audio::soundtrack::GameTrack> &tracks,
+                             std::string &error) = nullptr;
+    const std::vector<audio::soundtrack::Entry> &(*soundtrack_table)() = nullptr;
 
     // --- Text ----------------------------------------------------------------
     // Where the game caches the glyphs it has drawn. Null: a font changed while

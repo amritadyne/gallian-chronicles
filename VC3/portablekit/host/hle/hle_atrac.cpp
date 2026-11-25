@@ -11,22 +11,46 @@
 // sample the encoder was given. The decoded stream starts earlier, by the
 // encoder delay recorded in the `fact` chunk plus the decoder's own delay, and
 // loop points in the `smpl` chunk are counted including the encoder delay.
+//
+// Soundtrack replacement: the folder the soundtrack import writes
+// (audio/soundtrack_import_run.hpp; Audio > Soundtrack on, setting
+// audio.soundtrack), or <prefix>_MUSIC_DIR for tests: 16-bit stereo 44.1 kHz
+// FLAC or WAVE files, each named by a track's key (a hash of the first 4 KiB
+// of its data) and already lined up with the game's positions: sample p of
+// the file is position p. A track with one plays it in place of what it
+// decodes; which track plays, its loop, how often and its end stay the
+// game's own. F6 switches between the soundtrack and the game's own music
+// while playing, at the same point in the track, to compare them.
 #include "../profile.hpp"
 #include "hle_common.hpp"
 
 #include "audio/atrac_decoder.hpp"
+#include "audio/soundtrack_import_run.hpp"
+#include "audio/soundtrack_media.hpp"
+#include "settings/settings.hpp"
 
 #include "psprecomp/common.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <sstream>
 #include <vector>
+
+#if defined(PORTABLEKIT_HAS_SDL)
+#include <SDL3/SDL.h>
+#endif
 
 namespace portablekit {
 namespace {
@@ -63,6 +87,9 @@ bool trace_atrac() {
 void trace(const std::string &line) {
     if (trace_atrac()) std::cerr << "[atrac] " << line << "\n";
 }
+
+// A track's soundtrack replacement: interleaved stereo samples by position.
+using Replacement = std::shared_ptr<const std::vector<std::int16_t>>;
 
 // What SetData learns from the WAVE header.
 struct TrackInfo {
@@ -118,6 +145,9 @@ struct AtracContext {
     bool low_level{};
     std::uint32_t low_level_frame_bytes{};
     std::uint32_t low_level_out_channels{2u};
+
+    std::string key;          // names the track's replacement
+    Replacement replacement;  // empty: the track plays as it is
 };
 
 std::array<std::unique_ptr<AtracContext>, kMaxAtracIds> &contexts() {
@@ -215,6 +245,130 @@ std::optional<std::uint32_t> parse_header(const psprecomp::GuestMemory &memory, 
         info.loop_end = std::min(static_cast<std::int32_t>(loop->second - fact_offset), info.end_sample);
     }
     return std::nullopt;
+}
+
+// A hash of the first 4 KiB of the track's data, or nothing if the game has
+// not put that much in the buffer.
+std::string track_key(const psprecomp::GuestMemory &memory, std::uint32_t buffer, std::uint32_t available,
+                      const TrackInfo &track) {
+    constexpr std::uint32_t kKeyBytes = 4096u;
+    if (track.data_size < kKeyBytes || track.data_offset + kKeyBytes > available) return {};
+    std::vector<std::uint8_t> bytes(kKeyBytes);
+    memory.copy_out(buffer + track.data_offset, bytes);
+    std::uint64_t hash = 0xcbf29ce484222325ull;  // FNV-1a
+    for (const std::uint8_t byte : bytes) hash = (hash ^ byte) * 0x100000001b3ull;
+    char text[17];
+    std::snprintf(text, sizeof text, "%016llx", static_cast<unsigned long long>(hash));
+    return text;
+}
+
+// Reads a 16-bit stereo 44.1 kHz PCM WAVE file; empty if it is anything else.
+Replacement read_replacement_wave(const std::filesystem::path &path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return {};
+    const std::vector<char> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    const auto le16 = [&](std::size_t at) {
+        return static_cast<std::uint32_t>(static_cast<std::uint8_t>(bytes[at])) |
+               static_cast<std::uint32_t>(static_cast<std::uint8_t>(bytes[at + 1u])) << 8u;
+    };
+    const auto le32 = [&](std::size_t at) { return le16(at) | le16(at + 2u) << 16u; };
+    if (bytes.size() < 12u || std::memcmp(bytes.data(), "RIFF", 4) != 0 || std::memcmp(bytes.data() + 8, "WAVE", 4) != 0)
+        return {};
+    bool format_ok = false;
+    for (std::size_t at = 12u; at + 8u <= bytes.size();) {
+        const std::uint32_t size = le32(at + 4u);
+        const std::size_t body = at + 8u;
+        if (std::memcmp(bytes.data() + at, "fmt ", 4) == 0 && size >= 16u && body + 16u <= bytes.size())
+            format_ok = le16(body) == 1u && le16(body + 2u) == 2u && le32(body + 4u) == 44100u && le16(body + 14u) == 16u;
+        if (std::memcmp(bytes.data() + at, "data", 4) == 0) {
+            if (!format_ok) return {};
+            const std::size_t length = std::min<std::size_t>(size, bytes.size() - body) / 4u * 4u;
+            auto samples = std::make_shared<std::vector<std::int16_t>>(length / 2u);
+            std::memcpy(samples->data(), bytes.data() + body, length);
+            return samples;
+        }
+        at = body + size + (size & 1u);
+    }
+    return {};
+}
+
+// Whether replacements play: F6 turns them off and on again (checked as the
+// music decodes, a few times a second).
+bool soundtrack_on() {
+    static bool on = true;
+#if defined(PORTABLEKIT_HAS_SDL)
+    static bool was_down = false;
+    int count = 0;
+    const bool *keys = SDL_GetKeyboardState(&count);
+    const bool down = keys != nullptr && SDL_SCANCODE_F6 < count && keys[SDL_SCANCODE_F6];
+    if (down && !was_down) {
+        on = !on;
+        std::cerr << "[music] F6: " << (on ? "the soundtrack's versions" : "the game's own music") << "\n";
+    }
+    was_down = down;
+#endif
+    return on;
+}
+
+// The replacement for the track with key `key`, read once and kept.
+// The folder replacements come from: <prefix>_MUSIC_DIR, else the import's
+// folder when the soundtrack is on and the import has written to it.
+const std::filesystem::path &soundtrack_folder() {
+    static const std::filesystem::path folder = [] {
+        if (const char *dir = portablekit::env("MUSIC_DIR"); dir != nullptr && *dir != '\0')
+            return std::filesystem::path(dir);
+        if (!portablekit::settings::current().soundtrack) return std::filesystem::path();
+        std::filesystem::path imported = portablekit::audio::soundtrack::default_soundtrack_folder();
+        std::error_code error;
+        return std::filesystem::exists(imported / "soundtrack.txt", error) ? imported : std::filesystem::path();
+    }();
+    return folder;
+}
+
+// The track's FLAC (as the import writes it) or WAVE file; empty if neither
+// is there or readable.
+Replacement read_replacement(const std::filesystem::path &folder, const std::string &key, std::string &why) {
+    std::error_code error;
+    const std::filesystem::path flac = folder / (key + ".flac");
+    if (std::filesystem::exists(flac, error)) {
+        std::optional<std::vector<std::int16_t>> pcm = portablekit::audio::soundtrack::read_pcm16(flac, why);
+        if (pcm) return std::make_shared<const std::vector<std::int16_t>>(std::move(*pcm));
+        return {};
+    }
+    const std::filesystem::path wave = folder / (key + ".wav");
+    if (!std::filesystem::exists(wave, error)) return {};
+    Replacement r = read_replacement_wave(wave);
+    if (!r) why = wave.string() + " is not 16-bit stereo 44.1 kHz PCM";
+    return r;
+}
+
+Replacement find_replacement(const std::string &key) {
+    const std::filesystem::path &folder = soundtrack_folder();
+    if (folder.empty()) return {};
+    static std::mutex lock;
+    static std::map<std::string, Replacement> cache;
+    static bool announced = false;
+    const std::lock_guard guard(lock);
+    if (!announced) {
+        announced = true;
+        std::cerr << "[music] soundtrack files from " << folder.string() << "\n";
+    }
+    if (key.empty()) {
+        std::cerr << "[music] a track started with too little of it in memory to name it\n";
+        return {};
+    }
+    if (const auto found = cache.find(key); found != cache.end()) return found->second;
+    std::string why;
+    Replacement replacement = read_replacement(folder, key, why);
+    if (replacement)
+        std::cerr << "[music] " << key << ": the soundtrack's version ("
+                  << replacement->size() / 2u / 44100u << " s)\n";
+    else if (!why.empty())
+        std::cerr << "[music] " << key << ": " << why << "\n";
+    else
+        std::cerr << "[music] " << key << ": no soundtrack file\n";
+    cache.emplace(key, replacement);
+    return replacement;
 }
 
 bool looping(const AtracContext &context) {
@@ -434,6 +588,8 @@ LoadResult load_track(const psprecomp::GuestMemory &memory, std::optional<std::u
         if (free == table.end()) return {atrac_error::kNoAtracId, {}};
         slot = static_cast<std::uint32_t>(free - table.begin());
     }
+    context->key = track_key(memory, buffer, read_size, track);
+    context->replacement = find_replacement(context->key);
     context->loaded = true;
     context->buffer = buffer;
     context->buffer_size = buffer_size;
@@ -442,7 +598,8 @@ LoadResult load_track(const psprecomp::GuestMemory &memory, std::optional<std::u
     std::ostringstream details;
     details << "file=" << track.file_size << " align=" << track.block_align << " channels=" << track.channels
             << " end=" << track.end_sample << " loop=" << track.loop_start << ".." << track.loop_end
-            << " skip=" << track.skip;
+            << " skip=" << track.skip << " key=" << (context->key.empty() ? "-" : context->key)
+            << (context->replacement ? " (soundtrack)" : "");
     if (streaming) details << " streamed, " << read_size << " of it in a buffer of " << buffer_size;
     table[slot] = std::move(context);
     return {slot, details.str()};
@@ -617,6 +774,11 @@ void register_atrac_functions(HleRegistrar &hle) {
         if (output != 0u) {
             if (std::uint8_t *destination = memory.raw_pointer(output, static_cast<std::size_t>(count) * 4u)) {
                 const std::int16_t *source = context->cached.data() + first * 2;
+                // The soundtrack's samples for these positions, where it has them.
+                const Replacement &swap = context->replacement;
+                if (swap && soundtrack_on() &&
+                    static_cast<std::size_t>(context->position + count) * 2u <= swap->size())
+                    source = swap->data() + static_cast<std::size_t>(context->position) * 2u;
                 for (std::int32_t i = 0; i < count * 2; ++i) {
                     const auto value = static_cast<std::uint16_t>(source[i]);
                     destination[i * 2] = static_cast<std::uint8_t>(value);

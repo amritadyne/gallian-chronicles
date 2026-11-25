@@ -37,7 +37,8 @@ portablekit_add_game(VC3Native
         host/vc3_tick.cpp host/vc3_census.cpp host/vc3_lod.cpp
         host/vc3_settings.cpp host/vc3_settings_menu.cpp
         host/vc3_camera.cpp host/vc3_controls.cpp host/vc3_glyphs.cpp host/vc3_text.cpp
-        host/vc3_defaults.cpp host/vc3_discord.cpp host/vc3_audio.cpp host/vc3_extras.cpp)
+        host/vc3_defaults.cpp host/vc3_discord.cpp host/vc3_audio.cpp host/vc3_extras.cpp
+        host/vc3_soundtrack_table.cpp)
 
 # 100% native, as VC2's build (owner, 2026-11-16: VC3's native rendering
 # confirmed): every GU entry point, draw and display list is handled on the

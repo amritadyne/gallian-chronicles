@@ -39,6 +39,7 @@
 
 #include "vc2_settings.hpp"
 #include "kernel/iso_image.hpp"
+#include "settings/settings.hpp"
 #include "portablekit/hle_extension.hpp"
 
 #include <algorithm>
@@ -539,6 +540,19 @@ void install_voice() {
     if (!archive) {
         std::cerr << "[vc2-voice] the voice disc's archive can't be read (" << why << ")\n";
         return;
+    }
+    // "Keep disc images in memory": the voice disc's voices and movies too
+    // (only those are read from it), copied in the background like the game's
+    // own disc image (patch 0038).
+    if (settings::current().disc_in_memory) {
+        const std::string name = other->path.filename().string();
+        (void)other->image->preload(other->start, other->size, name + " voices");
+        for (const std::string &file : other->image->list(kMovieFolder)) {
+            const auto movie = other->image->find(std::string(kMovieFolder) + file);
+            if (movie && !movie->directory)
+                (void)other->image->preload(static_cast<std::uint64_t>(movie->lba) * IsoImage::kSectorSize,
+                                            movie->size, name + " " + file);
+        }
     }
     state.other = std::move(other);
     state.other_archive = std::move(archive);

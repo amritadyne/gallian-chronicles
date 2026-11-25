@@ -27,6 +27,9 @@ set(PORTABLEKIT_HOST_SOURCES
     host/app_paths.cpp
     host/corpus_library.cpp
     host/audio/atrac_decoder.cpp
+    host/audio/soundtrack_import.cpp
+    host/audio/soundtrack_import_run.cpp
+    host/audio/soundtrack_media.cpp
     host/movie/avc_decoder.cpp
     host/movie/psmf_demuxer.cpp
     host/movie/psmf_header.cpp

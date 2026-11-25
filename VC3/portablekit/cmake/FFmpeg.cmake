@@ -47,7 +47,10 @@ set(PORTABLEKIT_FFMPEG_CONFIGURE_FLAGS
 set(PORTABLEKIT_FFMPEG_WINDOWS_URL
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34/ffmpeg-n7.1.5-1-g7d0e842004-win64-lgpl-shared-7.1.zip")
 set(PORTABLEKIT_FFMPEG_WINDOWS_SHA256 03a8003e245c08df4277d7b0adc50b93a97ddd4a3aaafea21943c4384df59895)
-set(PORTABLEKIT_FFMPEG_WINDOWS_DLLS avcodec-61 avutil-59 swresample-5)
+# avformat, avfilter (and the swscale avfilter needs) are for the soundtrack
+# import only (host/audio/soundtrack_media.cpp): reading the player's audio
+# files, the tempo change and writing FLAC.
+set(PORTABLEKIT_FFMPEG_WINDOWS_DLLS avcodec-61 avutil-59 swresample-5 avformat-61 avfilter-10 swscale-8)
 
 set(PORTABLEKIT_FFMPEG "bundled" CACHE STRING
     "Where FFmpeg comes from: bundled (built with the project), system (pkg-config) or OFF (no music, no movies)")
@@ -72,6 +75,7 @@ set(PORTABLEKIT_FFMPEG_DOWNLOAD_DIR "${CMAKE_BINARY_DIR}/_deps/downloads" CACHE 
     "Where the bundled FFmpeg archive is downloaded to, or found without downloading")
 
 set(PORTABLEKIT_HAS_FFMPEG OFF)
+set(PORTABLEKIT_HAS_SOUNDTRACK_IMPORT OFF)
 set(_portablekit_ffmpeg_root "${CMAKE_BINARY_DIR}/_deps/ffmpeg")
 set(_portablekit_ffmpeg_bin "${CMAKE_BINARY_DIR}/bin")
 
@@ -164,14 +168,14 @@ elseif(WIN32)
     endforeach()
     configure_file("${_portablekit_ffmpeg_prefix}/LICENSE.txt" "${_portablekit_ffmpeg_bin}/FFmpeg-LICENSE.txt" COPYONLY)
     _portablekit_ffmpeg_write_notice("${_portablekit_ffmpeg_bin}"
-        "The FFmpeg libraries here (avcodec, avutil, swresample) are an unmodified prebuilt\n"
+        "The FFmpeg libraries here (avcodec, avutil, swresample, avformat, avfilter, swscale) are an unmodified prebuilt\n"
         "LGPL shared build of FFmpeg ${PORTABLEKIT_FFMPEG_VERSION} from BtbN/FFmpeg-Builds, licensed under the\n"
         "GNU LGPL version 3 or later (FFmpeg-LICENSE.txt). They are dynamically linked.\n\n"
         "Build:  ${PORTABLEKIT_FFMPEG_WINDOWS_URL}\n"
         "Source: https://github.com/FFmpeg/FFmpeg/tree/release/7.1 (the commit is in the file name)\n"
         "Build scripts: https://github.com/BtbN/FFmpeg-Builds\n")
     add_library(portablekit_ffmpeg INTERFACE)
-    foreach(lib avcodec avutil)
+    foreach(lib avcodec avutil avformat avfilter swresample)
         add_library(portablekit_ffmpeg_${lib} SHARED IMPORTED)
         foreach(dll IN LISTS PORTABLEKIT_FFMPEG_WINDOWS_DLLS)
             if(dll MATCHES "^${lib}-")
@@ -185,7 +189,8 @@ elseif(WIN32)
     endforeach()
     target_include_directories(portablekit_ffmpeg INTERFACE "${_portablekit_ffmpeg_includes}")
     set(PORTABLEKIT_HAS_FFMPEG ON)
-    message(STATUS "portablekit: bundled FFmpeg ${PORTABLEKIT_FFMPEG_VERSION} (prebuilt, LGPL); music and movies enabled")
+    set(PORTABLEKIT_HAS_SOUNDTRACK_IMPORT ON)
+    message(STATUS "portablekit: bundled FFmpeg ${PORTABLEKIT_FFMPEG_VERSION} (prebuilt, LGPL); music, movies and the soundtrack import enabled")
 
 else()
     find_program(PORTABLEKIT_MAKE NAMES gmake make)
@@ -315,6 +320,9 @@ function(portablekit_use_ffmpeg target)
         return()
     endif()
     target_compile_definitions(${target} PRIVATE PORTABLEKIT_HAS_FFMPEG=1)
+    if(PORTABLEKIT_HAS_SOUNDTRACK_IMPORT)
+        target_compile_definitions(${target} PRIVATE PORTABLEKIT_HAS_SOUNDTRACK_IMPORT=1)
+    endif()
     target_link_libraries(${target} PRIVATE portablekit_ffmpeg)
     if(PORTABLEKIT_FFMPEG_RPATH)
         set_property(TARGET ${target} APPEND PROPERTY BUILD_RPATH "${PORTABLEKIT_FFMPEG_RPATH}")

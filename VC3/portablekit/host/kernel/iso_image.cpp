@@ -4,6 +4,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cstring>
+#include <iostream>
+#include <new>
 
 namespace portablekit {
 namespace {
@@ -15,7 +19,7 @@ std::uint32_t read_le32(const std::vector<std::uint8_t> &data, std::size_t offse
 
 } // namespace
 
-IsoImage::IsoImage(const std::filesystem::path &path) : file_(path, std::ios::binary) {
+IsoImage::IsoImage(const std::filesystem::path &path) : path_(path), file_(path, std::ios::binary) {
     if (!file_) throw psprecomp::Error("Cannot open disc image: " + path.string());
     size_bytes_ = std::filesystem::file_size(path);
     std::vector<std::uint8_t> primary(kSectorSize);
@@ -26,6 +30,51 @@ IsoImage::IsoImage(const std::filesystem::path &path) : file_(path, std::ios::bi
     const std::uint32_t root_size = read_le32(primary, 156u + 10u);
     entries_[""] = Entry{root_lba, root_size, true};
     scan_directory(root_lba, root_size, "", 0);
+}
+
+IsoImage::~IsoImage() {
+    stopping_.store(true, std::memory_order_relaxed);
+    for (const auto &region : preloads_)
+        if (region->thread.joinable()) region->thread.join();
+}
+
+bool IsoImage::preload(std::uint64_t start, std::uint64_t size, const std::string &label) {
+    if (start >= size_bytes_ || size == 0u) return false;
+    size = std::min(size, size_bytes_ - start);
+    auto region = std::make_unique<Preload>();
+    region->start = start;
+    region->size = size;
+    region->data.reset(new (std::nothrow) std::uint8_t[static_cast<std::size_t>(size)]);
+    if (!region->data) {
+        std::cerr << "[disc] not enough memory to keep " << label << " in memory (" << (size >> 20u)
+                  << " MB): it is read from the drive\n";
+        return false;
+    }
+    Preload *target = region.get();
+    target->thread = std::thread([this, target, label] {
+        const auto begin = std::chrono::steady_clock::now();
+        std::ifstream file(path_, std::ios::binary);
+        if (file) file.seekg(static_cast<std::streamoff>(target->start));
+        constexpr std::uint64_t kChunk = 8u << 20u;
+        std::uint64_t done = 0u;
+        while (file && done < target->size && !stopping_.load(std::memory_order_relaxed)) {
+            const std::uint64_t want = std::min(kChunk, target->size - done);
+            file.read(reinterpret_cast<char *>(target->data.get() + done), static_cast<std::streamsize>(want));
+            const auto got = file.gcount();
+            if (got <= 0) break;
+            done += static_cast<std::uint64_t>(got);
+            target->loaded.store(done, std::memory_order_release);
+        }
+        if (stopping_.load(std::memory_order_relaxed)) return;
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+        if (done == target->size)
+            std::cerr << "[disc] " << label << " in memory: " << (done >> 20u) << " MB in " << seconds << " s\n";
+        else
+            std::cerr << "[disc] " << label << ": the copy stopped after " << (done >> 20u)
+                      << " MB; the rest is read from the drive\n";
+    });
+    preloads_.push_back(std::move(region));
+    return true;
 }
 
 std::string IsoImage::normalize(std::string path) {
@@ -74,6 +123,14 @@ std::optional<IsoImage::Entry> IsoImage::find(std::string path) const {
 std::size_t IsoImage::read(std::uint64_t offset, std::span<std::uint8_t> output) {
     if (offset >= size_bytes_) return 0u;
     const std::size_t count = static_cast<std::size_t>(std::min<std::uint64_t>(output.size(), size_bytes_ - offset));
+    // From memory when a preload has already copied the whole range.
+    for (const auto &region : preloads_) {
+        if (offset >= region->start &&
+            offset + count <= region->start + region->loaded.load(std::memory_order_acquire)) {
+            std::memcpy(output.data(), region->data.get() + (offset - region->start), count);
+            return count;
+        }
+    }
     file_.clear();
     file_.seekg(static_cast<std::streamoff>(offset));
     file_.read(reinterpret_cast<char *>(output.data()), static_cast<std::streamsize>(count));

@@ -12,6 +12,7 @@
 #include "profile.hpp"
 #include "install/installer.hpp"
 #include "install/user_data.hpp"
+#include "audio/soundtrack_import_run.hpp"
 #include "gpu/ge_state.hpp"
 #include "kernel/kernel.hpp"
 
@@ -103,10 +104,13 @@ std::string usage() {
     return "usage: " + app + " [game_dir]\n"
            "       " + app + " --install [image.iso [--in-place]]\n"
            "       " + app + " --adhoc-server [port]\n"
+           "       " + app + " --import-soundtrack folder [--image image.iso] [--out folder]\n"
            "  game_dir        play from a directory holding EBOOT.ELF, disc.iso and ms0/\n"
            "  --install       run the setup again on screen, then play\n"
            "  --install image set up from image.iso without the setup screens, then exit\n"
            "  --in-place      use the image where it is instead of copying it\n"
+           "  --import-soundtrack  build the game's music from your copy of its soundtrack\n"
+           "                  (any audio files in folder), then exit\n"
            "  --adhoc-server  run only the ad hoc server that Network > Host a session\n"
            "                  starts, on TCP port (default 27312) and the next one up,\n"
            "                  announced on the local network, until Ctrl+C\n";
@@ -361,6 +365,64 @@ int run_adhoc_server(int argc, char **argv) {
 
 } // namespace
 
+// --import-soundtrack <folder> [--image <image.iso>] [--out <folder>]: builds the
+// game's music from the player's soundtrack files (audio/soundtrack_import_run.hpp).
+int run_soundtrack_import(int argc, char **argv) {
+    namespace install = portablekit::install;
+    const portablekit::GameProfile &game = portablekit::game();
+    if (game.soundtrack_music == nullptr || game.soundtrack_table == nullptr) {
+        std::cerr << game.app_name << " has no soundtrack import\n";
+        return 2;
+    }
+    std::optional<std::filesystem::path> folder, image, out;
+    for (int i = 2; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if ((arg == "--image" || arg == "--out") && i + 1 < argc) {
+            (arg == "--image" ? image : out) = install::path_from_utf8(argv[++i]);
+        } else if (!arg.empty() && arg[0] != '-' && !folder) {
+            folder = install::path_from_utf8(arg);
+        } else {
+            std::cerr << game.app_name << ": --import-soundtrack folder [--image image.iso] [--out folder]\n";
+            return 2;
+        }
+    }
+    if (!folder) {
+        std::cerr << game.app_name << ": --import-soundtrack needs the folder holding the soundtrack's files\n";
+        return 2;
+    }
+    // The disc image: --image, else the game folder's disc.iso, else the
+    // installation's; only one that exists counts. A game whose music can't be
+    // read (VC3) builds from the album alone and is given an empty path.
+    std::error_code ec;
+    const auto exists = [&ec](const std::filesystem::path &path) {
+        return !path.empty() && std::filesystem::is_regular_file(path, ec);
+    };
+    if (!image) {
+        for (const char *name : {"GAME_DIR", "DATA_DIR"})
+            if (const char *dir = portablekit::env(name); !image && dir != nullptr && *dir != '\0')
+                if (exists(install::path_from_utf8(dir) / "disc.iso")) image = install::path_from_utf8(dir) / "disc.iso";
+        if (!image)
+            if (const auto installed = install::find_installation(install::user_data_directory()))
+                if (exists(installed->disc_image)) image = installed->disc_image;
+        if (!image && !checkout_game_directory().empty() && exists(checkout_game_directory() / "disc.iso"))
+            image = checkout_game_directory() / "disc.iso";
+    } else if (!exists(*image)) {
+        std::cerr << "No disc image at " << install::path_to_utf8(*image) << "\n";
+        return 1;
+    }
+    std::vector<portablekit::audio::soundtrack::GameTrack> tracks;
+    std::string error;
+    if (image) std::cout << "Reading the game's music from " << install::path_to_utf8(*image) << std::endl;
+    if (!game.soundtrack_music(image ? *image : std::filesystem::path{}, tracks, error)) {
+        if (!image) std::cerr << "No disc image found: set the game up first, or give --image image.iso\n";
+        else std::cerr << "Can't read the game's music: " << error << "\n";
+        return 1;
+    }
+    const std::filesystem::path target = out ? *out : portablekit::audio::soundtrack::default_soundtrack_folder();
+    std::cout << tracks.size() << " music tracks; writing to " << install::path_to_utf8(target) << std::endl;
+    return portablekit::audio::soundtrack::run_import(*folder, target, tracks, game.soundtrack_table());
+}
+
 // A program that wraps the port (the desktop app in apps/portablekit) compiles
 // this file with PORTABLEKIT_HOST_MAIN_NAME set, so it can choose the game and
 // prepare its files before this runs it.
@@ -379,6 +441,7 @@ int main(int argc, char **argv) {
 #endif
     try {
         if (argc > 1 && std::string(argv[1]) == "--adhoc-server") return run_adhoc_server(argc, argv);
+        if (argc > 1 && std::string(argv[1]) == "--import-soundtrack") return run_soundtrack_import(argc, argv);
         Options options;
         try {
             options = parse_options(argc, argv);

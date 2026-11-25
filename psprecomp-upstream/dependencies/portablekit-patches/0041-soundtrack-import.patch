@@ -1,0 +1,1751 @@
+Soundtrack import: <game> --import-soundtrack <folder> builds the game's music
+from the player's own copy of its soundtrack (any format FFmpeg reads): finds
+each album track, lines it up with the game's track (FFT cross-correlation, or a
+recipe of sections for tracks the game edited), matches its level and writes
+<key>.flac into soundtrack/ in the game folder or the per-user data folder,
+with soundtrack.txt as the report. The game plays those files when
+audio.soundtrack is on (<prefix>_SOUNDTRACK; default on), FLAC or WAVE;
+<prefix>_MUSIC_DIR still overrides the folder. GameProfile gains
+soundtrack_music (the game's tracks from its disc image) and soundtrack_table
+(names, lengths and offsets only; no audio). Windows: links avformat, avfilter
+and swresample from the same LGPL FFmpeg prebuilt and ships avformat-61,
+avfilter-10 and swscale-8. Entries with game_frames/game_rms are built from
+the album alone (VC3, whose music the import can't read). Needs 0040. (2026-11-25)
+
+--- a/host/profile.hpp
++++ b/host/profile.hpp
+@@ -15,9 +15,11 @@
+ 
+ #include <array>
+ #include <cstdint>
++#include <filesystem>
+ #include <span>
+ #include <string>
+ #include <string_view>
++#include <vector>
+ 
+ namespace psprecomp {
+ class Elf32Image;
+@@ -26,6 +28,11 @@
+ 
+ namespace portablekit {
+ 
++namespace audio::soundtrack {
++struct Entry;
++struct GameTrack;
++} // namespace audio::soundtrack
++
+ class HleRegistrar;
+ namespace gpu::interpolation {
+ struct CutThresholds;
+@@ -299,6 +306,15 @@
+     std::uint32_t system_language = 0u;
+     std::uint32_t confirm_button = 0u;
+ 
++    // --- Soundtrack import (host/audio/soundtrack_import_run.hpp) ----------
++    // `--import-soundtrack <folder>` builds the game's music from the player's
++    // own copy of the soundtrack. The game's music tracks, read from its disc
++    // image (false with `error` set when they can't be), and the table of
++    // which album track each one is. Null: the game has no soundtrack import.
++    bool (*soundtrack_music)(const std::filesystem::path &image, std::vector<audio::soundtrack::GameTrack> &tracks,
++                             std::string &error) = nullptr;
++    const std::vector<audio::soundtrack::Entry> &(*soundtrack_table)() = nullptr;
++
+     // --- Text ----------------------------------------------------------------
+     // Where the game caches the glyphs it has drawn. Null: a font changed while
+     // the game runs applies to text the game has not drawn yet.
+--- a/host/main.cpp
++++ b/host/main.cpp
+@@ -12,6 +12,7 @@
+ #include "profile.hpp"
+ #include "install/installer.hpp"
+ #include "install/user_data.hpp"
++#include "audio/soundtrack_import_run.hpp"
+ #include "gpu/ge_state.hpp"
+ #include "kernel/kernel.hpp"
+ 
+@@ -102,10 +103,13 @@
+     return "usage: " + app + " [game_dir]\n"
+            "       " + app + " --install [image.iso [--in-place]]\n"
+            "       " + app + " --adhoc-server [port]\n"
++           "       " + app + " --import-soundtrack folder [--image image.iso] [--out folder]\n"
+            "  game_dir        play from a directory holding EBOOT.ELF, disc.iso and ms0/\n"
+            "  --install       run the setup again on screen, then play\n"
+            "  --install image set up from image.iso without the setup screens, then exit\n"
+            "  --in-place      use the image where it is instead of copying it\n"
++           "  --import-soundtrack  build the game's music from your copy of its soundtrack\n"
++           "                  (any audio files in folder), then exit\n"
+            "  --adhoc-server  run only the ad hoc server that Network > Host a session\n"
+            "                  starts, on TCP port (default 27312) and the next one up,\n"
+            "                  announced on the local network, until Ctrl+C\n";
+@@ -315,6 +319,64 @@
+ 
+ } // namespace
+ 
++// --import-soundtrack <folder> [--image <image.iso>] [--out <folder>]: builds the
++// game's music from the player's soundtrack files (audio/soundtrack_import_run.hpp).
++int run_soundtrack_import(int argc, char **argv) {
++    namespace install = portablekit::install;
++    const portablekit::GameProfile &game = portablekit::game();
++    if (game.soundtrack_music == nullptr || game.soundtrack_table == nullptr) {
++        std::cerr << game.app_name << " has no soundtrack import\n";
++        return 2;
++    }
++    std::optional<std::filesystem::path> folder, image, out;
++    for (int i = 2; i < argc; ++i) {
++        const std::string arg = argv[i];
++        if ((arg == "--image" || arg == "--out") && i + 1 < argc) {
++            (arg == "--image" ? image : out) = install::path_from_utf8(argv[++i]);
++        } else if (!arg.empty() && arg[0] != '-' && !folder) {
++            folder = install::path_from_utf8(arg);
++        } else {
++            std::cerr << game.app_name << ": --import-soundtrack folder [--image image.iso] [--out folder]\n";
++            return 2;
++        }
++    }
++    if (!folder) {
++        std::cerr << game.app_name << ": --import-soundtrack needs the folder holding the soundtrack's files\n";
++        return 2;
++    }
++    // The disc image: --image, else the game folder's disc.iso, else the
++    // installation's; only one that exists counts. A game whose music can't be
++    // read (VC3) builds from the album alone and is given an empty path.
++    std::error_code ec;
++    const auto exists = [&ec](const std::filesystem::path &path) {
++        return !path.empty() && std::filesystem::is_regular_file(path, ec);
++    };
++    if (!image) {
++        for (const char *name : {"GAME_DIR", "DATA_DIR"})
++            if (const char *dir = portablekit::env(name); !image && dir != nullptr && *dir != '\0')
++                if (exists(install::path_from_utf8(dir) / "disc.iso")) image = install::path_from_utf8(dir) / "disc.iso";
++        if (!image)
++            if (const auto installed = install::find_installation(install::user_data_directory()))
++                if (exists(installed->disc_image)) image = installed->disc_image;
++        if (!image && !checkout_game_directory().empty() && exists(checkout_game_directory() / "disc.iso"))
++            image = checkout_game_directory() / "disc.iso";
++    } else if (!exists(*image)) {
++        std::cerr << "No disc image at " << install::path_to_utf8(*image) << "\n";
++        return 1;
++    }
++    std::vector<portablekit::audio::soundtrack::GameTrack> tracks;
++    std::string error;
++    if (image) std::cout << "Reading the game's music from " << install::path_to_utf8(*image) << std::endl;
++    if (!game.soundtrack_music(image ? *image : std::filesystem::path{}, tracks, error)) {
++        if (!image) std::cerr << "No disc image found: set the game up first, or give --image image.iso\n";
++        else std::cerr << "Can't read the game's music: " << error << "\n";
++        return 1;
++    }
++    const std::filesystem::path target = out ? *out : portablekit::audio::soundtrack::default_soundtrack_folder();
++    std::cout << tracks.size() << " music tracks; writing to " << install::path_to_utf8(target) << std::endl;
++    return portablekit::audio::soundtrack::run_import(*folder, target, tracks, game.soundtrack_table());
++}
++
+ // A program that wraps the port (the desktop app in apps/portablekit) compiles
+ // this file with PORTABLEKIT_HOST_MAIN_NAME set, so it can choose the game and
+ // prepare its files before this runs it.
+@@ -333,6 +395,7 @@
+ #endif
+     try {
+         if (argc > 1 && std::string(argv[1]) == "--adhoc-server") return run_adhoc_server(argc, argv);
++        if (argc > 1 && std::string(argv[1]) == "--import-soundtrack") return run_soundtrack_import(argc, argv);
+         Options options;
+         try {
+             options = parse_options(argc, argv);
+--- a/host/settings/settings.hpp
++++ b/host/settings/settings.hpp
+@@ -130,6 +130,7 @@
+     // Audio
+     std::uint32_t volume{100u};        // percent
+     bool mute{};
++    bool soundtrack{true};             // play an imported soundtrack's versions of the music (audio/soundtrack_import_run.hpp)
+ 
+     // Controls
+     // The game's confirm button on the south face button rather than the
+--- a/host/settings/settings.cpp
++++ b/host/settings/settings.cpp
+@@ -286,6 +286,10 @@
+          [](Settings &s, const std::string &t) { return parse_uint(t, 0u, 100u, s.volume); },
+          [](const Settings &s) { return std::to_string(s.volume); }, nullptr},
+         BOOL_FIELD("audio.mute", mute),
++        {"audio.soundtrack", "SOUNDTRACK",
++         [](Settings &s, const std::string &t) { return parse_bool(t, s.soundtrack); },
++         [](const Settings &s) { return std::string(s.soundtrack ? "1" : "0"); },
++         [](Settings &s, const char *t) { s.soundtrack = variable_flag(t); }},
+         {"input.confirm", "PAD_FACE",
+          [](Settings &s, const std::string &t) {
+              if (t == "south") s.confirm_south = true;
+--- a/host/hle/hle_atrac.cpp
++++ b/host/hle/hle_atrac.cpp
+@@ -12,8 +12,10 @@
+ // encoder delay recorded in the `fact` chunk plus the decoder's own delay, and
+ // loop points in the `smpl` chunk are counted including the encoder delay.
+ //
+-// Soundtrack replacement (<prefix>_MUSIC_DIR): a folder of 16-bit stereo
+-// 44.1 kHz WAVE files, each named by a track's key (a hash of the first 4 KiB
++// Soundtrack replacement: the folder the soundtrack import writes
++// (audio/soundtrack_import_run.hpp; Audio > Soundtrack on, setting
++// audio.soundtrack), or <prefix>_MUSIC_DIR for tests: 16-bit stereo 44.1 kHz
++// FLAC or WAVE files, each named by a track's key (a hash of the first 4 KiB
+ // of its data) and already lined up with the game's positions: sample p of
+ // the file is position p. A track with one plays it in place of what it
+ // decodes; which track plays, its loop, how often and its end stay the
+@@ -23,6 +25,9 @@
+ #include "hle_common.hpp"
+ 
+ #include "audio/atrac_decoder.hpp"
++#include "audio/soundtrack_import_run.hpp"
++#include "audio/soundtrack_media.hpp"
++#include "settings/settings.hpp"
+ 
+ #include "psprecomp/common.hpp"
+ 
+@@ -306,30 +311,60 @@
+ }
+ 
+ // The replacement for the track with key `key`, read once and kept.
++// The folder replacements come from: <prefix>_MUSIC_DIR, else the import's
++// folder when the soundtrack is on and the import has written to it.
++const std::filesystem::path &soundtrack_folder() {
++    static const std::filesystem::path folder = [] {
++        if (const char *dir = portablekit::env("MUSIC_DIR"); dir != nullptr && *dir != '\0')
++            return std::filesystem::path(dir);
++        if (!portablekit::settings::current().soundtrack) return std::filesystem::path();
++        std::filesystem::path imported = portablekit::audio::soundtrack::default_soundtrack_folder();
++        std::error_code error;
++        return std::filesystem::exists(imported / "soundtrack.txt", error) ? imported : std::filesystem::path();
++    }();
++    return folder;
++}
++
++// The track's FLAC (as the import writes it) or WAVE file; empty if neither
++// is there or readable.
++Replacement read_replacement(const std::filesystem::path &folder, const std::string &key, std::string &why) {
++    std::error_code error;
++    const std::filesystem::path flac = folder / (key + ".flac");
++    if (std::filesystem::exists(flac, error)) {
++        std::optional<std::vector<std::int16_t>> pcm = portablekit::audio::soundtrack::read_pcm16(flac, why);
++        if (pcm) return std::make_shared<const std::vector<std::int16_t>>(std::move(*pcm));
++        return {};
++    }
++    const std::filesystem::path wave = folder / (key + ".wav");
++    if (!std::filesystem::exists(wave, error)) return {};
++    Replacement r = read_replacement_wave(wave);
++    if (!r) why = wave.string() + " is not 16-bit stereo 44.1 kHz PCM";
++    return r;
++}
++
+ Replacement find_replacement(const std::string &key) {
+-    static const char *folder = portablekit::env("MUSIC_DIR");
+-    if (folder == nullptr || *folder == '\0') return {};
++    const std::filesystem::path &folder = soundtrack_folder();
++    if (folder.empty()) return {};
+     static std::mutex lock;
+     static std::map<std::string, Replacement> cache;
+     static bool announced = false;
+     const std::lock_guard guard(lock);
+     if (!announced) {
+         announced = true;
+-        std::cerr << "[music] soundtrack files from " << folder << "\n";
++        std::cerr << "[music] soundtrack files from " << folder.string() << "\n";
+     }
+     if (key.empty()) {
+         std::cerr << "[music] a track started with too little of it in memory to name it\n";
+         return {};
+     }
+     if (const auto found = cache.find(key); found != cache.end()) return found->second;
+-    const std::filesystem::path path = std::filesystem::path(folder) / (key + ".wav");
+-    Replacement replacement = read_replacement_wave(path);
+-    std::error_code error;
++    std::string why;
++    Replacement replacement = read_replacement(folder, key, why);
+     if (replacement)
+         std::cerr << "[music] " << key << ": the soundtrack's version ("
+                   << replacement->size() / 2u / 44100u << " s)\n";
+-    else if (std::filesystem::exists(path, error))
+-        std::cerr << "[music] " << key << ": " << path.string() << " is not 16-bit stereo 44.1 kHz PCM\n";
++    else if (!why.empty())
++        std::cerr << "[music] " << key << ": " << why << "\n";
+     else
+         std::cerr << "[music] " << key << ": no soundtrack file\n";
+     cache.emplace(key, replacement);
+--- a/cmake/FFmpeg.cmake
++++ b/cmake/FFmpeg.cmake
+@@ -47,7 +47,10 @@
+ set(PORTABLEKIT_FFMPEG_WINDOWS_URL
+     "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34/ffmpeg-n7.1.5-1-g7d0e842004-win64-lgpl-shared-7.1.zip")
+ set(PORTABLEKIT_FFMPEG_WINDOWS_SHA256 03a8003e245c08df4277d7b0adc50b93a97ddd4a3aaafea21943c4384df59895)
+-set(PORTABLEKIT_FFMPEG_WINDOWS_DLLS avcodec-61 avutil-59 swresample-5)
++# avformat, avfilter (and the swscale avfilter needs) are for the soundtrack
++# import only (host/audio/soundtrack_media.cpp): reading the player's audio
++# files, the tempo change and writing FLAC.
++set(PORTABLEKIT_FFMPEG_WINDOWS_DLLS avcodec-61 avutil-59 swresample-5 avformat-61 avfilter-10 swscale-8)
+ 
+ set(PORTABLEKIT_FFMPEG "bundled" CACHE STRING
+     "Where FFmpeg comes from: bundled (built with the project), system (pkg-config) or OFF (no music, no movies)")
+@@ -72,6 +75,7 @@
+     "Where the bundled FFmpeg archive is downloaded to, or found without downloading")
+ 
+ set(PORTABLEKIT_HAS_FFMPEG OFF)
++set(PORTABLEKIT_HAS_SOUNDTRACK_IMPORT OFF)
+ set(_portablekit_ffmpeg_root "${CMAKE_BINARY_DIR}/_deps/ffmpeg")
+ set(_portablekit_ffmpeg_bin "${CMAKE_BINARY_DIR}/bin")
+ 
+@@ -164,14 +168,14 @@
+     endforeach()
+     configure_file("${_portablekit_ffmpeg_prefix}/LICENSE.txt" "${_portablekit_ffmpeg_bin}/FFmpeg-LICENSE.txt" COPYONLY)
+     _portablekit_ffmpeg_write_notice("${_portablekit_ffmpeg_bin}"
+-        "The FFmpeg libraries here (avcodec, avutil, swresample) are an unmodified prebuilt\n"
++        "The FFmpeg libraries here (avcodec, avutil, swresample, avformat, avfilter, swscale) are an unmodified prebuilt\n"
+         "LGPL shared build of FFmpeg ${PORTABLEKIT_FFMPEG_VERSION} from BtbN/FFmpeg-Builds, licensed under the\n"
+         "GNU LGPL version 3 or later (FFmpeg-LICENSE.txt). They are dynamically linked.\n\n"
+         "Build:  ${PORTABLEKIT_FFMPEG_WINDOWS_URL}\n"
+         "Source: https://github.com/FFmpeg/FFmpeg/tree/release/7.1 (the commit is in the file name)\n"
+         "Build scripts: https://github.com/BtbN/FFmpeg-Builds\n")
+     add_library(portablekit_ffmpeg INTERFACE)
+-    foreach(lib avcodec avutil)
++    foreach(lib avcodec avutil avformat avfilter swresample)
+         add_library(portablekit_ffmpeg_${lib} SHARED IMPORTED)
+         foreach(dll IN LISTS PORTABLEKIT_FFMPEG_WINDOWS_DLLS)
+             if(dll MATCHES "^${lib}-")
+@@ -185,7 +189,8 @@
+     endforeach()
+     target_include_directories(portablekit_ffmpeg INTERFACE "${_portablekit_ffmpeg_includes}")
+     set(PORTABLEKIT_HAS_FFMPEG ON)
+-    message(STATUS "portablekit: bundled FFmpeg ${PORTABLEKIT_FFMPEG_VERSION} (prebuilt, LGPL); music and movies enabled")
++    set(PORTABLEKIT_HAS_SOUNDTRACK_IMPORT ON)
++    message(STATUS "portablekit: bundled FFmpeg ${PORTABLEKIT_FFMPEG_VERSION} (prebuilt, LGPL); music, movies and the soundtrack import enabled")
+ 
+ else()
+     find_program(PORTABLEKIT_MAKE NAMES gmake make)
+@@ -315,6 +320,9 @@
+         return()
+     endif()
+     target_compile_definitions(${target} PRIVATE PORTABLEKIT_HAS_FFMPEG=1)
++    if(PORTABLEKIT_HAS_SOUNDTRACK_IMPORT)
++        target_compile_definitions(${target} PRIVATE PORTABLEKIT_HAS_SOUNDTRACK_IMPORT=1)
++    endif()
+     target_link_libraries(${target} PRIVATE portablekit_ffmpeg)
+     if(PORTABLEKIT_FFMPEG_RPATH)
+         set_property(TARGET ${target} APPEND PROPERTY BUILD_RPATH "${PORTABLEKIT_FFMPEG_RPATH}")
+--- a/cmake/PortableKit.cmake
++++ b/cmake/PortableKit.cmake
+@@ -27,6 +27,9 @@
+     host/app_paths.cpp
+     host/corpus_library.cpp
+     host/audio/atrac_decoder.cpp
++    host/audio/soundtrack_import.cpp
++    host/audio/soundtrack_import_run.cpp
++    host/audio/soundtrack_media.cpp
+     host/movie/avc_decoder.cpp
+     host/movie/psmf_demuxer.cpp
+     host/movie/psmf_header.cpp
+--- /dev/null
++++ b/host/audio/soundtrack_import.hpp
+@@ -0,0 +1,134 @@
++#pragma once
++
++// Soundtrack import: builds, for one of the game's music tracks, a version made
++// from the player's own copy of the album track, in the game's own sample
++// positions (sample p of the result plays where the game would play its own
++// sample p), so the game's loop points and timing still apply.
++//
++// This part does the audio work only (alignment, level, edits). Reading the
++// disc, decoding the player's files and writing the results are elsewhere
++// (soundtrack_media.cpp, the game's import entry point). Nothing here holds or
++// ships any audio: the per-game tables are track names, lengths and offsets.
++
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <span>
++#include <string>
++#include <vector>
++
++namespace portablekit::audio::soundtrack {
++
++inline constexpr int kRate = 44'100;
++// A frame counts as sound from this level (about -54 dBFS) on.
++inline constexpr int kOnsetLevel = 64;
++
++// Interleaved stereo at 44.1 kHz, on the 16-bit scale (full scale = 32768).
++struct Stereo {
++    std::vector<float> samples;
++    [[nodiscard]] std::size_t frames() const noexcept { return samples.size() / 2; }
++    [[nodiscard]] float left(std::size_t i) const noexcept { return samples[2 * i]; }
++    [[nodiscard]] float right(std::size_t i) const noexcept { return samples[2 * i + 1]; }
++};
++
++// How a game track is made from the album track.
++enum class Method {
++    Exact,  // the same recording at one offset: sample-exact at several points
++    Mix,    // the same timing but a different mix: one offset, matched less tightly
++    Recipe, // the game's track is an edit of the album recording (see Recipe)
++};
++
++// One stretch of a recipe, in the game's sample positions [from, to).
++struct Section {
++    enum class Source {
++        Album,          // album sample = game sample + lag (lag in the reference rip)
++        Game,           // the game's own audio
++        AlbumStretched, // album from album_start (reference rip), tempo-changed with pitch kept;
++                        // stretched sample q plays at game position from + q - lag, or, with
++                        // search > 0, where it matches the game's audio best within +-search
++    };
++    Source source{Source::Album};
++    std::int64_t from{};
++    std::int64_t to{};
++    std::int64_t lag{};
++    double album_start{}; // seconds
++    double tempo{1.0};    // playback speed of the album part (below 1 = slower)
++    std::int64_t search{};
++};
++
++struct Recipe {
++    std::vector<Section> sections;
++    std::int64_t crossfade{};   // samples on each side of a join
++    bool equal_power{};         // sin^2 / cos^2 crossfades instead of straight lines
++    bool level_each_section{};  // match each section to the game's level over its own span
++    // The game's audio is a different render of the album recording, so it can't
++    // pin the rip's offset: take it from where the album's sound starts instead
++    // (rips mostly differ by padding there), then check the match loosely.
++    bool loose{};
++    // After the level match: the game's own audio for join_half samples each side
++    // of every join, faded in and out over join_fade samples (0 = not used).
++    std::int64_t join_half{};
++    std::int64_t join_fade{};
++};
++
++struct Entry {
++    std::string track;   // the game's name for it (VC2: STR_NN)
++    std::string key;     // the runtime key: FNV-1a 64 of the first 4 KiB of its data
++    std::string number;  // disc-track on the album, "1-02"
++    std::string title;
++    std::string album;
++    double album_seconds{}; // length of the album track in the reference rip
++    std::int64_t album_onset{}; // first frame of the reference rip at or above kOnsetLevel
++    Method method{Method::Exact};
++    std::int64_t lag{};  // Exact / Mix: album sample = game sample + lag (reference rip)
++    Recipe recipe;       // Method::Recipe
++    // For games whose music the import can't read from the disc (VC3: its data
++    // is decrypted with a key only the running game hands over): the game
++    // track's length and loudness (RMS, 16-bit scale), so it can be built from
++    // the album alone (build_from_reference). 0: the game's audio is needed.
++    std::int64_t game_frames{};
++    double game_rms{};
++};
++
++// Tempo change with pitch kept: returns `input` played at `tempo` times its speed.
++using Stretch = std::function<Stereo(const Stereo &input, double tempo)>;
++
++struct Result {
++    bool ok{};
++    std::string reason;            // why the game's own music is kept, when !ok
++    std::int64_t lag{};            // the offset used (Exact / Mix; Recipe: its first album section)
++    std::int64_t rip_offset{};     // lag - the table's lag: how this rip differs from the reference
++    double score{};                // the weakest correlation that was accepted
++    double gain_db{};
++    std::vector<std::int16_t> pcm; // interleaved stereo, game positions, the game track's length
++};
++
++// Builds the game track `game` (decoded, in game positions) from `album`.
++[[nodiscard]] Result build(const Entry &entry, const Stereo &game, const Stereo &album, const Stretch &stretch);
++
++// First frame at or above kOnsetLevel (-1 when silent throughout).
++[[nodiscard]] std::int64_t onset(const Stereo &album);
++
++// Builds the game track from the album alone, for an entry with game_frames:
++// the rip's offset from the reference is taken from where the album's sound
++// starts, the level from game_rms. Recipes may only use album sections.
++[[nodiscard]] Result build_from_reference(const Entry &entry, const Stereo &album);
++
++// How well `album` lines up with `game` at the table's offset: the median
++// correlation at a few points after a search of +-search samples around it.
++// Used to pick between several candidate files. -1 when they can't be compared.
++[[nodiscard]] double quick_score(const Entry &entry, const Stereo &game, const Stereo &album);
++
++// --- parts, exposed for the tests ---------------------------------------------------
++
++// The best offset of the window game[at, at+length) inside album, searched over
++// album positions at + lag_guess +- search, on the mono mix. Returns the lag
++// (album position - game position) and the normalised correlation.
++struct LagFound {
++    std::int64_t lag{};
++    double score{-1.0};
++};
++[[nodiscard]] LagFound find_lag(const Stereo &game, const Stereo &album, std::int64_t at, std::int64_t length,
++                                std::int64_t lag_guess, std::int64_t search, int decimate = 1);
++
++} // namespace portablekit::audio::soundtrack
+--- /dev/null
++++ b/host/audio/soundtrack_import.cpp
+@@ -0,0 +1,476 @@
++#include "audio/soundtrack_import.hpp"
++
++#include <algorithm>
++#include <cmath>
++#include <complex>
++#include <numeric>
++
++namespace portablekit::audio::soundtrack {
++
++namespace {
++
++using Complex = std::complex<double>;
++
++// Offsets this close to the table's are the reference rip itself (rounding apart).
++constexpr std::int64_t kSnap = 2;
++
++void fft(std::vector<Complex> &a, bool inverse) {
++    const std::size_t n = a.size();
++    for (std::size_t i = 1, j = 0; i < n; ++i) {
++        std::size_t bit = n >> 1;
++        for (; j & bit; bit >>= 1) j ^= bit;
++        j ^= bit;
++        if (i < j) std::swap(a[i], a[j]);
++    }
++    for (std::size_t len = 2; len <= n; len <<= 1) {
++        const double angle = 2.0 * 3.14159265358979323846 / static_cast<double>(len) * (inverse ? 1.0 : -1.0);
++        const Complex step(std::cos(angle), std::sin(angle));
++        for (std::size_t i = 0; i < n; i += len) {
++            Complex w(1.0);
++            for (std::size_t k = 0; k < len / 2; ++k) {
++                const Complex u = a[i + k];
++                const Complex v = a[i + k + len / 2] * w;
++                a[i + k] = u + v;
++                a[i + k + len / 2] = u - v;
++                w *= step;
++            }
++        }
++    }
++    if (inverse)
++        for (Complex &x : a) x /= static_cast<double>(n);
++}
++
++// Mono mix of frames [from, from + count), zero outside the track, averaged
++// over `decimate` frames.
++std::vector<double> mono(const Stereo &x, std::int64_t from, std::int64_t count, int decimate) {
++    const std::int64_t out_count = count / decimate;
++    std::vector<double> out(static_cast<std::size_t>(std::max<std::int64_t>(out_count, 0)), 0.0);
++    const auto frames = static_cast<std::int64_t>(x.frames());
++    for (std::int64_t i = 0; i < out_count; ++i) {
++        double sum = 0.0;
++        for (int k = 0; k < decimate; ++k) {
++            const std::int64_t f = from + i * decimate + k;
++            if (f >= 0 && f < frames) sum += 0.5 * (static_cast<double>(x.left(f)) + x.right(f));
++        }
++        out[static_cast<std::size_t>(i)] = sum / decimate;
++    }
++    return out;
++}
++
++double rms(const Stereo &x, std::int64_t from, std::int64_t to) {
++    from = std::max<std::int64_t>(from, 0);
++    to = std::min<std::int64_t>(to, static_cast<std::int64_t>(x.frames()));
++    if (to <= from) return 0.0;
++    double sum = 0.0;
++    for (std::int64_t i = 2 * from; i < 2 * to; ++i) sum += static_cast<double>(x.samples[i]) * x.samples[i];
++    return std::sqrt(sum / static_cast<double>(2 * (to - from)));
++}
++
++double peak(const Stereo &x) {
++    double p = 0.0;
++    for (float v : x.samples) p = std::max(p, static_cast<double>(std::fabs(v)));
++    return p;
++}
++
++std::int64_t median(std::vector<std::int64_t> v) {
++    std::sort(v.begin(), v.end());
++    return v.empty() ? 0 : v[(v.size() - 1) / 2] + (v.size() % 2 == 0 ? (v[v.size() / 2] - v[(v.size() - 1) / 2]) / 2 : 0);
++}
++
++// Points spread evenly from 3 s to 4 s before the end (or across a short span).
++std::vector<std::int64_t> points(std::int64_t begin, std::int64_t end, int count, std::int64_t window) {
++    std::int64_t first = begin + 3 * kRate;
++    std::int64_t last = end - 4 * kRate;
++    if (last <= first) {
++        first = begin;
++        last = std::max(begin, end - window);
++    }
++    std::vector<std::int64_t> out;
++    for (int i = 0; i < count; ++i)
++        out.push_back(count == 1 ? first
++                                 : first + static_cast<std::int64_t>(std::llround(
++                                               static_cast<double>(last - first) * i / (count - 1))));
++    return out;
++}
++
++// album[p + lag] for p in [0, frames), zero where the album has nothing.
++Stereo placed(const Stereo &album, std::int64_t lag, std::size_t frames) {
++    Stereo out;
++    out.samples.assign(frames * 2, 0.0f);
++    const auto have = static_cast<std::int64_t>(album.frames());
++    for (std::int64_t p = 0; p < static_cast<std::int64_t>(frames); ++p) {
++        const std::int64_t a = p + lag;
++        if (a < 0 || a >= have) continue;
++        out.samples[2 * p] = album.samples[2 * a];
++        out.samples[2 * p + 1] = album.samples[2 * a + 1];
++    }
++    return out;
++}
++
++// The coarse offset: one window, decimated, wide search; then `count` points at
++// full rate around it. Returns the fine lags and scores.
++struct Fine {
++    std::vector<std::int64_t> lags;
++    std::vector<double> scores;
++};
++
++Fine fine_lags(const Stereo &game, const Stereo &album, std::int64_t begin, std::int64_t end, std::int64_t lag_guess,
++               int count, std::int64_t fine_search) {
++    const std::int64_t span = end - begin;
++    const std::int64_t coarse_window = std::min<std::int64_t>(6 * kRate, span);
++    const std::int64_t coarse_at = begin + std::max<std::int64_t>(0, std::min<std::int64_t>(3 * kRate, span - coarse_window));
++    const LagFound coarse = find_lag(game, album, coarse_at, coarse_window, lag_guess, 2 * kRate, 4);
++    Fine fine;
++    const std::int64_t window = std::min<std::int64_t>(2 * kRate, span);
++    for (std::int64_t at : points(begin, end, count, window)) {
++        const LagFound f = find_lag(game, album, at, window, coarse.lag, fine_search, 1);
++        if (f.score <= -1.0) continue;
++        fine.lags.push_back(f.lag);
++        fine.scores.push_back(f.score);
++    }
++    return fine;
++}
++
++void add_section(Stereo &out, const Stereo &piece_source, std::int64_t source_lag, std::int64_t from, std::int64_t to,
++                 std::int64_t fade, bool fade_in, bool fade_out, bool equal_power, double level) {
++    const auto frames = static_cast<std::int64_t>(out.frames());
++    const std::int64_t s0 = std::max<std::int64_t>(fade_in ? from - fade : from, 0);
++    const std::int64_t s1 = std::min<std::int64_t>(fade_out ? to + fade : to, frames);
++    const std::int64_t n = s1 - s0;
++    const auto have = static_cast<std::int64_t>(piece_source.frames());
++    for (std::int64_t i = 0; i < n; ++i) {
++        double w = 1.0;
++        if (fade_in && i < 2 * fade) {
++            const double t = static_cast<double>(i) / static_cast<double>(2 * fade - 1);
++            w = equal_power ? std::pow(std::sin(t * 3.14159265358979323846 / 2), 2) : t;
++        }
++        if (fade_out && i >= n - 2 * fade) {
++            const double t = static_cast<double>(i - (n - 2 * fade)) / static_cast<double>(2 * fade - 1);
++            w *= equal_power ? std::pow(std::cos(t * 3.14159265358979323846 / 2), 2) : 1.0 - t;
++        }
++        const std::int64_t p = s0 + i;
++        const std::int64_t a = p + source_lag;
++        if (a < 0 || a >= have) continue;
++        out.samples[2 * p] += static_cast<float>(piece_source.samples[2 * a] * w * level);
++        out.samples[2 * p + 1] += static_cast<float>(piece_source.samples[2 * a + 1] * w * level);
++    }
++}
++
++std::vector<std::int16_t> to_pcm16(const Stereo &x, double gain) {
++    std::vector<std::int16_t> out(x.samples.size());
++    for (std::size_t i = 0; i < out.size(); ++i)
++        out[i] = static_cast<std::int16_t>(std::clamp(std::nearbyint(x.samples[i] * gain), -32768.0, 32767.0));
++    return out;
++}
++
++// Gain that matches `x` to the game's level, at most 0.97 of full scale at its peak.
++double level_gain(const Stereo &game, const Stereo &x) {
++    const double want = rms(game, 0, static_cast<std::int64_t>(game.frames()));
++    const double have = rms(x, 0, static_cast<std::int64_t>(x.frames()));
++    const double cap = 0.97 * 32767.0 / std::max(peak(x), 1.0);
++    return std::min(want / std::max(have, 1e-9), cap);
++}
++
++Result one_offset(const Entry &entry, const Stereo &game, const Stereo &album) {
++    Result result;
++    const auto n = static_cast<std::int64_t>(game.frames());
++    const bool exact = entry.method == Method::Exact;
++    const Fine fine = fine_lags(game, album, 0, n, entry.lag, exact ? 5 : 9, exact ? 256 : kRate / 2);
++    if (fine.lags.size() < 3) {
++        result.reason = "too short to compare";
++        return result;
++    }
++    const std::int64_t measured = median(fine.lags);
++    // Within a couple of samples of the table: the same rip, rounding apart.
++    const std::int64_t mid = std::llabs(measured - entry.lag) <= kSnap ? entry.lag : measured;
++    if (exact) {
++        int agree = 0;
++        double weakest = 1.0;
++        for (std::size_t i = 0; i < fine.lags.size(); ++i)
++            if (std::llabs(fine.lags[i] - measured) <= 4) {
++                ++agree;
++                weakest = std::min(weakest, fine.scores[i]);
++            }
++        if (agree < 3 || weakest < 0.45) {
++            result.reason = "the recording does not line up with the game's";
++            return result;
++        }
++        result.score = weakest;
++    } else {
++        std::vector<std::int64_t> spread = fine.lags;
++        std::sort(spread.begin(), spread.end());
++        const std::int64_t iqr = spread[spread.size() * 3 / 4] - spread[spread.size() / 4];
++        const double best = *std::max_element(fine.scores.begin(), fine.scores.end());
++        if (iqr > kRate / 50 || best < 0.2) {
++            result.reason = "the recording does not keep the game's timing";
++            return result;
++        }
++        result.score = best;
++    }
++    result.lag = mid;
++    result.rip_offset = mid - entry.lag;
++    const Stereo out = placed(album, mid, game.frames());
++    const double gain = level_gain(game, out);
++    result.gain_db = 20.0 * std::log10(std::max(gain, 1e-9));
++    result.pcm = to_pcm16(out, gain);
++    result.ok = true;
++    return result;
++}
++
++Result from_recipe(const Entry &entry, const Stereo &game, const Stereo &album, const Stretch &stretch) {
++    Result result;
++    const Recipe &recipe = entry.recipe;
++    const auto n = static_cast<std::int64_t>(game.frames());
++    // How this rip differs from the reference: measured on the first album section.
++    const auto first = std::find_if(recipe.sections.begin(), recipe.sections.end(),
++                                    [](const Section &s) { return s.source == Section::Source::Album; });
++    if (first == recipe.sections.end()) {
++        result.reason = "no album section";
++        return result;
++    }
++    std::int64_t found = first->lag;
++    double weakest = 1.0;
++    if (recipe.loose) {
++        const std::int64_t start = onset(album);
++        if (start < 0) {
++            result.reason = "the album track is silent";
++            return result;
++        }
++        found = first->lag + (start - entry.album_onset);
++        const std::int64_t span = first->to - first->from;
++        const std::int64_t window = std::min<std::int64_t>(6 * kRate, span);
++        const std::int64_t at = first->from + std::max<std::int64_t>(0, std::min<std::int64_t>(3 * kRate, span - window));
++        const LagFound check = find_lag(game, album, at, window, found, kRate / 2, 4);
++        if (check.score < 0.3) {
++            result.reason = "the recording does not line up with the game's";
++            return result;
++        }
++        weakest = check.score;
++    } else {
++        const Fine fine = fine_lags(game, album, first->from, first->to, first->lag, 3, 256);
++        if (fine.lags.size() < 2) {
++            result.reason = "too short to compare";
++            return result;
++        }
++        found = median(fine.lags);
++        int agree = 0;
++        for (std::size_t i = 0; i < fine.lags.size(); ++i)
++            if (std::llabs(fine.lags[i] - found) <= 4) {
++                ++agree;
++                weakest = std::min(weakest, fine.scores[i]);
++            }
++        if (agree < 2 || weakest < 0.45) {
++            result.reason = "the recording does not line up with the game's";
++            return result;
++        }
++    }
++    std::int64_t offset = found - first->lag;
++    if (std::llabs(offset) <= kSnap) offset = 0;
++    result.lag = found;
++    result.rip_offset = offset;
++    result.score = weakest;
++
++    Stereo out;
++    out.samples.assign(game.samples.size(), 0.0f);
++    for (std::size_t i = 0; i < recipe.sections.size(); ++i) {
++        const Section &s = recipe.sections[i];
++        const bool fade_in = i > 0;
++        const bool fade_out = i + 1 < recipe.sections.size();
++        const Stereo *source = &album;
++        std::int64_t lag = s.lag + offset;
++        Stereo stretched;
++        if (s.source == Section::Source::Game) {
++            source = &game;
++            lag = 0;
++        } else if (s.source == Section::Source::AlbumStretched) {
++            if (!stretch) {
++                result.reason = "no tempo change available";
++                return result;
++            }
++            const auto start = static_cast<std::int64_t>(std::llround(s.album_start * kRate)) + offset;
++            Stereo tail;
++            const std::int64_t from = std::clamp<std::int64_t>(start, 0, static_cast<std::int64_t>(album.frames()));
++            tail.samples.assign(album.samples.begin() + 2 * from, album.samples.end());
++            stretched = stretch(tail, s.tempo);
++            if (stretched.frames() == 0) {
++                result.reason = "the tempo change failed";
++                return result;
++            }
++            // Stretched sample q plays at game position from + q - lag: the table's placement.
++            lag = s.lag - s.from;
++            if (s.search > 0) {
++                // Or where it matches the game's own audio best (only for a clear match).
++                const std::int64_t window = std::min<std::int64_t>(5 * kRate, (s.to - s.from) / 2);
++                const LagFound at = find_lag(game, stretched, s.from + kRate, window, lag, s.search, 1);
++                if (at.score < 0.15) {
++                    result.reason = "the tempo-changed part does not line up with the game's";
++                    return result;
++                }
++                lag = at.lag;
++                result.score = std::min(result.score, at.score);
++            }
++            source = &stretched;
++        }
++        double level = 1.0;
++        if (recipe.level_each_section && s.source != Section::Source::Game) {
++            Stereo piece = placed(*source, lag, game.frames());
++            level = rms(game, s.from, s.to) / std::max(rms(piece, s.from, s.to), 1e-9);
++        }
++        add_section(out, *source, lag, s.from, s.to, recipe.crossfade, fade_in, fade_out, recipe.equal_power, level);
++    }
++    const double gain = level_gain(game, out);
++    for (float &v : out.samples) v = static_cast<float>(v * gain);
++    if (recipe.join_half > 0) {
++        const double game_level = rms(out, 0, n) / std::max(rms(game, 0, n), 1e-9);
++        for (std::size_t i = 1; i < recipe.sections.size(); ++i) {
++            const std::int64_t cut = recipe.sections[i].from;
++            const std::int64_t s0 = std::max<std::int64_t>(cut - recipe.join_half, 0);
++            const std::int64_t s1 = std::min<std::int64_t>(cut + recipe.join_half, n);
++            const std::int64_t len = s1 - s0;
++            const std::int64_t x = recipe.join_fade;
++            for (std::int64_t k = 0; k < len; ++k) {
++                double w = 1.0;
++                if (k < x) w = static_cast<double>(k) / static_cast<double>(x - 1);
++                if (k >= len - x) w = 1.0 - static_cast<double>(k - (len - x)) / static_cast<double>(x - 1);
++                const std::int64_t p = s0 + k;
++                for (int c = 0; c < 2; ++c)
++                    out.samples[2 * p + c] = static_cast<float>(out.samples[2 * p + c] * (1.0 - w) +
++                                                                game.samples[2 * p + c] * game_level * w);
++            }
++        }
++    }
++    result.gain_db = 20.0 * std::log10(std::max(gain, 1e-9));
++    result.pcm = to_pcm16(out, 1.0);
++    result.ok = true;
++    return result;
++}
++
++} // namespace
++
++LagFound find_lag(const Stereo &game, const Stereo &album, std::int64_t at, std::int64_t length, std::int64_t lag_guess,
++                  std::int64_t search, int decimate) {
++    LagFound best;
++    if (length <= 0 || at < 0 || at + length > static_cast<std::int64_t>(game.frames())) return best;
++    const std::vector<double> seg = mono(game, at, length, decimate);
++    const std::int64_t ref_from = at + lag_guess - search;
++    const std::vector<double> ref = mono(album, ref_from, length + 2 * search, decimate);
++    const std::size_t m = seg.size();
++    const std::size_t r = ref.size();
++    if (m == 0 || r < m) return best;
++    std::size_t size = 1;
++    while (size < r + m) size <<= 1;
++    std::vector<Complex> a(size), b(size);
++    for (std::size_t i = 0; i < r; ++i) a[i] = ref[i];
++    for (std::size_t i = 0; i < m; ++i) b[i] = seg[i];
++    fft(a, false);
++    fft(b, false);
++    for (std::size_t i = 0; i < size; ++i) a[i] *= std::conj(b[i]);
++    fft(a, true);
++    double seg_energy = 0.0;
++    for (double v : seg) seg_energy += v * v;
++    std::vector<double> cumulative(r + 1, 0.0);
++    for (std::size_t i = 0; i < r; ++i) cumulative[i + 1] = cumulative[i] + ref[i] * ref[i];
++    double best_score = -2.0;
++    std::size_t best_at = 0;
++    for (std::size_t k = 0; k + m <= r; ++k) {
++        const double energy = std::sqrt((cumulative[k + m] - cumulative[k]) * seg_energy) + 1e-9;
++        const double score = a[k].real() / energy;
++        if (score > best_score) {
++            best_score = score;
++            best_at = k;
++        }
++    }
++    best.lag = ref_from + static_cast<std::int64_t>(best_at) * decimate - at;
++    best.score = best_score;
++    return best;
++}
++
++std::int64_t onset(const Stereo &album) {
++    for (std::size_t i = 0; i < album.frames(); ++i)
++        if (std::fabs(album.left(i)) >= kOnsetLevel || std::fabs(album.right(i)) >= kOnsetLevel)
++            return static_cast<std::int64_t>(i);
++    return -1;
++}
++
++double quick_score(const Entry &entry, const Stereo &game, const Stereo &album) {
++    std::int64_t begin = 0;
++    std::int64_t end = static_cast<std::int64_t>(game.frames());
++    std::int64_t lag = entry.lag;
++    if (entry.method == Method::Recipe) {
++        for (const Section &s : entry.recipe.sections)
++            if (s.source == Section::Source::Album) {
++                begin = s.from;
++                end = s.to;
++                lag = s.lag;
++                break;
++            }
++    }
++    const std::int64_t span = end - begin;
++    if (span < kRate) return -1.0;
++    const std::int64_t window = std::min<std::int64_t>(6 * kRate, span);
++    const std::int64_t at = begin + std::max<std::int64_t>(0, std::min<std::int64_t>(3 * kRate, span - window));
++    return find_lag(game, album, at, window, lag, 2 * kRate, 4).score;
++}
++
++Result build_from_reference(const Entry &entry, const Stereo &album) {
++    Result result;
++    if (entry.game_frames <= 0 || entry.game_rms <= 0.0 || album.frames() == 0) {
++        result.reason = "no audio";
++        return result;
++    }
++    const double seconds = static_cast<double>(album.frames()) / kRate;
++    if (std::fabs(seconds - entry.album_seconds) > 3.0) {
++        result.reason = "the album track is not the expected length";
++        return result;
++    }
++    const std::int64_t start = onset(album);
++    if (start < 0) {
++        result.reason = "the album track is silent";
++        return result;
++    }
++    std::int64_t offset = start - entry.album_onset;
++    if (std::llabs(offset) <= kSnap) offset = 0;
++    if (std::llabs(offset) > 2 * kRate) {
++        result.reason = "the album track starts too far from where it should";
++        return result;
++    }
++    const auto frames = static_cast<std::size_t>(entry.game_frames);
++    Stereo out;
++    if (entry.method == Method::Recipe) {
++        out.samples.assign(frames * 2, 0.0f);
++        const auto &sections = entry.recipe.sections;
++        for (std::size_t i = 0; i < sections.size(); ++i) {
++            if (sections[i].source != Section::Source::Album) {
++                result.reason = "this track needs the game's own audio";
++                return result;
++            }
++            add_section(out, album, sections[i].lag + offset, sections[i].from, sections[i].to, entry.recipe.crossfade,
++                        i > 0, i + 1 < sections.size(), entry.recipe.equal_power, 1.0);
++        }
++        result.lag = sections.empty() ? 0 : sections.front().lag + offset;
++    } else {
++        out = placed(album, entry.lag + offset, frames);
++        result.lag = entry.lag + offset;
++    }
++    const double have = rms(out, 0, static_cast<std::int64_t>(frames));
++    const double cap = 0.97 * 32767.0 / std::max(peak(out), 1.0);
++    const double gain = std::min(entry.game_rms / std::max(have, 1e-9), cap);
++    result.rip_offset = offset;
++    result.score = 1.0;
++    result.gain_db = 20.0 * std::log10(std::max(gain, 1e-9));
++    result.pcm = to_pcm16(out, gain);
++    result.ok = true;
++    return result;
++}
++
++Result build(const Entry &entry, const Stereo &game, const Stereo &album, const Stretch &stretch) {
++    if (game.frames() == 0 || album.frames() == 0) {
++        Result r;
++        r.reason = "no audio";
++        return r;
++    }
++    if (entry.method == Method::Recipe) return from_recipe(entry, game, album, stretch);
++    return one_offset(entry, game, album);
++}
++
++} // namespace portablekit::audio::soundtrack
+--- /dev/null
++++ b/host/audio/soundtrack_media.hpp
+@@ -0,0 +1,42 @@
++#pragma once
++
++// The FFmpeg side of the soundtrack import: reading the player's audio files
++// (any format FFmpeg reads: FLAC, MP3, AAC/ALAC in M4A, Ogg, Opus, WAV...),
++// the pitch-kept tempo change, and the FLAC files the import writes and the game
++// plays. Needs libavformat, libavcodec, libavfilter and libswresample.
++
++#include "audio/soundtrack_import.hpp"
++
++#include <cstdint>
++#include <filesystem>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace portablekit::audio::soundtrack {
++
++// What the import can tell about a file without decoding it.
++struct FileInfo {
++    double seconds{};
++    std::string title, album;
++    int disc{}, track{}; // 0 when the file doesn't say
++};
++
++[[nodiscard]] bool media_available() noexcept;
++
++[[nodiscard]] std::optional<FileInfo> probe(const std::filesystem::path &file);
++
++// The whole file as 44.1 kHz stereo (resampled and up/down-mixed as needed).
++[[nodiscard]] std::optional<Stereo> decode(const std::filesystem::path &file, std::string &error);
++
++// `input` played at `tempo` times its speed, pitch kept (FFmpeg's atempo).
++[[nodiscard]] Stereo change_tempo(const Stereo &input, double tempo);
++
++// Writes interleaved 16-bit stereo 44.1 kHz as FLAC. Replaces `file` only once
++// the new one is complete.
++bool write_flac(const std::filesystem::path &file, const std::vector<std::int16_t> &pcm, std::string &error);
++
++// Reads a FLAC (or any file) back as interleaved 16-bit stereo at 44.1 kHz.
++[[nodiscard]] std::optional<std::vector<std::int16_t>> read_pcm16(const std::filesystem::path &file, std::string &error);
++
++} // namespace portablekit::audio::soundtrack
+--- /dev/null
++++ b/host/audio/soundtrack_media.cpp
+@@ -0,0 +1,351 @@
++#include "audio/soundtrack_media.hpp"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <system_error>
++
++#if defined(PORTABLEKIT_HAS_SOUNDTRACK_IMPORT)
++extern "C" {
++#include <libavcodec/avcodec.h>
++#include <libavfilter/avfilter.h>
++#include <libavfilter/buffersink.h>
++#include <libavfilter/buffersrc.h>
++#include <libavformat/avformat.h>
++#include <libavutil/channel_layout.h>
++#include <libavutil/log.h>
++#include <libavutil/opt.h>
++#include <libswresample/swresample.h>
++}
++#endif
++
++namespace portablekit::audio::soundtrack {
++
++#if defined(PORTABLEKIT_HAS_SOUNDTRACK_IMPORT)
++
++namespace {
++
++std::string utf8(const std::filesystem::path &p) {
++    const auto s = p.u8string();
++    return std::string(reinterpret_cast<const char *>(s.data()), s.size());
++}
++
++std::string av_message(int code) {
++    char text[AV_ERROR_MAX_STRING_SIZE] = {};
++    av_strerror(code, text, sizeof text);
++    return text;
++}
++
++// The leading number of "3", "3/25" or "03 of 25"; 0 when there is none.
++int leading_number(const char *text) {
++    if (text == nullptr) return 0;
++    while (*text == ' ') ++text;
++    return std::isdigit(static_cast<unsigned char>(*text)) ? std::atoi(text) : 0;
++}
++
++const char *tag(const AVDictionary *a, const AVDictionary *b, const char *key) {
++    if (const AVDictionaryEntry *e = av_dict_get(a, key, nullptr, AV_DICT_IGNORE_SUFFIX)) return e->value;
++    if (const AVDictionaryEntry *e = av_dict_get(b, key, nullptr, AV_DICT_IGNORE_SUFFIX)) return e->value;
++    return nullptr;
++}
++
++// FFmpeg's own messages (an MP3's "Could not update timestamps for skipped
++// samples" and the like) say nothing the player can act on: errors only.
++void quiet_ffmpeg() {
++    static const bool once = [] {
++        av_log_set_level(AV_LOG_ERROR);
++        return true;
++    }();
++    (void)once;
++}
++
++struct Input {
++    AVFormatContext *format{};
++    AVCodecContext *codec{};
++    int stream{-1};
++    ~Input() {
++        avcodec_free_context(&codec);
++        avformat_close_input(&format);
++    }
++    bool open(const std::filesystem::path &file, bool with_decoder, std::string &error) {
++        quiet_ffmpeg();
++        int r = avformat_open_input(&format, utf8(file).c_str(), nullptr, nullptr);
++        if (r < 0) {
++            error = av_message(r);
++            return false;
++        }
++        if ((r = avformat_find_stream_info(format, nullptr)) < 0) {
++            error = av_message(r);
++            return false;
++        }
++        const AVCodec *decoder = nullptr;
++        stream = av_find_best_stream(format, AVMEDIA_TYPE_AUDIO, -1, -1, &decoder, 0);
++        if (stream < 0 || decoder == nullptr) {
++            error = "no audio in the file";
++            return false;
++        }
++        if (!with_decoder) return true;
++        codec = avcodec_alloc_context3(decoder);
++        if (codec == nullptr || avcodec_parameters_to_context(codec, format->streams[stream]->codecpar) < 0) {
++            error = "can't set up the decoder";
++            return false;
++        }
++        if ((r = avcodec_open2(codec, decoder, nullptr)) < 0) {
++            error = av_message(r);
++            return false;
++        }
++        return true;
++    }
++};
++
++} // namespace
++
++bool media_available() noexcept { return true; }
++
++std::optional<FileInfo> probe(const std::filesystem::path &file) {
++    Input in;
++    std::string error;
++    if (!in.open(file, false, error)) return std::nullopt;
++    FileInfo info;
++    const AVStream *s = in.format->streams[in.stream];
++    if (s->duration != AV_NOPTS_VALUE)
++        info.seconds = static_cast<double>(s->duration) * av_q2d(s->time_base);
++    else if (in.format->duration != AV_NOPTS_VALUE)
++        info.seconds = static_cast<double>(in.format->duration) / AV_TIME_BASE;
++    const AVDictionary *a = in.format->metadata;
++    const AVDictionary *b = s->metadata;
++    if (const char *t = tag(a, b, "title")) info.title = t;
++    if (const char *t = tag(a, b, "album")) info.album = t;
++    info.track = leading_number(tag(a, b, "track"));
++    info.disc = leading_number(tag(a, b, "disc"));
++    return info;
++}
++
++std::optional<Stereo> decode(const std::filesystem::path &file, std::string &error) {
++    Input in;
++    if (!in.open(file, true, error)) return std::nullopt;
++    SwrContext *swr = nullptr;
++    AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
++    if (in.codec->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC)
++        av_channel_layout_default(&in.codec->ch_layout, in.codec->ch_layout.nb_channels);
++    if (swr_alloc_set_opts2(&swr, &stereo, AV_SAMPLE_FMT_FLT, kRate, &in.codec->ch_layout, in.codec->sample_fmt,
++                            in.codec->sample_rate, 0, nullptr) < 0 ||
++        swr_init(swr) < 0) {
++        swr_free(&swr);
++        error = "can't convert the file's audio to 44.1 kHz stereo";
++        return std::nullopt;
++    }
++    Stereo out;
++    AVPacket *packet = av_packet_alloc();
++    AVFrame *frame = av_frame_alloc();
++    std::vector<float> chunk;
++    const auto convert = [&](const AVFrame *f) {
++        const int room = swr_get_out_samples(swr, f ? f->nb_samples : 0);
++        if (room <= 0) return;
++        chunk.resize(static_cast<std::size_t>(room) * 2);
++        auto *dst = reinterpret_cast<std::uint8_t *>(chunk.data());
++        const int got = swr_convert(swr, &dst, room, f ? const_cast<const std::uint8_t **>(f->extended_data) : nullptr,
++                                    f ? f->nb_samples : 0);
++        if (got <= 0) return;
++        for (int i = 0; i < got * 2; ++i) out.samples.push_back(chunk[static_cast<std::size_t>(i)] * 32768.0f);
++    };
++    const auto drain = [&]() {
++        while (avcodec_receive_frame(in.codec, frame) >= 0) {
++            convert(frame);
++            av_frame_unref(frame);
++        }
++    };
++    while (av_read_frame(in.format, packet) >= 0) {
++        if (packet->stream_index == in.stream && avcodec_send_packet(in.codec, packet) >= 0) drain();
++        av_packet_unref(packet);
++    }
++    avcodec_send_packet(in.codec, nullptr);
++    drain();
++    convert(nullptr); // what the resampler still holds
++    av_frame_free(&frame);
++    av_packet_free(&packet);
++    swr_free(&swr);
++    if (out.samples.empty()) {
++        error = "the file decoded to nothing";
++        return std::nullopt;
++    }
++    return out;
++}
++
++Stereo change_tempo(const Stereo &input, double tempo) {
++    Stereo out;
++    AVFilterGraph *graph = avfilter_graph_alloc();
++    AVFilterContext *source = nullptr, *sink = nullptr, *stretch = nullptr, *format = nullptr;
++    char args[256];
++    std::snprintf(args, sizeof args, "sample_rate=%d:sample_fmt=flt:channel_layout=stereo:time_base=1/%d", kRate, kRate);
++    char tempo_args[64];
++    std::snprintf(tempo_args, sizeof tempo_args, "tempo=%.10f", tempo);
++    bool ok = graph != nullptr &&
++              avfilter_graph_create_filter(&source, avfilter_get_by_name("abuffer"), "in", args, nullptr, graph) >= 0 &&
++              avfilter_graph_create_filter(&stretch, avfilter_get_by_name("atempo"), "tempo", tempo_args, nullptr, graph) >= 0 &&
++              avfilter_graph_create_filter(&format, avfilter_get_by_name("aformat"), "format",
++                                           "sample_fmts=flt:sample_rates=44100:channel_layouts=stereo", nullptr, graph) >= 0 &&
++              avfilter_graph_create_filter(&sink, avfilter_get_by_name("abuffersink"), "out", nullptr, nullptr, graph) >= 0 &&
++              avfilter_link(source, 0, stretch, 0) >= 0 && avfilter_link(stretch, 0, format, 0) >= 0 &&
++              avfilter_link(format, 0, sink, 0) >= 0 && avfilter_graph_config(graph, nullptr) >= 0;
++    AVFrame *frame = av_frame_alloc();
++    const auto pull = [&]() {
++        while (av_buffersink_get_frame(sink, frame) >= 0) {
++            const auto *data = reinterpret_cast<const float *>(frame->extended_data[0]);
++            out.samples.insert(out.samples.end(), data, data + frame->nb_samples * 2);
++            av_frame_unref(frame);
++        }
++    };
++    constexpr int kChunk = 4096;
++    const std::size_t frames = input.frames();
++    for (std::size_t at = 0; ok && at < frames; at += kChunk) {
++        const int n = static_cast<int>(std::min<std::size_t>(kChunk, frames - at));
++        AVFrame *in = av_frame_alloc();
++        in->format = AV_SAMPLE_FMT_FLT;
++        in->sample_rate = kRate;
++        in->nb_samples = n;
++        in->pts = static_cast<std::int64_t>(at);
++        av_channel_layout_default(&in->ch_layout, 2);
++        if (av_frame_get_buffer(in, 0) < 0) {
++            av_frame_free(&in);
++            ok = false;
++            break;
++        }
++        auto *dst = reinterpret_cast<float *>(in->extended_data[0]);
++        for (int i = 0; i < n * 2; ++i) dst[i] = input.samples[at * 2 + static_cast<std::size_t>(i)] / 32768.0f;
++        if (av_buffersrc_add_frame(source, in) < 0) ok = false;
++        av_frame_free(&in);
++        pull();
++    }
++    if (ok && av_buffersrc_add_frame(source, nullptr) >= 0) pull(); // flush what the filter still holds
++    for (float &v : out.samples) v *= 32768.0f;
++    av_frame_free(&frame);
++    avfilter_graph_free(&graph);
++    if (!ok) out.samples.clear();
++    return out;
++}
++
++bool write_flac(const std::filesystem::path &file, const std::vector<std::int16_t> &pcm, std::string &error) {
++    const std::filesystem::path part = file.string() + ".part";
++    AVFormatContext *out = nullptr;
++    AVCodecContext *enc = nullptr;
++    AVPacket *packet = av_packet_alloc();
++    AVFrame *frame = av_frame_alloc();
++    bool ok = false;
++    do {
++        if (avformat_alloc_output_context2(&out, nullptr, "flac", utf8(part).c_str()) < 0 || out == nullptr) {
++            error = "can't make a FLAC file";
++            break;
++        }
++        const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_FLAC);
++        if (codec == nullptr) {
++            error = "this FFmpeg has no FLAC encoder";
++            break;
++        }
++        enc = avcodec_alloc_context3(codec);
++        enc->sample_fmt = AV_SAMPLE_FMT_S16;
++        enc->sample_rate = kRate;
++        enc->time_base = AVRational{1, kRate};
++        av_channel_layout_default(&enc->ch_layout, 2);
++        if (avcodec_open2(enc, codec, nullptr) < 0) {
++            error = "can't start the FLAC encoder";
++            break;
++        }
++        AVStream *stream = avformat_new_stream(out, nullptr);
++        if (stream == nullptr || avcodec_parameters_from_context(stream->codecpar, enc) < 0) {
++            error = "can't make a FLAC stream";
++            break;
++        }
++        stream->time_base = enc->time_base;
++        int r = avio_open(&out->pb, utf8(part).c_str(), AVIO_FLAG_WRITE);
++        if (r < 0) {
++            error = av_message(r);
++            break;
++        }
++        if ((r = avformat_write_header(out, nullptr)) < 0) {
++            error = av_message(r);
++            break;
++        }
++        const auto send = [&](AVFrame *f) -> bool {
++            if (avcodec_send_frame(enc, f) < 0) return false;
++            while (avcodec_receive_packet(enc, packet) >= 0) {
++                av_packet_rescale_ts(packet, enc->time_base, stream->time_base);
++                packet->stream_index = stream->index;
++                if (av_interleaved_write_frame(out, packet) < 0) return false;
++            }
++            return true;
++        };
++        const int per_frame = enc->frame_size > 0 ? enc->frame_size : 4608;
++        const std::size_t frames = pcm.size() / 2;
++        bool sent = true;
++        for (std::size_t at = 0; sent && at < frames; at += static_cast<std::size_t>(per_frame)) {
++            const int n = static_cast<int>(std::min<std::size_t>(static_cast<std::size_t>(per_frame), frames - at));
++            frame->format = AV_SAMPLE_FMT_S16;
++            frame->sample_rate = kRate;
++            frame->nb_samples = n;
++            frame->pts = static_cast<std::int64_t>(at);
++            av_channel_layout_default(&frame->ch_layout, 2);
++            if (av_frame_get_buffer(frame, 0) < 0) {
++                sent = false;
++                break;
++            }
++            std::memcpy(frame->extended_data[0], pcm.data() + at * 2, static_cast<std::size_t>(n) * 4);
++            sent = send(frame);
++            av_frame_unref(frame);
++        }
++        if (!sent || !send(nullptr) || av_write_trailer(out) < 0) {
++            error = "writing the FLAC file failed";
++            break;
++        }
++        ok = true;
++    } while (false);
++    if (out != nullptr && out->pb != nullptr) avio_closep(&out->pb);
++    avformat_free_context(out);
++    avcodec_free_context(&enc);
++    av_frame_free(&frame);
++    av_packet_free(&packet);
++    std::error_code ec;
++    if (!ok) {
++        std::filesystem::remove(part, ec);
++        return false;
++    }
++    std::filesystem::remove(file, ec);
++    std::filesystem::rename(part, file, ec);
++    if (ec) {
++        error = "can't replace " + utf8(file.filename()) + ": " + ec.message();
++        return false;
++    }
++    return true;
++}
++
++std::optional<std::vector<std::int16_t>> read_pcm16(const std::filesystem::path &file, std::string &error) {
++    std::optional<Stereo> audio = decode(file, error);
++    if (!audio) return std::nullopt;
++    std::vector<std::int16_t> out(audio->samples.size());
++    for (std::size_t i = 0; i < out.size(); ++i)
++        out[i] = static_cast<std::int16_t>(std::clamp(std::nearbyint(audio->samples[i]), -32768.0f, 32767.0f));
++    return out;
++}
++
++#else // without libavformat / libavfilter / libswresample
++
++bool media_available() noexcept { return false; }
++std::optional<FileInfo> probe(const std::filesystem::path &) { return std::nullopt; }
++std::optional<Stereo> decode(const std::filesystem::path &, std::string &error) {
++    error = "this build can't read audio files";
++    return std::nullopt;
++}
++Stereo change_tempo(const Stereo &, double) { return {}; }
++bool write_flac(const std::filesystem::path &, const std::vector<std::int16_t> &, std::string &error) {
++    error = "this build can't write FLAC";
++    return false;
++}
++std::optional<std::vector<std::int16_t>> read_pcm16(const std::filesystem::path &, std::string &error) {
++    error = "this build can't read FLAC";
++    return std::nullopt;
++}
++
++#endif
++
++} // namespace portablekit::audio::soundtrack
+--- /dev/null
++++ b/host/audio/soundtrack_import_run.hpp
+@@ -0,0 +1,42 @@
++#pragma once
++
++// The soundtrack import as a whole: `<game> --import-soundtrack <folder>`.
++// Finds the album tracks the game uses among the player's files, builds each
++// game track from them (soundtrack_import.hpp) and writes one FLAC per track,
++// named by the track's key, into the soundtrack folder the game plays from.
++
++#include "audio/soundtrack_import.hpp"
++
++#include <cstdint>
++#include <filesystem>
++#include <string>
++#include <vector>
++
++namespace portablekit::audio::soundtrack {
++
++// One of the game's music tracks: a whole ATRAC3 / ATRAC3plus WAVE file.
++struct GameTrack {
++    std::string name;
++    std::vector<std::uint8_t> wave;
++};
++
++// The key the game's music player names this track by (hle_atrac.cpp
++// track_key): FNV-1a 64 of the first 4 KiB of its data. Empty when too short.
++[[nodiscard]] std::string wave_key(const std::vector<std::uint8_t> &wave);
++
++// The track decoded and moved into the game's own sample positions. Empty when
++// it can't be decoded.
++[[nodiscard]] Stereo decode_game_track(const std::vector<std::uint8_t> &wave);
++
++// Where the import writes and the game plays from: soundtrack/ in the game
++// folder (<prefix>_GAME_DIR or <prefix>_DATA_DIR) when one is set, else in the
++// per-user data folder.
++[[nodiscard]] std::filesystem::path default_soundtrack_folder();
++
++// Runs the import and prints its progress ("Importing the soundtrack: N%") and
++// a line per track. Writes `<out>/<key>.flac` per track it could build and
++// `<out>/soundtrack.txt`, the report. Returns 0 when at least one track was built.
++int run_import(const std::filesystem::path &album_folder, const std::filesystem::path &out,
++               const std::vector<GameTrack> &tracks, const std::vector<Entry> &table);
++
++} // namespace portablekit::audio::soundtrack
+--- /dev/null
++++ b/host/audio/soundtrack_import_run.cpp
+@@ -0,0 +1,347 @@
++#include "audio/soundtrack_import_run.hpp"
++
++#include "audio/atrac_decoder.hpp"
++#include "audio/soundtrack_media.hpp"
++#include "install/user_data.hpp"
++#include "profile.hpp"
++
++#include <algorithm>
++#include <cctype>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <iostream>
++#include <list>
++#include <map>
++#include <optional>
++#include <set>
++
++namespace portablekit::audio::soundtrack {
++
++namespace {
++
++std::uint32_t le32(const std::uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | std::uint32_t(p[3]) << 24; }
++std::uint16_t le16(const std::uint8_t *p) { return std::uint16_t(p[0] | p[1] << 8); }
++
++struct Wave {
++    std::size_t data_offset{}, data_size{};
++    unsigned channels{}, block_align{};
++    AtracCodec codec{AtracCodec::Atrac3Plus};
++    std::vector<std::uint8_t> extradata;
++    std::uint32_t samples{}, delay{};
++    bool ok{};
++};
++
++Wave parse_wave(const std::vector<std::uint8_t> &w) {
++    Wave out;
++    if (w.size() < 12 || std::memcmp(w.data(), "RIFF", 4) != 0 || std::memcmp(&w[8], "WAVE", 4) != 0) return out;
++    bool have_format = false, have_fact = false;
++    for (std::size_t at = 12; at + 8 <= w.size();) {
++        const std::uint32_t size = le32(&w[at + 4]);
++        const std::size_t body = at + 8;
++        if (body + size > w.size() && std::memcmp(&w[at], "data", 4) != 0) break;
++        if (std::memcmp(&w[at], "fmt ", 4) == 0 && size >= 16) {
++            const std::uint16_t tag = le16(&w[body]);
++            out.channels = le16(&w[body + 2]);
++            out.block_align = le16(&w[body + 12]);
++            if (tag == 0x0270) {
++                out.codec = AtracCodec::Atrac3;
++                if (size >= 18 + 14) out.extradata.assign(w.begin() + body + 18, w.begin() + body + 18 + 14);
++            } else {
++                out.codec = AtracCodec::Atrac3Plus; // 0xFFFE with the ATRAC3plus sub-format
++            }
++            have_format = true;
++        } else if (std::memcmp(&w[at], "fact", 4) == 0 && size >= 8) {
++            out.samples = le32(&w[body]);
++            out.delay = le32(&w[body + 4]);
++            have_fact = true;
++        } else if (std::memcmp(&w[at], "data", 4) == 0) {
++            out.data_offset = body;
++            out.data_size = std::min<std::size_t>(size, w.size() - body);
++            break;
++        }
++        at = body + size + (size & 1u);
++    }
++    out.ok = have_format && have_fact && out.data_size > 0 && out.block_align > 0;
++    return out;
++}
++
++std::string lower_alnum(const std::string &s) {
++    std::string out;
++    for (unsigned char c : s)
++        if (std::isalnum(c)) out.push_back(static_cast<char>(std::tolower(c)));
++    return out;
++}
++
++bool is_audio_file(const std::filesystem::path &p) {
++    static const std::set<std::string> kinds{".flac", ".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wav",
++                                             ".wma", ".ape", ".wv", ".alac", ".aiff", ".aif", ".mka", ".tta"};
++    std::string ext = p.extension().string();
++    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++    return kinds.count(ext) != 0;
++}
++
++struct AlbumFile {
++    std::filesystem::path path;
++    FileInfo info;
++    int disc{}, track{}; // from the tags, else the file and folder names
++};
++
++// "1-02 Title", "1-02. Title", "102 Title", "02 - Title"; the disc from a
++// "Disc 2" / "CD2" folder when the name has none.
++void numbers_from_names(AlbumFile &f) {
++    const std::string stem = f.path.stem().string();
++    int disc = 0, track = 0;
++    std::size_t i = 0;
++    while (i < stem.size() && stem[i] == ' ') ++i;
++    std::size_t digits = i;
++    while (digits < stem.size() && std::isdigit(static_cast<unsigned char>(stem[digits]))) ++digits;
++    const std::string first = stem.substr(i, digits - i);
++    if (!first.empty()) {
++        if (digits < stem.size() && (stem[digits] == '-' || stem[digits] == '.' || stem[digits] == '_') &&
++            digits + 1 < stem.size() && std::isdigit(static_cast<unsigned char>(stem[digits + 1])) && first.size() == 1) {
++            disc = std::stoi(first);
++            std::size_t j = digits + 1, k = j;
++            while (k < stem.size() && std::isdigit(static_cast<unsigned char>(stem[k]))) ++k;
++            track = std::stoi(stem.substr(j, k - j));
++        } else if (first.size() == 3) {
++            disc = first[0] - '0';
++            track = std::stoi(first.substr(1));
++        } else if (first.size() <= 2) {
++            track = std::stoi(first);
++        }
++    }
++    if (disc == 0) {
++        const std::string folder = lower_alnum(f.path.parent_path().filename().string());
++        for (const char *word : {"disc", "disk", "cd"}) {
++            const auto at = folder.find(word);
++            if (at != std::string::npos && at + std::strlen(word) < folder.size() &&
++                std::isdigit(static_cast<unsigned char>(folder[at + std::strlen(word)])))
++                disc = folder[at + std::strlen(word)] - '0';
++        }
++    }
++    if (f.disc == 0) f.disc = disc;
++    if (f.track == 0) f.track = track;
++}
++
++bool number_matches(const AlbumFile &f, const std::string &number) {
++    if (number.size() < 3 || number[1] != '-') return false;
++    const int disc = number[0] - '0';
++    const int track = std::atoi(number.c_str() + 2);
++    return f.track == track && (f.disc == disc || (f.disc == 0 && disc == 1));
++}
++
++// Decoded album files, a few at a time (several game tracks can use one).
++class AlbumCache {
++public:
++    const Stereo *get(const std::filesystem::path &path) {
++        for (auto it = items_.begin(); it != items_.end(); ++it)
++            if (it->first == path) {
++                items_.splice(items_.begin(), items_, it);
++                return items_.front().second ? &*items_.front().second : nullptr;
++            }
++        std::string error;
++        items_.emplace_front(path, decode(path, error));
++        if (!items_.front().second) std::cout << "  can't read " << path.filename().string() << ": " << error << "\n";
++        while (items_.size() > 6) items_.pop_back();
++        return items_.front().second ? &*items_.front().second : nullptr;
++    }
++
++private:
++    std::list<std::pair<std::filesystem::path, std::optional<Stereo>>> items_;
++};
++
++void progress(std::size_t done, std::size_t total) {
++    const int percent = total == 0 ? 100 : static_cast<int>(done * 100 / total);
++    std::cout << "Importing the soundtrack: " << percent << "%" << std::endl;
++}
++
++} // namespace
++
++std::filesystem::path default_soundtrack_folder() {
++    for (const char *name : {"GAME_DIR", "DATA_DIR"})
++        if (const char *dir = portablekit::env(name); dir != nullptr && *dir != '\0')
++            return portablekit::install::path_from_utf8(dir) / "soundtrack";
++    return portablekit::install::user_data_directory() / "soundtrack";
++}
++
++std::string wave_key(const std::vector<std::uint8_t> &wave) {
++    const Wave w = parse_wave(wave);
++    constexpr std::size_t kKeyBytes = 4096;
++    if (!w.ok || w.data_size < kKeyBytes) return {};
++    std::uint64_t hash = 0xcbf29ce484222325ull;
++    for (std::size_t i = 0; i < kKeyBytes; ++i) hash = (hash ^ wave[w.data_offset + i]) * 0x100000001b3ull;
++    char text[17];
++    std::snprintf(text, sizeof text, "%016llx", static_cast<unsigned long long>(hash));
++    return text;
++}
++
++Stereo decode_game_track(const std::vector<std::uint8_t> &wave) {
++    Stereo out;
++    const Wave w = parse_wave(wave);
++    if (!w.ok) return out;
++    AtracDecoder decoder;
++    if (!decoder.open(w.codec, w.channels, w.block_align, w.extradata)) return out;
++    std::vector<std::int16_t> frame(atrac_frame_samples(w.codec) * 2);
++    std::vector<float> all;
++    for (std::size_t at = w.data_offset; at + w.block_align <= w.data_offset + w.data_size; at += w.block_align) {
++        const std::size_t got = decoder.decode(std::span(wave.data() + at, w.block_align), frame.data());
++        if (got == 0) {
++            std::fill(frame.begin(), frame.end(), 0);
++            all.insert(all.end(), atrac_frame_samples(w.codec) * 2, 0.0f);
++            continue;
++        }
++        for (std::size_t i = 0; i < got * 2; ++i) all.push_back(frame[i]);
++    }
++    // Game position p = decoded sample p + the stream's delay + 368 (the
++    // decoder's own lead-in), as the game's player counts them.
++    const std::size_t skip = static_cast<std::size_t>(w.delay) + 368u;
++    if (all.size() / 2 <= skip) return out;
++    const std::size_t frames = std::min<std::size_t>(w.samples, all.size() / 2 - skip);
++    out.samples.assign(all.begin() + static_cast<std::ptrdiff_t>(skip * 2),
++                       all.begin() + static_cast<std::ptrdiff_t>((skip + frames) * 2));
++    return out;
++}
++
++int run_import(const std::filesystem::path &album_folder, const std::filesystem::path &out,
++               const std::vector<GameTrack> &tracks, const std::vector<Entry> &table) {
++    if (!media_available()) {
++        std::cout << "This build can't read audio files (no FFmpeg format libraries).\n";
++        return 1;
++    }
++    std::error_code ec;
++    if (!std::filesystem::is_directory(album_folder, ec)) {
++        std::cout << "No folder " << album_folder.string() << "\n";
++        return 1;
++    }
++    // The player's files.
++    std::vector<AlbumFile> files;
++    for (auto it = std::filesystem::recursive_directory_iterator(
++             album_folder, std::filesystem::directory_options::skip_permission_denied, ec);
++         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
++        if (!it->is_regular_file(ec) || !is_audio_file(it->path())) continue;
++        const std::optional<FileInfo> info = probe(it->path());
++        if (!info || info->seconds <= 0.0) continue;
++        AlbumFile f{it->path(), *info, info->disc, info->track};
++        numbers_from_names(f);
++        files.push_back(std::move(f));
++    }
++    std::cout << files.size() << " audio files in " << album_folder.string() << "\n";
++    if (files.empty()) return 1;
++
++    std::filesystem::create_directories(out, ec);
++    for (auto it = std::filesystem::directory_iterator(out, ec); !ec && it != std::filesystem::directory_iterator();
++         it.increment(ec))
++        if (it->path().extension() == ".flac") std::filesystem::remove(it->path(), ec);
++
++    // What to build: every game track the table knows (by key, else by name);
++    // then, for a game whose music can't be read from the disc, every entry
++    // that can be built from the album alone (Entry::game_frames).
++    struct Job {
++        const Entry *entry;
++        const GameTrack *track; // null: from the album alone
++    };
++    std::vector<Job> jobs;
++    std::set<const Entry *> covered;
++    for (const GameTrack &track : tracks) {
++        const std::string key = wave_key(track.wave);
++        if (key.empty()) continue;
++        const Entry *entry = nullptr;
++        for (const Entry &e : table)
++            if (e.key == key) entry = &e;
++        if (entry == nullptr)
++            for (const Entry &e : table)
++                if (e.track == track.name) entry = &e;
++        if (entry == nullptr || !covered.insert(entry).second) continue;
++        jobs.push_back({entry, &track});
++    }
++    for (const Entry &e : table)
++        if (e.game_frames > 0 && covered.insert(&e).second) jobs.push_back({&e, nullptr});
++
++    std::ofstream report(out / "soundtrack.txt");
++    report << "Soundtrack import from " << album_folder.string() << "\n";
++    AlbumCache cache;
++    std::size_t built = 0, done = 0;
++    progress(0, jobs.size());
++    for (const Job &job : jobs) {
++        const Entry &entry = *job.entry;
++        const std::string label = entry.number + " " + entry.title;
++        Stereo game;
++        if (job.track != nullptr) {
++            game = decode_game_track(job.track->wave);
++            if (game.frames() == 0) {
++                report << label << ": the game's track can't be decoded\n";
++                progress(++done, jobs.size());
++                continue;
++            }
++        }
++        // Candidates: the right number or title at about the right length; else
++        // (only when the game's audio can confirm it) any file of about that length.
++        std::vector<const AlbumFile *> candidates;
++        const std::string title = lower_alnum(entry.title);
++        for (const AlbumFile &f : files) {
++            const bool titled = !title.empty() && (lower_alnum(f.info.title) == title ||
++                                                   lower_alnum(f.path.stem().string()).find(title) != std::string::npos);
++            const double off = std::fabs(f.info.seconds - entry.album_seconds);
++            if ((titled && off <= 4.0) || (number_matches(f, entry.number) && off <= (job.track ? 4.0 : 1.5)))
++                candidates.push_back(&f);
++        }
++        if (candidates.empty() && job.track != nullptr)
++            for (const AlbumFile &f : files)
++                if (std::fabs(f.info.seconds - entry.album_seconds) <= 1.0) candidates.push_back(&f);
++        const AlbumFile *best = nullptr;
++        if (job.track != nullptr) {
++            double best_score = 0.3;
++            for (const AlbumFile *f : candidates) {
++                const Stereo *album = cache.get(f->path);
++                if (album == nullptr) continue;
++                const double score = quick_score(entry, game, *album);
++                if (score > best_score) {
++                    best_score = score;
++                    best = f;
++                }
++            }
++        } else {
++            // Without the game's audio: the closest length, a title match first.
++            double best_off = 1e9;
++            for (const AlbumFile *f : candidates) {
++                const bool titled = !title.empty() && (lower_alnum(f->info.title) == title ||
++                                                       lower_alnum(f->path.stem().string()).find(title) != std::string::npos);
++                const double off = std::fabs(f->info.seconds - entry.album_seconds) - (titled ? 100.0 : 0.0);
++                if (off < best_off) {
++                    best_off = off;
++                    best = f;
++                }
++            }
++        }
++        if (best == nullptr) {
++            report << label << ": not found in the folder (the game's music plays)\n";
++            std::cout << "  " << label << ": not found" << std::endl;
++            progress(++done, jobs.size());
++            continue;
++        }
++        const Stereo *album = cache.get(best->path);
++        Result r;
++        if (album == nullptr) r.reason = "can't read the file";
++        else r = job.track ? build(entry, game, *album, change_tempo) : build_from_reference(entry, *album);
++        std::string error;
++        if (r.ok && write_flac(out / (entry.key + ".flac"), r.pcm, error)) {
++            ++built;
++            report << label << ": from " << best->path.filename().string();
++            if (r.rip_offset != 0) report << " (offset " << r.rip_offset << " samples from the reference)";
++            report << "\n";
++            std::cout << "  " << label << ": from " << best->path.filename().string() << std::endl;
++        } else {
++            const std::string why = r.ok ? error : r.reason;
++            report << label << ": kept the game's music (" << why << ")\n";
++            std::cout << "  " << label << ": kept the game's music (" << why << ")" << std::endl;
++        }
++        progress(++done, jobs.size());
++    }
++    report << built << " of " << jobs.size() << " tracks from the soundtrack\n";
++    std::cout << built << " of " << jobs.size() << " tracks from the soundtrack" << std::endl;
++    return built > 0 ? 0 : 1;
++}
++
++} // namespace portablekit::audio::soundtrack

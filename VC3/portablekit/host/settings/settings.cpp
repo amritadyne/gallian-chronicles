@@ -250,6 +250,11 @@ const std::vector<Field> &fields() {
          [](Settings &s, const std::string &t) { return parse_bool(t, s.fast_loading); },
          [](const Settings &s) { return std::string(s.fast_loading ? "1" : "0"); },
          [](Settings &s, const char *t) { s.fast_loading = variable_flag(t); }},
+        // Patch 0038: the disc image copied into memory at start (IsoImage::preload).
+        {"system.disc_in_memory", "DISC_IN_MEMORY",
+         [](Settings &s, const std::string &t) { return parse_bool(t, s.disc_in_memory); },
+         [](const Settings &s) { return std::string(s.disc_in_memory ? "1" : "0"); },
+         [](Settings &s, const char *t) { s.disc_in_memory = variable_flag(t); }},
         {"video.frame_rate", "FRAME_RATE",
          [](Settings &s, const std::string &t) { return kFrameRates.parse(t, s.frame_rate); },
          [](const Settings &s) { return kFrameRates.format(s.frame_rate); },
@@ -281,6 +286,10 @@ const std::vector<Field> &fields() {
          [](Settings &s, const std::string &t) { return parse_uint(t, 0u, 100u, s.volume); },
          [](const Settings &s) { return std::to_string(s.volume); }, nullptr},
         BOOL_FIELD("audio.mute", mute),
+        {"audio.soundtrack", "SOUNDTRACK",
+         [](Settings &s, const std::string &t) { return parse_bool(t, s.soundtrack); },
+         [](const Settings &s) { return std::string(s.soundtrack ? "1" : "0"); },
+         [](Settings &s, const char *t) { s.soundtrack = variable_flag(t); }},
         {"input.confirm", "PAD_FACE",
          [](Settings &s, const std::string &t) {
              if (t == "south") s.confirm_south = true;
